@@ -46,7 +46,9 @@ python3 -m venv .venv
 | 검토 담당자 | `reviewer@example.com` |
 | 현장 운영자 | `operator@example.com` |
 
-시드 계정은 개발 전용입니다. 운영에서는 시드를 실행하지 말고 강한 `JWT_SECRET`과 실제 계정 정책을 사용해야 합니다.
+`scripts.seed`는 조직·운영자 4명, `EST34-2026` 축제, 구역·시설, 게시 프로그램, 설문, 운영 티켓 3건과 E·S·G 승인 실적 3건을 중복 없이 생성합니다.
+
+시드와 위 계정은 로컬 및 데모 환경 전용입니다. 실제 운영 환경에서는 시드를 실행하지 말고 강한 `JWT_SECRET`과 별도 계정 정책을 사용해야 합니다. 시드를 다시 실행하면 데모 계정 비밀번호가 위 기본값으로 갱신됩니다.
 
 ## Docker
 
@@ -65,12 +67,14 @@ docker run --rm -p 8000:8000 --env-file .env \
 
 `railway.toml`은 Dockerfile 빌드, 배포 전 마이그레이션, readiness 확인 및 실패 시 재시작을 설정합니다.
 
+현재 데모 API: [https://backend-production-8532.up.railway.app](https://backend-production-8532.up.railway.app)
+
 1. Railway 프로젝트에 PostgreSQL 서비스를 추가합니다.
 2. 백엔드 서비스에 `DATABASE_URL`, `JWT_SECRET`, `ENVIRONMENT=production`을 설정합니다.
 3. 필요하면 `.env.example`의 토큰·세션 만료 시간을 환경 변수로 재정의합니다.
 4. 저장소를 연결해 배포합니다. 서버 포트는 Railway의 `PORT`를 자동으로 사용합니다.
 
-운영 환경의 `JWT_SECRET`은 32자 이상이어야 합니다. `scripts.seed`는 운영 배포 과정에서 실행하지 않습니다.
+운영 환경의 `JWT_SECRET`은 32자 이상이어야 합니다. 배포 과정에서는 마이그레이션만 자동 실행되며 `scripts.seed`는 실행되지 않습니다. 데모 데이터를 넣을 때만 대상 환경을 확인한 후 별도로 실행합니다.
 
 ## 검증
 
@@ -81,6 +85,8 @@ API_URL=http://127.0.0.1:8000/api/v1 .venv/bin/python -m scripts.smoke
 ```
 
 `smoke`는 실행 중인 시드 서버를 대상으로 인증, 공개 조회, 익명 세션, AI, 설문, 콘텐츠 승인·게시, 티켓 전체 상태 전이, ESG 보고서 생성을 검증합니다.
+
+> `scripts.smoke`는 읽기 전용 테스트가 아닙니다. 지정한 환경에 방문 세션, 설문 응답, 프로그램, 티켓, ESG 실적과 보고서를 생성하므로 로컬 또는 전용 데모 환경에서만 실행하세요.
 
 ## 주요 규칙
 

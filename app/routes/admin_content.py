@@ -92,7 +92,7 @@ def unpublish_item(festival_id:str,item_id:str,request:Request,_:Annotated[dict,
 def ai_reviews(festival_id:str,request:Request,_:Annotated[dict,Depends(festival_access)],user:Annotated[dict,Depends(roles("SUPER_ADMIN","FESTIVAL_MANAGER","REVIEWER"))],connection:Annotated[Connection,Depends(database)],status:str="OPEN"):
     rows=all_rows(connection,"""SELECT r.*,m.question,m.answer,m.safety_status,m.model_version FROM ai_message_reports r
         JOIN ai_messages m ON m.id=r.message_id JOIN ai_conversations c ON c.id=m.conversation_id
-        WHERE c.festival_id=%s AND (%s IS NULL OR r.status=%s) ORDER BY r.created_at""",(festival_id,status,status));return success(request,rows)
+        WHERE c.festival_id=%s AND (%s::text IS NULL OR r.status=%s) ORDER BY r.created_at""",(festival_id,status,status));return success(request,rows)
 
 
 @router.post("/admin/festivals/{festival_id}/ai/reviews/{review_id}/decision")
