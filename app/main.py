@@ -10,7 +10,7 @@ setup_logging()
 app = FastAPI(
     title=settings.PROJECT_NAME,
     version=settings.VERSION,
-    description="FEST backend with map data and Allen AI integration",
+    description="FEST backend with verified festival data, search-based AI retrieval, and LLM answer composition",
 )
 
 app.add_middleware(

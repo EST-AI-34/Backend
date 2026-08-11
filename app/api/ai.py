@@ -26,12 +26,12 @@ def analyze_image_upload(file: UploadFile = File(...)) -> VisionResponse:
     return service.analyze_image_file(file)
 
 
-@router.post("/llm/reply", response_model=LLMResponse, summary="Get a reply from the LLM")
+@router.post("/llm/reply", response_model=LLMResponse, summary="Compose an answer from verified context")
 def llm_reply(payload: LLMRequest) -> LLMResponse:
     return service.get_llm_reply(payload)
 
 
-@router.post("/guide/ask", response_model=GuideQuestionResponse, summary="Ask AI festival guide")
+@router.post("/guide/ask", response_model=GuideQuestionResponse, summary="Ask guide using verified festival data")
 def ask_guide(payload: GuideQuestionRequest) -> GuideQuestionResponse:
     return service.answer_guide_question(payload)
 

@@ -47,7 +47,11 @@ class AIService:
         related_programs = self._match_program_ids(payload.question, payload.interests)
 
         prompt = (
-            "You are a verified Korean festival guide. Answer only from the provided festival context. "
+            "You are a Korean festival guide that explains verified backend data. "
+            "Use only the provided festival context and API/search results. "
+            "Do not invent or calculate visitor counts, congestion, reservations, complaints, ESG metrics, "
+            "rankings, or trends. If a statistic is not included in the verified context, say it is unavailable. "
+            "Alan AI/search is retrieval only; the LLM only composes the final answer. "
             "If safety, emergency, cancellation, parking, or operating hours are uncertain, tell the visitor "
             "to confirm with staff or official notices.\n\n"
             f"Visitor question: {payload.question}"
