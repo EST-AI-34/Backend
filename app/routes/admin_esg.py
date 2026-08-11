@@ -47,7 +47,7 @@ def measurements(festival_id:str,request:Request,_:Annotated[dict,Depends(festiv
     rows=all_rows(connection,"""SELECT em.*,m.name AS metric_name,m.category,v.version_no,v.unit,
         (SELECT count(*) FROM esg_evidence e WHERE e.measurement_id=em.id)::int AS evidence_count
         FROM esg_measurements em JOIN esg_metric_versions v ON v.id=em.metric_version_id JOIN esg_metrics m ON m.id=v.metric_id
-        WHERE em.festival_id=%s AND (%s IS NULL OR em.status=%s) ORDER BY em.measured_at DESC""",(festival_id,status,status));return success(request,rows)
+        WHERE em.festival_id=%s AND (%s::text IS NULL OR em.status=%s) ORDER BY em.measured_at DESC""",(festival_id,status,status));return success(request,rows)
 
 
 @router.post("/admin/festivals/{festival_id}/esg/measurements",status_code=201)

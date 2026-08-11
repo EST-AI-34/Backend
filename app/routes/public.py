@@ -118,7 +118,7 @@ def facilities(festival_code: str, request: Request, response: Response, connect
     rows = all_rows(connection, """SELECT f.id,f.name,f.facility_type,f.accessibility,f.operating_hours,f.status,f.updated_at,
         jsonb_build_object('id',a.id,'name',a.name,'latitude',a.latitude,'longitude',a.longitude) AS area
         FROM facilities f JOIN festival_areas a ON a.id=f.area_id WHERE f.festival_id=%s AND f.status='ACTIVE'
-        AND (%s IS NULL OR f.facility_type=%s) ORDER BY f.name""", (festival["id"], type_, type_))
+        AND (%s::text IS NULL OR f.facility_type=%s) ORDER BY f.name""", (festival["id"], type_, type_))
     cached(response)
     return success(request, rows)
 

@@ -80,7 +80,7 @@ def visible_ticket(connection:Connection,ticket_id:str,festival_id:str,user:dict
 def tickets(festival_id:str,request:Request,_:Annotated[dict,Depends(festival_access)],user:Annotated[dict,Depends(roles("SUPER_ADMIN","FESTIVAL_MANAGER","FIELD_OPERATOR"))],connection:Annotated[Connection,Depends(database)],status:str|None=None):
     rows=all_rows(connection,"""SELECT * FROM ops_tickets WHERE festival_id=%s
         AND (ticket_type='COMPLAINT' OR %s<>'FIELD_OPERATOR' OR assignee_id=%s OR created_by=%s)
-        AND (%s IS NULL OR status=%s) ORDER BY CASE priority WHEN 'EMERGENCY' THEN 1 WHEN 'HIGH' THEN 2 WHEN 'NORMAL' THEN 3 ELSE 4 END,created_at""",(festival_id,user["role"],user["id"],user["id"],status,status));return success(request,rows)
+        AND (%s::text IS NULL OR status=%s) ORDER BY CASE priority WHEN 'EMERGENCY' THEN 1 WHEN 'HIGH' THEN 2 WHEN 'NORMAL' THEN 3 ELSE 4 END,created_at""",(festival_id,user["role"],user["id"],user["id"],status,status));return success(request,rows)
 
 
 @router.post("/admin/festivals/{festival_id}/ops-tickets",status_code=201)
@@ -153,8 +153,8 @@ def deactivate_membership(organization_id:str,membership_id:str,user:Annotated[d
 
 @router.get("/admin/festivals/{festival_id}/audit-logs")
 def audit_logs(festival_id:str,request:Request,_:Annotated[dict,Depends(festival_access)],user:Annotated[dict,Depends(roles("SUPER_ADMIN","FESTIVAL_MANAGER"))],connection:Annotated[Connection,Depends(database)],limit:int=Query(20,ge=1,le=100),action:str|None=None,resource_type:Annotated[str|None,Query(alias="resourceType")]=None):
-    rows=all_rows(connection,"""SELECT * FROM audit_logs WHERE festival_id=%s AND (%s IS NULL OR action=%s)
-        AND (%s IS NULL OR resource_type=%s) ORDER BY created_at DESC LIMIT %s""",(festival_id,action,action,resource_type,resource_type,limit));return success(request,rows,page={"nextCursor":None,"hasNext":False,"limit":limit})
+    rows=all_rows(connection,"""SELECT * FROM audit_logs WHERE festival_id=%s AND (%s::text IS NULL OR action=%s)
+        AND (%s::text IS NULL OR resource_type=%s) ORDER BY created_at DESC LIMIT %s""",(festival_id,action,action,resource_type,resource_type,limit));return success(request,rows,page={"nextCursor":None,"hasNext":False,"limit":limit})
 
 
 @router.post("/admin/festivals/{festival_id}/exports",status_code=202)
