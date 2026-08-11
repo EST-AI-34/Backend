@@ -32,9 +32,9 @@ class ESGService:
             social_score=min(sum(by_category["social"]) / 5, 100),
             governance_score=min(sum(by_category["governance"]) * 4, 100),
             highlights=[
-                "Mobile leaflet usage is replacing printed 안내문 in the visitor flow.",
-                "Local coupon usage is measurable through issued and used counts.",
-                "Verified operating updates provide governance traceability.",
+                "모바일 안내문 조회가 종이 안내물 사용을 대체하고 있습니다.",
+                "지역 쿠폰 사용량을 발급 및 사용 기록으로 측정하고 있습니다.",
+                "검증된 운영 업데이트 기록으로 행사 운영의 추적 가능성을 확보하고 있습니다.",
             ],
             metrics=metrics,
         )
@@ -42,20 +42,20 @@ class ESGService:
     def generate_report(self) -> ESGReport:
         summary = self.get_summary()
         return ESGReport(
-            title="FEST ESG Performance Draft",
+            title="FEST ESG 성과 보고서 초안",
             summary=(
-                "The festival is tracking environmental, social, and governance activity through "
-                "QR usage, local coupon participation, and verified operating updates."
+                "본 축제는 QR 안내 이용, 지역 쿠폰 참여, 검증된 운영 업데이트를 기반으로 "
+                "환경, 사회, 거버넌스 활동을 추적하고 있습니다."
             ),
             achievements=summary.highlights,
             risks=[
-                "Crowding and complaint response times should be reviewed after peak programs.",
-                "Offline backup guidance is needed if network or AI services are unavailable.",
+                "인기 프로그램 종료 후 혼잡도와 민원 대응 시간을 추가로 점검해야 합니다.",
+                "네트워크 또는 AI 서비스 장애에 대비한 오프라인 안내 백업이 필요합니다.",
             ],
             next_actions=[
-                "Connect ESG metrics to PostgreSQL for auditable history.",
-                "Add operator approval before publishing AI-generated ESG reports.",
-                "Expand accessibility and multilingual usage metrics.",
+                "ESG 지표를 PostgreSQL 기록과 연결해 감사 가능한 이력을 유지합니다.",
+                "AI가 생성한 ESG 보고서를 공개하기 전에 운영자 승인 절차를 추가합니다.",
+                "접근성 및 다국어 이용 지표를 확대합니다.",
             ],
             generated_at=datetime.now(KST),
         )
