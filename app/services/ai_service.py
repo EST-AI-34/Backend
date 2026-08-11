@@ -57,8 +57,7 @@ class AIService:
             f"Visitor question: {payload.question}"
         )
         result = self.repo.call_llm(prompt, context)
-        fallback_answer = self._build_local_answer(payload.question, programs, payload.interests)
-        answer = result["reply"] if result.get("source") == "allen" else fallback_answer
+        answer = result["reply"]
 
         return GuideQuestionResponse(
             answer=answer,

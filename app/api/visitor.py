@@ -1,6 +1,7 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
 from app.api.responses import listed, ok
+from app.repositories.ai_repository import AllenAPIError
 from app.schemas.ai import CourseRecommendRequest, GuideQuestionRequest
 from app.schemas.survey import SurveySubmission
 from app.services.ai_service import AIService
@@ -32,7 +33,10 @@ def send_ai_message(conversation_id: str, payload: dict) -> dict:
         interests=payload.get("interests", []),
         stay_minutes=payload.get("stayMinutes"),
     )
-    answer = ai_service.answer_guide_question(request)
+    try:
+        answer = ai_service.answer_guide_question(request)
+    except AllenAPIError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     return ok(
         {
             "messageId": f"msg_{conversation_id}",

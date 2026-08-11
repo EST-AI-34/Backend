@@ -18,12 +18,12 @@ basic ESG reporting.
 
 - Visitor festival overview for QR mobile pages
 - Registered festival data: programs, notices, facilities, stores, coupons
-- AI guide Q&A over verified database/API results with local fallback
+- AI guide Q&A over verified database/API results using Allen only
 - Personalized course recommendation by visitor type, interests, and stay time
 - Map locations with simple congestion status
 - Operator dashboard stats and incident registration
-- ESG metrics, dashboard summary, and report draft generation
-- Optional Alan/Allen search integration using `ALLEN_API_BASE_URL` and `ALLEN_API_KEY`
+- ESG metrics, dashboard summary, report draft generation, and Allen-only admin one-line briefing
+- Required Alan/Allen integration for AI answer/report generation using the myAlan API, fixed Alan v4.0 persona, and one explicit auth mode
 
 ## AI Role Policy
 
@@ -59,9 +59,25 @@ ACCESS_TOKEN_MINUTES=15
 REFRESH_TOKEN_DAYS=7
 VISITOR_SESSION_HOURS=24
 BACKEND_CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
-ALLEN_API_BASE_URL=https://api.allen.ai
+ALLEN_API_BASE_URL=https://api.myalan.ai/api/v1
+ALLEN_AUTH_MODE=bearer
+ALLEN_AUTH_BASE_URL=https://api.myalan.ai
+ALLEN_CLIENT_ID=
+ALLEN_LLM_ENDPOINT=/channels
+ALLEN_PERSONA_ID=69ce0aeab459faf50a427005
+ALLEN_MODEL=
 ALLEN_API_KEY=
+ALLEN_CONNECT_TIMEOUT_SECONDS=3
+ALLEN_READ_TIMEOUT_SECONDS=30
+ALLEN_MAX_RETRIES=2
+ALLEN_MESSAGE_POLL_SECONDS=2
+ALLEN_MESSAGE_POLL_ATTEMPTS=20
 ```
+
+`ALLEN_AUTH_MODE=bearer` is the default operation mode and requires
+`ALLEN_API_KEY`. For development POC checks, `ALLEN_AUTH_MODE=implicit` requires
+`ALLEN_CLIENT_ID`; it does not reuse `ALLEN_API_KEY` as a client id and does not
+fall back to bearer or any other model.
 
 3. Apply migrations to Supabase:
 
@@ -104,6 +120,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 - `GET /api/v1/esg/metrics`
 - `POST /api/v1/esg/metrics`
 - `GET /api/v1/esg/summary`
+- `GET /api/v1/esg/briefing`
 - `POST /api/v1/esg/report`
 
 ## Example requests

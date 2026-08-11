@@ -27,8 +27,21 @@ class Settings:
     REFRESH_TOKEN_DAYS: int = 7
     VISITOR_SESSION_HOURS: int = 24
     ENABLE_EXTERNAL_AI: bool = False
-    ALLEN_API_BASE_URL: str = "https://api.allen.ai"
+    ALLEN_API_BASE_URL: str = "https://api.myalan.ai/api/v1"
+    ALLEN_AUTH_MODE: str = "bearer"
+    ALLEN_AUTH_BASE_URL: str = "https://api.myalan.ai"
+    ALLEN_CLIENT_ID: str = ""
+    ALLEN_LLM_ENDPOINT: str = "/channels"
+    ALLEN_PERSONA_ID: str = "69ce0aeab459faf50a427005"
+    ALLEN_MODEL: str = ""
+    ALLEN_DEVICE_PLATFORM: str = "web"
+    ALLEN_DEVICE_VERSION: str = "2.0.4"
+    ALLEN_MESSAGE_POLL_SECONDS: float = 2.0
+    ALLEN_MESSAGE_POLL_ATTEMPTS: int = 20
     ALLEN_API_KEY: str = ""
+    ALLEN_CONNECT_TIMEOUT_SECONDS: float = 3.0
+    ALLEN_READ_TIMEOUT_SECONDS: float = 30.0
+    ALLEN_MAX_RETRIES: int = 2
     BACKEND_CORS_ORIGINS: str = "http://localhost:3000,http://127.0.0.1:3000"
 
     @property
@@ -54,8 +67,21 @@ settings = Settings(
     REFRESH_TOKEN_DAYS=int(os.getenv("REFRESH_TOKEN_DAYS", "7")),
     VISITOR_SESSION_HOURS=int(os.getenv("VISITOR_SESSION_HOURS", "24")),
     ENABLE_EXTERNAL_AI=os.getenv("ENABLE_EXTERNAL_AI", "false").lower() == "true",
-    ALLEN_API_BASE_URL=os.getenv("ALLEN_API_BASE_URL", "https://api.allen.ai"),
+    ALLEN_API_BASE_URL=os.getenv("ALLEN_API_BASE_URL", "https://api.myalan.ai/api/v1"),
+    ALLEN_AUTH_MODE=os.getenv("ALLEN_AUTH_MODE", "bearer"),
+    ALLEN_AUTH_BASE_URL=os.getenv("ALLEN_AUTH_BASE_URL", "https://api.myalan.ai"),
+    ALLEN_CLIENT_ID=os.getenv("ALLEN_CLIENT_ID", ""),
+    ALLEN_LLM_ENDPOINT=os.getenv("ALLEN_LLM_ENDPOINT", "/channels"),
+    ALLEN_PERSONA_ID=os.getenv("ALLEN_PERSONA_ID", "69ce0aeab459faf50a427005"),
+    ALLEN_MODEL=os.getenv("ALLEN_MODEL", ""),
+    ALLEN_DEVICE_PLATFORM=os.getenv("ALLEN_DEVICE_PLATFORM", "web"),
+    ALLEN_DEVICE_VERSION=os.getenv("ALLEN_DEVICE_VERSION", "2.0.4"),
+    ALLEN_MESSAGE_POLL_SECONDS=float(os.getenv("ALLEN_MESSAGE_POLL_SECONDS", "2.0")),
+    ALLEN_MESSAGE_POLL_ATTEMPTS=int(os.getenv("ALLEN_MESSAGE_POLL_ATTEMPTS", "20")),
     ALLEN_API_KEY=os.getenv("ALLEN_API_KEY", ""),
+    ALLEN_CONNECT_TIMEOUT_SECONDS=float(os.getenv("ALLEN_CONNECT_TIMEOUT_SECONDS", "3.0")),
+    ALLEN_READ_TIMEOUT_SECONDS=float(os.getenv("ALLEN_READ_TIMEOUT_SECONDS", "30.0")),
+    ALLEN_MAX_RETRIES=int(os.getenv("ALLEN_MAX_RETRIES", "2")),
     BACKEND_CORS_ORIGINS=os.getenv(
         "BACKEND_CORS_ORIGINS",
         "http://localhost:3000,http://127.0.0.1:3000",

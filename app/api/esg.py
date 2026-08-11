@@ -1,6 +1,7 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
-from app.schemas.esg import ESGMetric, ESGMetricCreate, ESGReport, ESGSummary
+from app.repositories.ai_repository import AllenAPIError
+from app.schemas.esg import ESGBriefing, ESGMetric, ESGMetricCreate, ESGReport, ESGSummary
 from app.services.esg_service import ESGService
 
 router = APIRouter()
@@ -25,3 +26,11 @@ def get_summary() -> ESGSummary:
 @router.post("/report", response_model=ESGReport, summary="Generate ESG performance report draft")
 def generate_report() -> ESGReport:
     return service.generate_report()
+
+
+@router.get("/briefing", response_model=ESGBriefing, summary="Generate one-line admin ESG briefing with Allen")
+def generate_briefing() -> ESGBriefing:
+    try:
+        return service.generate_admin_briefing()
+    except AllenAPIError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc

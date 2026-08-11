@@ -13,8 +13,8 @@ class ESGMetricCreate(BaseModel):
 
 
 class ESGMetric(BaseModel):
-    id: int
-    festival_id: int
+    id: int | str
+    festival_id: int | str
     category: str
     metric_name: str
     value: float
@@ -37,4 +37,11 @@ class ESGReport(BaseModel):
     achievements: list[str]
     risks: list[str]
     next_actions: list[str]
+    generated_at: datetime
+
+
+class ESGBriefing(BaseModel):
+    briefing: str
+    source: str
+    metrics: list[ESGMetric]
     generated_at: datetime
