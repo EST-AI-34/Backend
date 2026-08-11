@@ -4,6 +4,12 @@ FastAPI backend for the FEST MVP. It provides QR visitor guide data, AI guide
 answers, course recommendations, map/facility data, operations incidents, and
 basic ESG reporting.
 
+## Deployed API
+
+- Swagger UI: https://backend-production-8532.up.railway.app/docs
+- OpenAPI JSON: https://backend-production-8532.up.railway.app/openapi.json
+- API base URL: https://backend-production-8532.up.railway.app/api/v1
+
 ## Architecture
 
 - `app/api`: HTTP controllers and routing
