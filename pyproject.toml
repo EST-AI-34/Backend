@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "festival-dx-backend"
+version = "1.0.0"
+description = "AI·ESG 기반 지역축제 DX FastAPI backend"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.116,<1",
+  "email-validator>=2.2,<3",
+  "psycopg[binary,pool]>=3.2,<4",
+  "pyjwt>=2.10,<3",
+  "uvicorn[standard]>=0.35,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx>=0.28,<1",
+  "pytest>=8.4,<9",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*", "scripts*"]
