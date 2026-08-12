@@ -1,9 +1,9 @@
+import re
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from psycopg.rows import dict_row
-from psycopg.types.json import Jsonb
 
 from app.core.config import settings
 from app.core.database import has_database
@@ -60,6 +60,7 @@ class ESGRepository:
                 "recorded_at": now,
             },
         ]
+        self._briefings: dict[tuple[str, str], dict[str, Any]] = {}
 
     def list_metrics(self) -> list[dict]:
         if not self._should_use_database():
@@ -146,22 +147,129 @@ class ESGRepository:
             "recorded_at": measurement["measured_at"],
         }
 
-    def save_ai_briefing(self, *, question: str, context: list[str], verified_result: dict[str, Any], answer: str) -> None:
+    def get_latest_briefing(self, festival_code: str, focus: str = "esg") -> dict[str, Any] | None:
         if not self._should_use_database():
-            return
+            briefing = self._briefings.get((festival_code, focus))
+            return dict(briefing) if briefing else None
 
         with psycopg.connect(settings.database_url, row_factory=dict_row, prepare_threshold=None) as connection:
-            festival = connection.execute(
-                "SELECT id FROM festivals ORDER BY starts_at DESC, created_at DESC LIMIT 1"
+            row = connection.execute(
+                """
+                SELECT
+                  message.verified_result,
+                  message.answer AS allen_comment,
+                  message.created_at AS generated_at
+                FROM ai_messages message
+                JOIN ai_conversations conversation ON conversation.id = message.conversation_id
+                JOIN festivals festival ON festival.id = conversation.festival_id
+                WHERE festival.code = %s
+                  AND message.question = %s
+                  AND message.safety_status = 'ALLOWED'
+                ORDER BY message.created_at DESC
+                LIMIT 1
+                """,
+                (festival_code, self._briefing_question(focus)),
             ).fetchone()
-            if not festival:
-                return
+        if not row:
+            return None
+        if not self._is_usable_briefing(row["allen_comment"]):
+            return None
+        verified_result = row.get("verified_result") or {}
+        if not isinstance(verified_result, dict):
+            return None
+        return {
+            **verified_result,
+            "allen_comment": row["allen_comment"],
+            "generated_at": row["generated_at"],
+        }
+
+    def save_briefing(self, festival_code: str, focus: str, payload: dict[str, Any]) -> dict[str, Any]:
+        now = datetime.now(KST)
+        row = {
+            "summary": payload["summary"],
+            "allen_comment": payload["allen_comment"],
+            "metric_label": payload["metric_label"],
+            "metric_value": payload["metric_value"],
+            "status": payload["status"],
+            "sources": payload["sources"],
+            "provider": payload.get("provider", "allen"),
+            "context_snapshot": payload.get("context_snapshot", []),
+            "generated_at": payload.get("generated_at", now),
+        }
+
+        if not self._should_use_database():
+            self._briefings[(festival_code, focus)] = row
+            return dict(row)
+
+        verified_result = {
+            "summary": row["summary"],
+            "metric_label": row["metric_label"],
+            "metric_value": row["metric_value"],
+            "status": row["status"],
+            "sources": row["sources"],
+            "provider": row["provider"],
+        }
+
+        with psycopg.connect(settings.database_url, row_factory=dict_row, prepare_threshold=None) as connection:
+            existing = connection.execute(
+                """
+                SELECT message.id
+                FROM ai_messages message
+                JOIN ai_conversations conversation ON conversation.id = message.conversation_id
+                JOIN festivals festival ON festival.id = conversation.festival_id
+                WHERE festival.code = %s
+                  AND message.question = %s
+                ORDER BY message.created_at DESC
+                LIMIT 1
+                """,
+                (festival_code, self._briefing_question(focus)),
+            ).fetchone()
+            if existing:
+                saved = connection.execute(
+                    """
+                    UPDATE ai_messages
+                    SET
+                      search_query = %s,
+                      retrieved_context = %s::jsonb,
+                      verified_result = %s::jsonb,
+                      answer = %s,
+                      safety_status = 'ALLOWED',
+                      model_version = 'allen-esg-briefing-v1',
+                      created_at = %s
+                    WHERE id = %s
+                    RETURNING verified_result, answer AS allen_comment, created_at AS generated_at
+                    """,
+                    (
+                        "admin esg briefing",
+                        json_dumps(row["context_snapshot"]),
+                        json_dumps(verified_result),
+                        row["allen_comment"],
+                        row["generated_at"],
+                        existing["id"],
+                    ),
+                ).fetchone()
+                saved_result = saved["verified_result"]
+                return {
+                    **saved_result,
+                    "allen_comment": saved["allen_comment"],
+                    "generated_at": saved["generated_at"],
+                }
 
             conversation = connection.execute(
-                "INSERT INTO ai_conversations(festival_id, language) VALUES (%s, 'ko') RETURNING id",
-                (festival["id"],),
+                """
+                WITH selected_festival AS (
+                  SELECT id FROM festivals WHERE code = %s LIMIT 1
+                )
+                INSERT INTO ai_conversations(festival_id, language)
+                SELECT id, 'ko' FROM selected_festival
+                RETURNING id
+                """,
+                (festival_code,),
             ).fetchone()
-            connection.execute(
+            if not conversation:
+                raise RuntimeError(f"Festival code {festival_code} was not found.")
+
+            saved = connection.execute(
                 """
                 INSERT INTO ai_messages(
                   conversation_id,
@@ -171,20 +279,43 @@ class ESGRepository:
                   verified_result,
                   answer,
                   safety_status,
-                  model_version
+                  model_version,
+                  created_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, 'ALLOWED', 'myalan-esg-briefing-v1')
+                VALUES (%s, %s, %s, %s::jsonb, %s::jsonb, %s, 'ALLOWED', 'allen-esg-briefing-v1', %s)
+                RETURNING verified_result, answer AS allen_comment, created_at AS generated_at
                 """,
                 (
                     conversation["id"],
-                    question,
-                    "admin_esg_briefing",
-                    Jsonb(context),
-                    Jsonb(verified_result),
-                    answer,
+                    self._briefing_question(focus),
+                    "admin esg briefing",
+                    json_dumps(row["context_snapshot"]),
+                    json_dumps(verified_result),
+                    row["allen_comment"],
+                    row["generated_at"],
                 ),
-            )
-            connection.commit()
+            ).fetchone()
+
+        saved_result = saved["verified_result"]
+        return {
+            **saved_result,
+            "allen_comment": saved["allen_comment"],
+            "generated_at": saved["generated_at"],
+        }
 
     def _should_use_database(self) -> bool:
         return has_database() and psycopg is not None
+
+    def _briefing_question(self, focus: str) -> str:
+        return f"admin:{focus}:one-line-briefing"
+
+    def _is_usable_briefing(self, value: str | None) -> bool:
+        if not value or len(value.strip()) < 12:
+            return False
+        return re.search(r"\d\.$", value.strip()) is None
+
+
+def json_dumps(value: Any) -> str:
+    import json
+
+    return json.dumps(value, ensure_ascii=False, default=str)

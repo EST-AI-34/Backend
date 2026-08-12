@@ -204,7 +204,7 @@ CREATE TABLE visitor_sessions (
 CREATE TABLE ai_conversations (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   festival_id uuid NOT NULL REFERENCES festivals(id),
-  visitor_session_id uuid NOT NULL REFERENCES visitor_sessions(id),
+  visitor_session_id uuid REFERENCES visitor_sessions(id),
   language text NOT NULL DEFAULT 'ko',
   created_at timestamptz NOT NULL DEFAULT now()
 );
@@ -213,6 +213,9 @@ CREATE TABLE ai_messages (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   conversation_id uuid NOT NULL REFERENCES ai_conversations(id),
   question text NOT NULL,
+  search_query text,
+  retrieved_context jsonb NOT NULL DEFAULT '[]',
+  verified_result jsonb NOT NULL DEFAULT '{}',
   answer text,
   safety_status text NOT NULL CHECK (safety_status IN ('ALLOWED','BLOCKED','INSUFFICIENT_GROUNDING')),
   model_version text NOT NULL DEFAULT 'approved-content-search-v1',

@@ -42,7 +42,7 @@ class Settings:
     ALLEN_CONNECT_TIMEOUT_SECONDS: float = 3.0
     ALLEN_READ_TIMEOUT_SECONDS: float = 30.0
     ALLEN_MAX_RETRIES: int = 2
-    BACKEND_CORS_ORIGINS: str = "http://localhost:3000,http://127.0.0.1:3000"
+    BACKEND_CORS_ORIGINS: str = "http://localhost:3000,http://127.0.0.1:3000,http://localhost:3300,http://127.0.0.1:3300"
 
     @property
     def cors_origins(self) -> list[str]:
@@ -84,6 +84,6 @@ settings = Settings(
     ALLEN_MAX_RETRIES=int(os.getenv("ALLEN_MAX_RETRIES", "2")),
     BACKEND_CORS_ORIGINS=os.getenv(
         "BACKEND_CORS_ORIGINS",
-        "http://localhost:3000,http://127.0.0.1:3000",
+        "http://localhost:3000,http://127.0.0.1:3000,http://localhost:3300,http://127.0.0.1:3300",
     ),
 )

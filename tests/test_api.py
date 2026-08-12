@@ -1,6 +1,9 @@
 from fastapi.testclient import TestClient
 
+from app.core.config import settings
 from app.main import app
+from app.repositories.ai_repository import AllenAPIError
+from app.services.esg_service import ESGService
 
 
 client = TestClient(app)
@@ -64,3 +67,95 @@ def test_esg_briefing_uses_allen_only(monkeypatch):
     assert body["metrics"]
     assert any("environment_score=" in item for item in captured["context"])
     assert any(item.startswith("metric=") for item in captured["context"])
+
+
+def test_admin_ai_brief_is_generated_and_saved_without_external_ai(monkeypatch):
+    calls = {"count": 0}
+
+    def fake_create_esg_briefing(self, context):
+        calls["count"] += 1
+        return {
+            "briefing": "DB ESG 지표 기준으로 다회용기 운영 개선을 우선 점검해야 합니다.",
+            "source": "allen",
+        }
+
+    monkeypatch.setattr(
+        "app.repositories.ai_repository.AIRepository.create_esg_briefing",
+        fake_create_esg_briefing,
+    )
+
+    first = client.get("/api/v1/admin/festivals/EST34-2026/ai-brief?focus=esg")
+    second = client.get("/api/v1/admin/festivals/EST34-2026/ai-brief?focus=esg")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert calls["count"] == 0
+    assert "ESG 개선 속도" in first.json()["data"]["allen_comment"]
+    assert second.json()["data"]["allen_comment"] == first.json()["data"]["allen_comment"]
+
+
+def test_admin_ai_brief_uses_allen_when_external_ai_enabled(monkeypatch):
+    original_external_ai = settings.ENABLE_EXTERNAL_AI
+    object.__setattr__(settings, "ENABLE_EXTERNAL_AI", True)
+    calls = {"count": 0}
+
+    def fake_create_esg_briefing(self, context):
+        calls["count"] += 1
+        return {
+            "briefing": "Allen이 DB ESG 지표를 보고 만든 한줄평입니다.",
+            "source": "allen",
+        }
+
+    monkeypatch.setattr(
+        "app.repositories.ai_repository.AIRepository.create_esg_briefing",
+        fake_create_esg_briefing,
+    )
+
+    try:
+        service = ESGService()
+        first = service.get_or_create_admin_ai_brief("EST34-2026", refresh=True)
+        second = service.get_or_create_admin_ai_brief("EST34-2026")
+    finally:
+        object.__setattr__(settings, "ENABLE_EXTERNAL_AI", original_external_ai)
+
+    assert calls["count"] == 1
+    assert first.allen_comment == "Allen이 DB ESG 지표를 보고 만든 한줄평입니다."
+    assert second.allen_comment == first.allen_comment
+
+
+def test_admin_ai_brief_falls_back_when_allen_times_out(monkeypatch):
+    original_external_ai = settings.ENABLE_EXTERNAL_AI
+    object.__setattr__(settings, "ENABLE_EXTERNAL_AI", True)
+
+    def fake_create_esg_briefing(self, context):
+        raise AllenAPIError("Allen response read timed out.", status_code=504)
+
+    monkeypatch.setattr(
+        "app.repositories.ai_repository.AIRepository.create_esg_briefing",
+        fake_create_esg_briefing,
+    )
+
+    try:
+        brief = ESGService().get_or_create_admin_ai_brief("EST34-2026", refresh=True)
+    finally:
+        object.__setattr__(settings, "ENABLE_EXTERNAL_AI", original_external_ai)
+
+    assert "ESG 개선 속도" in brief.allen_comment
+
+
+def test_admin_ai_brief_handles_empty_esg_metrics(monkeypatch):
+    monkeypatch.setattr("app.repositories.esg_repository.ESGRepository.list_metrics", lambda self: [])
+
+    brief = ESGService().get_or_create_admin_ai_brief("EMPTY-METRICS", refresh=True)
+
+    assert brief.metric_label == "ESG 운영 지표"
+    assert brief.allen_comment
+
+
+def test_admin_ai_brief_refresh_does_not_duplicate_in_memory_storage():
+    service = ESGService()
+
+    service.get_or_create_admin_ai_brief("NO-DUPLICATE", refresh=True)
+    service.get_or_create_admin_ai_brief("NO-DUPLICATE", refresh=True)
+
+    assert len(service.repo._briefings) == 1

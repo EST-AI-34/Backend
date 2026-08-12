@@ -45,3 +45,13 @@ class ESGBriefing(BaseModel):
     source: str
     metrics: list[ESGMetric]
     generated_at: datetime
+
+
+class FestivalAIBrief(BaseModel):
+    summary: str
+    allen_comment: str
+    metric_label: str
+    metric_value: str
+    status: Literal["normal", "warning", "critical"]
+    sources: list[str]
+    generated_at: datetime
