@@ -135,3 +135,24 @@ def get_admin_risk_brief(
     include_resolved: bool = False,
 ) -> dict:
     return ok(insights_service.get_risk_brief(festival_id, refresh, include_resolved))
+
+
+@router.get(
+    "/festivals/{festival_id}/recommendation-bias",
+    summary="Audit business recommendation exposure bias",
+    dependencies=[Depends(require_admin_roles(REVIEW_READ))],
+)
+def get_recommendation_bias_audit(
+    festival_id: str,
+    window_days: int = 7,
+    max_business_share: float = 0.6,
+    max_category_share: float = 0.75,
+) -> dict:
+    return ok(
+        insights_service.audit_recommendation_bias(
+            festival_id,
+            window_days=window_days,
+            max_business_share=max_business_share,
+            max_category_share=max_category_share,
+        )
+    )

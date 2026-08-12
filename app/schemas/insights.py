@@ -48,3 +48,40 @@ class BusinessRecommendations(BaseModel):
     sponsored_items: list[BusinessRecommendationItem] = Field(default_factory=list)
     recommendation_policy_version: str = "biz-rec-v1"
     generated_at: datetime
+
+
+class RecommendationBiasBusinessExposure(BaseModel):
+    business_id: str
+    name: str
+    category: str
+    total_exposures: int
+    general_exposures: int = 0
+    sponsored_exposures: int = 0
+    exposure_share: float = Field(ge=0, le=1)
+    is_over_threshold: bool = False
+
+
+class RecommendationBiasCategoryExposure(BaseModel):
+    category: str
+    total_exposures: int
+    exposure_share: float = Field(ge=0, le=1)
+    is_over_threshold: bool = False
+
+
+class RecommendationBiasAudit(BaseModel):
+    festival_id: str
+    status: Literal["pass", "warning", "insufficient_data"]
+    summary: str
+    checked_event_count: int
+    total_exposures: int
+    general_exposures: int
+    sponsored_exposures: int
+    business_exposures: list[RecommendationBiasBusinessExposure] = Field(default_factory=list)
+    category_exposures: list[RecommendationBiasCategoryExposure] = Field(default_factory=list)
+    thresholds: dict[str, float | int | str]
+    recommended_actions: list[str] = Field(default_factory=list)
+    cadence: str = "weekly"
+    window_days: int = 7
+    generated_at: datetime
+    next_recommended_check_at: datetime
+    policy_version: str = "bias-audit-v1"

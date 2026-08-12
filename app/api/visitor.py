@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 from app.api.responses import listed, ok
 from app.repositories.ai_repository import AllenAPIError
-from app.schemas.ai import CourseRecommendRequest, GuideQuestionRequest
+from app.schemas.ai import AiGuideRequest, CourseRecommendRequest, GuideQuestionRequest
 from app.schemas.survey import SurveySubmission
 from app.services.ai_service import AIService
 from app.services.festival_service import FestivalService
@@ -63,6 +63,16 @@ def send_ai_message(conversation_id: str, payload: dict) -> dict:
 @router.get("/ai/conversations/{conversation_id}/messages", summary="List visitor AI messages")
 def list_ai_messages(conversation_id: str) -> dict:
     return listed([])
+
+
+@router.post("/festivals/{festival_id}/ai-guide", summary="Guide visitor with verified festival data")
+def guide_visitor(festival_id: str, payload: AiGuideRequest) -> dict:
+    try:
+        return ok(ai_service.answer_visitor_ai_guide(festival_id, payload))
+    except ValueError as exc:
+        detail = str(exc)
+        status_code = 404 if "not found" in detail.lower() else 422
+        raise HTTPException(status_code=status_code, detail=detail) from exc
 
 
 @router.post("/course-plans", summary="Create personalized visitor course plan")

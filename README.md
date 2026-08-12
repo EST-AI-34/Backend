@@ -4,6 +4,16 @@ FastAPI backend for the FEST MVP. It provides QR visitor guide data, AI guide
 answers, course recommendations, map/facility data, operations incidents, and
 basic ESG reporting.
 
+## 📋 기능 진행 상황
+
+현재 구현 상태를 확인하려면 [**FEATURE_STATUS.md**](../FEATURE_STATUS.md) 참고:
+- AI 휴먼 안내: 진행 중
+- BIZ-03 실질 추천: 백엔드 완료
+- 소음·네트워크 장애 대응: 부분 구현
+- **추천 편향 점검: 백엔드 완료** (2026-08-13 업데이트)
+- 운영 대시보드: 프론트 데모
+- ESG 성과관리: 백엔드 기초 완료
+
 ## Architecture
 
 - `app/api`: HTTP controllers and routing

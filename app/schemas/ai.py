@@ -39,6 +39,43 @@ class GuideQuestionResponse(BaseModel):
     last_updated_at: str
 
 
+class AiGuideRequest(BaseModel):
+    message: str = Field(min_length=2, max_length=240)
+    language: str = "ko"
+    latitude: float | None = Field(default=None, ge=-90, le=90)
+    longitude: float | None = Field(default=None, ge=-180, le=180)
+    accessibility_preferences: list[str] = Field(default_factory=list)
+    conversation_id: str | None = None
+
+
+class AiGuideAction(BaseModel):
+    type: Literal["open_map", "open_schedule", "open_business", "call_staff", "retry"]
+    label: str
+    target: str = ""
+
+
+class AiGuideSourceItem(BaseModel):
+    id: str
+    title: str
+    subtitle: str | None = None
+    kind: str
+    metadata: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
+
+
+class AiGuideResponse(BaseModel):
+    intent: Literal["schedule", "navigation", "culture", "safety", "esg", "business", "fallback"]
+    language: Literal["ko", "en"]
+    display_text: str
+    speech_text: str
+    source_type: str
+    source_items: list[AiGuideSourceItem] = Field(default_factory=list)
+    actions: list[AiGuideAction] = Field(default_factory=list)
+    fallback_used: bool = False
+    fallback_reason: str | None = None
+    generated_at: str
+    source_updated_at: str | None = None
+
+
 class CourseRecommendRequest(BaseModel):
     visitor_type: Literal["solo", "couple", "friends", "family", "senior"]
     interests: list[str] = Field(default_factory=list)

@@ -484,3 +484,233 @@ def test_business_recommendations_reject_invalid_filters():
     assert bad_latitude.status_code == 422
     assert bad_category.status_code == 422
     assert bad_limit.status_code == 422
+
+
+def test_visitor_ai_guide_handles_core_intents():
+    cases = [
+        ("오늘 공연 일정 알려줘", "schedule"),
+        ("메인 무대가 어디야", "navigation"),
+        ("근처 문화 관광 추천해줘", "culture"),
+        ("응급 상황이면 어디로 가?", "safety"),
+        ("ESG 스탬프는 어떻게 받아?", "esg"),
+        ("근처 영업 중인 맛집 추천해줘", "business"),
+    ]
+
+    for message, intent in cases:
+        response = client.post(
+            "/api/v1/visitor/festivals/EST34-2026/ai-guide",
+            json={"message": message, "language": "ko"},
+        )
+
+        assert response.status_code == 200
+        body = response.json()["data"]
+        assert body["intent"] == intent
+        assert body["display_text"]
+        assert body["speech_text"]
+        assert body["actions"]
+        assert body["source_type"]
+
+
+def test_visitor_ai_guide_language_and_validation():
+    fallback_language = client.post(
+        "/api/v1/visitor/festivals/EST34-2026/ai-guide",
+        json={"message": "Where is the restroom?", "language": "fr"},
+    )
+    english = client.post(
+        "/api/v1/visitor/festivals/EST34-2026/ai-guide",
+        json={"message": "Where is the restroom?", "language": "en"},
+    )
+    bad_coords = client.post(
+        "/api/v1/visitor/festivals/EST34-2026/ai-guide",
+        json={"message": "Where is the restroom?", "language": "en", "latitude": 37.1},
+    )
+    other_festival = client.post(
+        "/api/v1/visitor/festivals/OTHER/ai-guide",
+        json={"message": "Where is the restroom?", "language": "en"},
+    )
+
+    assert fallback_language.status_code == 200
+    assert fallback_language.json()["data"]["language"] == "ko"
+    assert english.status_code == 200
+    assert english.json()["data"]["language"] == "en"
+    assert bad_coords.status_code == 422
+    assert other_festival.status_code == 404
+
+
+def test_visitor_ai_guide_external_ai_fallback(monkeypatch):
+    original_external_ai = settings.ENABLE_EXTERNAL_AI
+    object.__setattr__(settings, "ENABLE_EXTERNAL_AI", True)
+
+    def fake_call_llm(self, prompt, context):
+        raise AllenAPIError("Allen timeout", status_code=504)
+
+    monkeypatch.setattr("app.repositories.ai_repository.AIRepository.call_llm", fake_call_llm)
+
+    try:
+        response = client.post(
+            "/api/v1/visitor/festivals/EST34-2026/ai-guide",
+            json={"message": "오늘 공연 일정 알려줘", "language": "ko"},
+        )
+    finally:
+        object.__setattr__(settings, "ENABLE_EXTERNAL_AI", original_external_ai)
+
+    assert response.status_code == 200
+    body = response.json()["data"]
+    assert body["intent"] == "schedule"
+    assert body["fallback_used"] is True
+    assert body["fallback_reason"] == "external_ai_unavailable"
+
+
+def test_visitor_ai_guide_handles_stage_crowding_and_food_booth_questions(monkeypatch):
+    monkeypatch.setattr(
+        "app.repositories.insights_repository.InsightsRepository.list_business_candidates",
+        lambda self, festival_id: [
+            {
+                "id": 201,
+                "festival_id": "EST34-2026",
+                "name": "Open Food Booth",
+                "category": "restaurant",
+                "location_id": "food-zone",
+                "latitude": None,
+                "longitude": None,
+                "coupon_available": True,
+                "operating_status": "open",
+                "is_sponsored": False,
+                "accessible": True,
+                "esg_participating": True,
+                "description": "Verified open food booth.",
+            },
+            {
+                "id": 202,
+                "festival_id": "EST34-2026",
+                "name": "Sponsored Dessert Booth",
+                "category": "cafe",
+                "location_id": "food-zone",
+                "latitude": None,
+                "longitude": None,
+                "coupon_available": True,
+                "operating_status": "open",
+                "is_sponsored": True,
+                "accessible": True,
+                "esg_participating": False,
+                "description": "Verified sponsored booth.",
+            },
+        ],
+    )
+
+    cases = [
+        ("메인 무대가 어디야?", "navigation", "map"),
+        ("지금 혼잡한 곳이 어디야?", "safety", "crowding"),
+        ("근처에서 영업 중인 음식 부스를 추천해줘.", "business", "business"),
+    ]
+
+    for message, intent, source_type in cases:
+        response = client.post(
+            "/api/v1/visitor/festivals/EST34-2026/ai-guide",
+            json={"message": message, "language": "ko"},
+        )
+        body = response.json()["data"]
+
+        assert response.status_code == 200
+        assert body["intent"] == intent
+        assert body["source_type"] == source_type
+        assert body["source_items"]
+
+    business = client.post(
+        "/api/v1/visitor/festivals/EST34-2026/ai-guide",
+        json={"message": "근처에서 영업 중인 음식 부스를 추천해줘.", "language": "ko"},
+    ).json()["data"]
+
+    assert any(item["metadata"]["is_sponsored"] is True for item in business["source_items"])
+    assert all(item["subtitle"] for item in business["source_items"])
+
+
+def test_admin_recommendation_bias_audit_uses_logged_events(monkeypatch):
+    monkeypatch.setattr(
+        "app.repositories.insights_repository.InsightsRepository.list_business_candidates",
+        lambda self, festival_id: [
+            {
+                "id": 301,
+                "festival_id": "EST34-2026",
+                "name": "General Booth",
+                "category": "restaurant",
+                "location_id": "food-zone",
+                "latitude": None,
+                "longitude": None,
+                "coupon_available": True,
+                "operating_status": "open",
+                "is_sponsored": False,
+                "accessible": True,
+                "esg_participating": False,
+                "description": "General booth.",
+            },
+            {
+                "id": 302,
+                "festival_id": "EST34-2026",
+                "name": "Sponsored Booth",
+                "category": "cafe",
+                "location_id": "food-zone",
+                "latitude": None,
+                "longitude": None,
+                "coupon_available": True,
+                "operating_status": "open",
+                "is_sponsored": True,
+                "accessible": True,
+                "esg_participating": False,
+                "description": "Sponsored booth.",
+            },
+        ],
+    )
+
+    recommend = client.get("/api/v1/visitor/festivals/EST34-2026/business-recommendations?limit=3")
+    assert recommend.status_code == 200
+
+    response = client.get(
+        "/api/v1/admin/festivals/EST34-2026/recommendation-bias",
+        headers=admin_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()["data"]
+    assert body["checked_event_count"] >= 1
+    assert body["total_exposures"] >= 2
+    assert body["general_exposures"] >= 1
+    assert body["sponsored_exposures"] >= 1
+    assert body["cadence"] == "weekly"
+    assert body["policy_version"] == "bias-audit-v1"
+    assert body["business_exposures"]
+    assert body["category_exposures"]
+
+
+def test_admin_recommendation_bias_audit_warns_on_concentration(monkeypatch):
+    monkeypatch.setattr(
+        "app.repositories.insights_repository.InsightsRepository.list_recommendation_events",
+        lambda self, festival_id, window_days=7: [
+            {
+                "festival_id": festival_id,
+                "request": {},
+                "policy_version": "biz-rec-v1",
+                "response": {
+                    "items": [
+                        {
+                            "business_id": "BIZ-999",
+                            "name": "Dominant Booth",
+                            "category": "restaurant",
+                            "is_sponsored": False,
+                        }
+                    ],
+                    "sponsored_items": [],
+                },
+            }
+        ],
+    )
+
+    response = client.get(
+        "/api/v1/admin/festivals/EST34-2026/recommendation-bias?max_business_share=0.5",
+        headers=admin_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()["data"]
+    assert body["status"] == "warning"
+    assert body["business_exposures"][0]["is_over_threshold"] is True

@@ -1,12 +1,21 @@
 import math
-from datetime import datetime
+from collections import Counter
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from app.core.config import settings
 from app.repositories.ai_repository import AIRepository, AllenAPIError
 from app.repositories.festival_repository import FestivalRepository
 from app.repositories.insights_repository import InsightsRepository
-from app.schemas.insights import BusinessRecommendationItem, BusinessRecommendations, RiskBrief, RiskEvidence
+from app.schemas.insights import (
+    BusinessRecommendationItem,
+    BusinessRecommendations,
+    RecommendationBiasAudit,
+    RecommendationBiasBusinessExposure,
+    RecommendationBiasCategoryExposure,
+    RiskBrief,
+    RiskEvidence,
+)
 
 
 KST = ZoneInfo("Asia/Seoul")
@@ -140,6 +149,106 @@ class InsightsService:
         )
         return response
 
+    def audit_recommendation_bias(
+        self,
+        festival_id: str,
+        window_days: int = 7,
+        max_business_share: float = 0.6,
+        max_category_share: float = 0.75,
+        min_events: int = 1,
+    ) -> RecommendationBiasAudit:
+        events = self.repo.list_recommendation_events(festival_id, window_days)
+        business_counts: Counter[str] = Counter()
+        general_counts: Counter[str] = Counter()
+        sponsored_counts: Counter[str] = Counter()
+        category_counts: Counter[str] = Counter()
+        business_meta: dict[str, dict[str, str]] = {}
+
+        for event in events:
+            response = event.get("response") or {}
+            for section, is_sponsored_section in (("items", False), ("sponsored_items", True)):
+                for item in response.get(section, []) or []:
+                    business_id = str(item.get("business_id") or item.get("id") or "")
+                    if not business_id:
+                        continue
+                    category = str(item.get("category") or "unknown")
+                    name = str(item.get("name") or business_id)
+                    is_sponsored = bool(item.get("is_sponsored", is_sponsored_section))
+                    business_counts[business_id] += 1
+                    category_counts[category] += 1
+                    business_meta[business_id] = {"name": name, "category": category}
+                    if is_sponsored:
+                        sponsored_counts[business_id] += 1
+                    else:
+                        general_counts[business_id] += 1
+
+        total_exposures = sum(business_counts.values())
+        general_exposures = sum(general_counts.values())
+        sponsored_exposures = sum(sponsored_counts.values())
+        generated_at = datetime.now(KST)
+
+        business_rows = [
+            RecommendationBiasBusinessExposure(
+                business_id=business_id,
+                name=business_meta[business_id]["name"],
+                category=business_meta[business_id]["category"],
+                total_exposures=count,
+                general_exposures=general_counts[business_id],
+                sponsored_exposures=sponsored_counts[business_id],
+                exposure_share=round(count / total_exposures, 4) if total_exposures else 0,
+                is_over_threshold=(count / total_exposures) > max_business_share if total_exposures else False,
+            )
+            for business_id, count in business_counts.most_common()
+        ]
+        category_rows = [
+            RecommendationBiasCategoryExposure(
+                category=category,
+                total_exposures=count,
+                exposure_share=round(count / total_exposures, 4) if total_exposures else 0,
+                is_over_threshold=(count / total_exposures) > max_category_share if total_exposures else False,
+            )
+            for category, count in category_counts.most_common()
+        ]
+        over_business = [row for row in business_rows if row.is_over_threshold]
+        over_category = [row for row in category_rows if row.is_over_threshold]
+
+        if len(events) < min_events or total_exposures == 0:
+            status = "insufficient_data"
+            summary = "Not enough recommendation exposure events are available for bias review."
+            actions = ["Run this audit after recommendation traffic is collected."]
+        elif over_business or over_category:
+            status = "warning"
+            summary = "Recommendation exposure concentration exceeded the configured bias threshold."
+            actions = [
+                "Review businesses or categories over threshold before the next weekly check.",
+                "Adjust recommendation policy or exposure rotation if concentration is not justified by filters.",
+            ]
+        else:
+            status = "pass"
+            summary = "No business or category exceeded the configured recommendation exposure thresholds."
+            actions = ["Continue weekly recommendation bias checks."]
+
+        return RecommendationBiasAudit(
+            festival_id=festival_id,
+            status=status,
+            summary=summary,
+            checked_event_count=len(events),
+            total_exposures=total_exposures,
+            general_exposures=general_exposures,
+            sponsored_exposures=sponsored_exposures,
+            business_exposures=business_rows,
+            category_exposures=category_rows,
+            thresholds={
+                "max_business_exposure_share": max_business_share,
+                "max_category_exposure_share": max_category_share,
+                "min_events": min_events,
+            },
+            recommended_actions=actions,
+            window_days=window_days,
+            generated_at=generated_at,
+            next_recommended_check_at=generated_at + timedelta(days=7),
+        )
+
     def _signal_points(self, signal: dict) -> int:
         signal_type = signal["type"]
         value = float(signal["value"])
@@ -196,7 +305,7 @@ class InsightsService:
             "latitude": None,
             "longitude": None,
             "operating_status": "open",
-            "is_sponsored": False,
+            "is_sponsored": item.get("id") == 2,
             "accessible": True,
             "esg_participating": False,
         }

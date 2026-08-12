@@ -1,8 +1,17 @@
+from datetime import datetime
+import re
 from typing import Any
+from zoneinfo import ZoneInfo
 
+from app.core.config import settings
 from app.repositories.ai_repository import AIRepository
 from app.repositories.festival_repository import FestivalRepository
+from app.repositories.insights_repository import InsightsRepository
 from app.schemas.ai import (
+    AiGuideAction,
+    AiGuideRequest,
+    AiGuideResponse,
+    AiGuideSourceItem,
     CourseRecommendRequest,
     CourseRecommendResponse,
     CourseStop,
@@ -13,12 +22,19 @@ from app.schemas.ai import (
     VisionRequest,
     VisionResponse,
 )
+from app.services.insights_service import InsightsService
+
+
+KST = ZoneInfo("Asia/Seoul")
+SUPPORTED_LANGUAGES = {"ko", "en"}
 
 
 class AIService:
     def __init__(self) -> None:
         self.repo = AIRepository()
         self.festival_repo = FestivalRepository()
+        self.insights_repo = InsightsRepository()
+        self.insights_service = InsightsService()
 
     def analyze_image(self, payload: VisionRequest) -> VisionResponse:
         result = self.repo.analyze_image(payload.image_url)
@@ -66,6 +82,37 @@ class AIService:
             sources=["등록된 축제 데이터", "공식 공지"],
             last_updated_at=str(self.festival_repo.get_festival()["last_updated_at"]),
         )
+
+    def answer_visitor_ai_guide(self, festival_id: str, payload: AiGuideRequest) -> AiGuideResponse:
+        if str(festival_id) not in {"1", "EST34-2026"}:
+            raise ValueError("Festival was not found.")
+        if (payload.latitude is None) != (payload.longitude is None):
+            raise ValueError("latitude and longitude must be provided together.")
+
+        language = payload.language if payload.language in SUPPORTED_LANGUAGES else "ko"
+        intent = self._guide_intent(payload.message)
+        generated_at = datetime.now(KST).isoformat()
+        source_updated_at = str(self.festival_repo.get_festival()["last_updated_at"])
+        result = self._rule_based_guide(intent, language, festival_id, payload)
+
+        if settings.ENABLE_EXTERNAL_AI and result.source_items:
+            try:
+                llm = self.repo.call_llm(
+                    self._guide_prompt(payload.message, language),
+                    [self._source_line(item) for item in result.source_items],
+                )
+                text = self._strip_sensitive_text(llm["reply"])
+                result.display_text = text
+                result.speech_text = text
+                result.fallback_used = False
+                result.fallback_reason = None
+            except Exception:
+                result.fallback_used = True
+                result.fallback_reason = "external_ai_unavailable"
+
+        result.generated_at = generated_at
+        result.source_updated_at = source_updated_at
+        return result
 
     def recommend_course(self, payload: CourseRecommendRequest) -> CourseRecommendResponse:
         programs = self.festival_repo.list_programs()
@@ -117,6 +164,319 @@ class AIService:
                 "안전, 취소, 응급 상황은 현장 스태프와 공식 공지를 우선 확인하세요.",
             ],
         )
+
+    def _guide_intent(self, message: str) -> str:
+        text = message.lower()
+        if self._matches(text, ["crowd", "crowded", "congestion", "busy", "혼잡", "붐비", "사람 많", "대기"]):
+            return "crowding"
+        if self._matches(text, ["응급", "안전", "구급", "분실", "위험", "safe", "emergency", "medical", "lost", "danger"]):
+            return "safety"
+        if self._matches(text, ["음식", "부스", "맛집", "카페", "쿠폰", "업체", "상점", "food", "restaurant", "cafe", "coupon", "business", "booth", "vendor", "stall"]):
+            return "business"
+        if self._matches(text, ["포인트", "분리", "재활용", "스탬프", "친환경", "esg", "recycle", "stamp", "eco", "trash", "point"]):
+            return "esg"
+        if self._matches(text, ["일정", "공연", "프로그램", "오늘", "schedule", "program", "show", "performance", "today"]):
+            return "schedule"
+        if self._matches(text, ["어디", "지도", "무대", "메인", "화장실", "주차", "길", "where", "map", "route", "stage", "main stage", "restroom", "toilet", "parking"]):
+            return "navigation"
+        if self._matches(text, ["관광", "문화", "근처", "지역", "tour", "culture", "nearby", "photo", "local"]):
+            return "culture"
+        if self._matches(text, ["safe", "emergency", "medical", "lost", "danger", "응급", "안전", "구급", "분실", "위험"]):
+            return "safety"
+        if self._matches(text, ["food", "restaurant", "cafe", "coupon", "business", "상점", "맛집", "카페", "쿠폰", "업체"]):
+            return "business"
+        if self._matches(text, ["esg", "recycle", "stamp", "eco", "trash", "분리", "재활용", "스탬프", "친환경"]):
+            return "esg"
+        if self._matches(text, ["schedule", "program", "show", "performance", "today", "일정", "공연", "프로그램", "오늘"]):
+            return "schedule"
+        if self._matches(text, ["where", "map", "route", "stage", "restroom", "toilet", "parking", "길", "어디", "지도", "무대", "화장실", "주차"]):
+            return "navigation"
+        if self._matches(text, ["tour", "culture", "nearby", "photo", "local", "관광", "문화", "근처", "지역"]):
+            return "culture"
+        return "fallback"
+
+    def _rule_based_guide(
+        self,
+        intent: str,
+        language: str,
+        festival_id: str,
+        payload: AiGuideRequest,
+    ) -> AiGuideResponse:
+        if intent == "schedule":
+            return self._schedule_guide(language)
+        if intent == "navigation":
+            return self._navigation_guide(language, payload.message)
+        if intent == "culture":
+            return self._culture_guide(language)
+        if intent == "safety":
+            return self._safety_guide(language)
+        if intent == "crowding":
+            return self._crowding_guide(language)
+        if intent == "esg":
+            return self._esg_guide(language)
+        if intent == "business":
+            return self._business_guide(language, festival_id, payload)
+        return self._fallback_guide(language)
+
+    def _schedule_guide(self, language: str) -> AiGuideResponse:
+        programs = self.festival_repo.list_programs()[:3]
+        items = [
+            AiGuideSourceItem(
+                id=str(program["id"]),
+                title=program["name"],
+                subtitle=f"{program['start_time'].strftime('%m/%d %H:%M')} - {program['end_time'].strftime('%H:%M')}",
+                kind="program",
+                metadata={"location_id": program["location_id"], "status": program["status"]},
+            )
+            for program in programs
+        ]
+        text = self._text(
+            language,
+            "오늘 주요 일정은 등록된 프로그램 기준으로 안내해 드릴게요. 첫 일정은 {name}입니다.",
+            "Here are the main programs from the registered schedule. The first one is {name}.",
+        ).format(name=programs[0]["name"] if programs else self._text(language, "확인된 일정 없음", "no verified program"))
+        return self._guide_response("schedule", language, text, "program", items, [
+            AiGuideAction(type="open_schedule", label=self._text(language, "일정 보기", "Open schedule"), target="/visitor/schedule")
+        ])
+
+    def _navigation_guide(self, language: str, message: str) -> AiGuideResponse:
+        facilities = self.festival_repo.list_facilities()
+        programs = self.festival_repo.list_programs()
+        message_text = message.lower()
+        if self._matches(message_text, ["stage", "main stage", "무대", "메인"]):
+            selected_program = next((item for item in programs if item.get("location_id") == 1), programs[0] if programs else None)
+            if selected_program:
+                item = AiGuideSourceItem(
+                    id=str(selected_program["id"]),
+                    title=selected_program["name"],
+                    subtitle=selected_program["description"],
+                    kind="program",
+                    metadata={"location_id": selected_program["location_id"], "status": selected_program["status"]},
+                )
+                text = self._text(
+                    language,
+                    "메인 무대는 지도 location_id 1 구역입니다. 현장 표지판과 안내요원 안내를 함께 확인해 주세요.",
+                    "The main stage is the map area with location_id 1. Please also follow signs and staff guidance on site.",
+                )
+                return self._guide_response("navigation", language, text, "map", [item], [
+                    AiGuideAction(type="open_map", label=self._text(language, "지도에서 보기", "Open map"), target="/visitor/map"),
+                    AiGuideAction(type="call_staff", label=self._text(language, "운영요원 찾기", "Find staff"), target="staff"),
+                ])
+        selected = facilities[0]
+        if self._matches(message.lower(), ["medical", "emergency", "응급", "구급"]):
+            selected = next((item for item in facilities if item["category"] == "medical"), selected)
+        elif self._matches(message.lower(), ["parking", "주차"]):
+            selected = next((item for item in facilities if item["category"] == "parking"), selected)
+        item = AiGuideSourceItem(
+            id=str(selected["id"]),
+            title=selected["name"],
+            subtitle=selected["description"],
+            kind="facility",
+            metadata={"location_id": selected["location_id"], "category": selected["category"]},
+        )
+        text = self._text(
+            language,
+            "{name} 위치는 지도에서 확인할 수 있어요. 현장 표지판과 안내요원 안내를 함께 확인해 주세요.",
+            "{name} is available on the map. Please also follow signs and staff guidance on site.",
+        ).format(name=selected["name"])
+        return self._guide_response("navigation", language, text, "map", [item], [
+            AiGuideAction(type="open_map", label=self._text(language, "지도에서 보기", "Open map"), target="/visitor/map")
+        ])
+
+    def _culture_guide(self, language: str) -> AiGuideResponse:
+        festival = self.festival_repo.get_festival()
+        programs = [program for program in self.festival_repo.list_programs() if "ESG" in program.get("tags", [])]
+        items = [
+            AiGuideSourceItem(
+                id=str(program["id"]),
+                title=program["name"],
+                subtitle=program["description"],
+                kind="program",
+                metadata={"location_id": program["location_id"]},
+            )
+            for program in programs[:2]
+        ]
+        text = self._text(
+            language,
+            "{festival} 안에서는 지역과 친환경 주제의 전시와 체험을 먼저 추천해요.",
+            "Inside {festival}, start with the local culture and eco-themed exhibitions or activities.",
+        ).format(festival=festival["name"])
+        return self._guide_response("culture", language, text, "festival_data", items, [
+            AiGuideAction(type="open_schedule", label=self._text(language, "관련 일정 보기", "Open related programs"), target="/visitor/schedule")
+        ])
+
+    def _safety_guide(self, language: str) -> AiGuideResponse:
+        medical = next((item for item in self.festival_repo.list_facilities() if item["category"] == "medical"), None)
+        items = []
+        if medical:
+            items.append(
+                AiGuideSourceItem(
+                    id=str(medical["id"]),
+                    title=medical["name"],
+                    subtitle=medical["description"],
+                    kind="facility",
+                    metadata={"location_id": medical["location_id"], "category": medical["category"]},
+                )
+            )
+        text = self._text(
+            language,
+            "응급 상황이면 가까운 운영요원에게 바로 알리고, 긴급하면 119에 연락하세요. 축제 응급부스 위치도 안내할게요.",
+            "For an emergency, notify nearby staff immediately and call 119 if urgent. I can show the medical booth location.",
+        )
+        return self._guide_response("safety", language, text, "safety", items, [
+            AiGuideAction(type="open_map", label=self._text(language, "응급부스 위치", "Medical booth"), target="/visitor/map"),
+            AiGuideAction(type="call_staff", label=self._text(language, "운영요원 찾기", "Find staff"), target="staff"),
+        ])
+
+    def _crowding_guide(self, language: str) -> AiGuideResponse:
+        crowded_programs = [item for item in self.festival_repo.list_programs() if item.get("status") == "crowded"]
+        if not crowded_programs:
+            return self._no_data_guide(language, "crowding")
+        items = [
+            AiGuideSourceItem(
+                id=str(program["id"]),
+                title=program["name"],
+                subtitle=program["description"],
+                kind="program",
+                metadata={
+                    "location_id": program["location_id"],
+                    "status": program["status"],
+                    "reserved_count": program.get("reserved_count"),
+                    "capacity": program.get("capacity"),
+                },
+            )
+            for program in crowded_programs[:3]
+        ]
+        text = self._text(
+            language,
+            "현재 등록된 운영 데이터 기준으로 혼잡 표시가 있는 구역은 {name}입니다. 이동 전 현장 안내요원 안내를 확인해 주세요.",
+            "Based on verified operations data, the crowded area is {name}. Please check staff guidance before moving.",
+        ).format(name=crowded_programs[0]["name"])
+        return self._guide_response("safety", language, text, "crowding", items, [
+            AiGuideAction(type="open_map", label=self._text(language, "혼잡 구역 보기", "Open crowded area"), target="/visitor/map"),
+            AiGuideAction(type="call_staff", label=self._text(language, "운영요원 찾기", "Find staff"), target="staff"),
+        ])
+
+    def _esg_guide(self, language: str) -> AiGuideResponse:
+        notices = self.festival_repo.list_notices()
+        esg_notice = next((item for item in notices if "ESG" in item["body"] or "ESG" in item["title"]), notices[-1])
+        item = AiGuideSourceItem(
+            id=str(esg_notice["id"]),
+            title=esg_notice["title"],
+            subtitle=esg_notice["body"],
+            kind="notice",
+            metadata={"level": esg_notice["level"]},
+        )
+        text = self._text(
+            language,
+            "ESG 참여는 공식 공지와 현장 부스 안내를 기준으로 진행해 주세요. 재사용컵 반납이나 친환경 참여 안내를 확인할 수 있어요.",
+            "Please follow official notices and booth guidance for ESG participation, such as reusable cup returns or eco activities.",
+        )
+        return self._guide_response("esg", language, text, "notice", [item], [
+            AiGuideAction(type="open_map", label=self._text(language, "ESG 부스 찾기", "Find ESG booth"), target="/visitor/map")
+        ])
+
+    def _business_guide(self, language: str, festival_id: str, payload: AiGuideRequest) -> AiGuideResponse:
+        recommendations = self.insights_service.recommend_businesses(
+            festival_id,
+            latitude=payload.latitude,
+            longitude=payload.longitude,
+            limit=3,
+        )
+        open_items = [*recommendations.items, *recommendations.sponsored_items]
+        source_items = [
+            AiGuideSourceItem(
+                id=item.business_id,
+                title=item.name,
+                subtitle=" / ".join(item.reasons),
+                kind="business",
+                metadata={
+                    "category": item.category,
+                    "is_sponsored": item.is_sponsored,
+                    "score": item.score,
+                    "operating_status": item.operating_status,
+                    "location_id": item.location_id,
+                },
+            )
+            for item in open_items
+        ]
+        if not source_items:
+            return self._no_data_guide(language, "business")
+        text = self._text(
+            language,
+            "현재 영업 중인 참여업체 중 {name}을 먼저 추천해요. 후원 업체는 별도로 표시됩니다.",
+            "Among currently open participating businesses, start with {name}. Sponsored businesses are labeled separately.",
+        ).format(name=open_items[0].name)
+        return self._guide_response("business", language, text, "business", source_items, [
+            AiGuideAction(type="open_business", label=self._text(language, "추천 업체 보기", "Open recommendations"), target="/visitor/ai-guide")
+        ])
+
+    def _fallback_guide(self, language: str) -> AiGuideResponse:
+        text = self._text(
+            language,
+            "확인된 축제 데이터로 답할 수 있는 질문을 골라 주세요. 일정, 길찾기, 문화관광, 안전, ESG, 참여업체를 안내할 수 있어요.",
+            "Please choose a question I can answer from verified festival data: schedule, navigation, culture, safety, ESG, or businesses.",
+        )
+        return self._guide_response("fallback", language, text, "none", [], [
+            AiGuideAction(type="retry", label=self._text(language, "다시 질문하기", "Ask again"), target="")
+        ], fallback_used=True, fallback_reason="unsupported_intent")
+
+    def _no_data_guide(self, language: str, source_type: str) -> AiGuideResponse:
+        text = self._text(
+            language,
+            "현재 이 항목에 사용할 수 있는 확인된 데이터가 없습니다. 현장 안내소에서 최신 정보를 확인해 주세요.",
+            "There is no verified data available for this topic right now. Please check the information desk for updates.",
+        )
+        return self._guide_response("fallback", language, text, source_type, [], [
+            AiGuideAction(type="open_map", label=self._text(language, "안내소 찾기", "Find information desk"), target="/visitor/map")
+        ], fallback_used=True, fallback_reason="no_verified_data")
+
+    def _guide_response(
+        self,
+        intent: str,
+        language: str,
+        text: str,
+        source_type: str,
+        source_items: list[AiGuideSourceItem],
+        actions: list[AiGuideAction],
+        fallback_used: bool = False,
+        fallback_reason: str | None = None,
+    ) -> AiGuideResponse:
+        return AiGuideResponse(
+            intent=intent,
+            language=language,
+            display_text=text,
+            speech_text=text,
+            source_type=source_type,
+            source_items=source_items,
+            actions=actions,
+            fallback_used=fallback_used,
+            fallback_reason=fallback_reason,
+            generated_at="",
+            source_updated_at=None,
+        )
+
+    def _guide_prompt(self, message: str, language: str) -> str:
+        target = "Korean" if language == "ko" else "English"
+        return (
+            f"Answer the visitor in {target}. Use only the verified source items below. "
+            "Do not invent schedules, locations, safety status, ESG rewards, or business rankings. "
+            f"Visitor question: {message}"
+        )
+
+    def _source_line(self, item: AiGuideSourceItem) -> str:
+        return f"{item.kind}: {item.title}; {item.subtitle or ''}; {item.metadata}"
+
+    def _strip_sensitive_text(self, text: str) -> str:
+        text = re.sub(r"[\w.+-]+@[\w-]+\.[\w.-]+", "[masked-email]", text)
+        text = re.sub(r"\b\d{2,3}-\d{3,4}-\d{4}\b", "[masked-phone]", text)
+        return text.strip()
+
+    def _matches(self, text: str, keywords: list[str]) -> bool:
+        return any(keyword and keyword in text for keyword in keywords)
+
+    def _text(self, language: str, ko: str, en: str) -> str:
+        return en if language == "en" else ko
 
     def _match_program_ids(self, question: str, interests: list[str]) -> list[int]:
         words = {question.lower(), *[item.lower() for item in interests]}

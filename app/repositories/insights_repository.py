@@ -20,9 +20,11 @@ logger = logging.getLogger(__name__)
 
 
 class InsightsRepository:
+    _shared_recommendation_events: list[dict[str, Any]] = []
+
     def __init__(self) -> None:
         self._risk_briefs: dict[tuple[str, bool], dict[str, Any]] = {}
-        self._recommendation_events: list[dict[str, Any]] = []
+        self._recommendation_events = self._shared_recommendation_events
 
     def list_risk_signals(self, festival_id: str, include_resolved: bool = False) -> list[dict[str, Any]]:
         if not self._should_use_database():
@@ -134,6 +136,7 @@ class InsightsRepository:
         return dict(payload)
 
     def log_recommendation_event(self, payload: dict[str, Any]) -> None:
+        payload = {**payload, "created_at": payload.get("created_at") or datetime.now(KST)}
         self._recommendation_events.append(dict(payload))
         if not self._should_use_database():
             return
@@ -155,6 +158,39 @@ class InsightsRepository:
                 )
         except Exception as exc:  # pragma: no cover
             logger.warning("Recommendation event DB save failed; continuing: %s", exc)
+
+    def list_recommendation_events(self, festival_id: str, window_days: int = 7) -> list[dict[str, Any]]:
+        if not self._should_use_database():
+            return [
+                dict(event)
+                for event in self._recommendation_events
+                if str(event.get("festival_id")) == str(festival_id)
+            ]
+        try:
+            with psycopg.connect(settings.database_url, row_factory=dict_row, prepare_threshold=None) as connection:
+                rows = connection.execute(
+                    """
+                    SELECT
+                      festival_code AS festival_id,
+                      request_snapshot AS request,
+                      response_snapshot AS response,
+                      policy_version,
+                      created_at
+                    FROM business_recommendation_events
+                    WHERE festival_code = %s
+                      AND created_at >= now() - (%s::text || ' days')::interval
+                    ORDER BY created_at DESC
+                    """,
+                    (festival_id, window_days),
+                ).fetchall()
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Recommendation event DB read failed; using local events: %s", exc)
+            return [
+                dict(event)
+                for event in self._recommendation_events
+                if str(event.get("festival_id")) == str(festival_id)
+            ]
+        return [dict(row) for row in rows]
 
     def _find_festival(self, connection: Any, festival_id: str) -> dict[str, Any] | None:
         return connection.execute(
