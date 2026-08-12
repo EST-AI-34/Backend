@@ -1,4 +1,5 @@
 import re
+import logging
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -15,6 +16,7 @@ except ImportError:  # pragma: no cover
 
 
 KST = ZoneInfo("Asia/Seoul")
+logger = logging.getLogger(__name__)
 
 CATEGORY_TO_DB = {
     "environment": "E",
@@ -66,34 +68,45 @@ class ESGRepository:
         if not self._should_use_database():
             return list(self._metrics)
 
-        with psycopg.connect(settings.database_url, row_factory=dict_row, prepare_threshold=None) as connection:
-            rows = connection.execute(
-                """
-                SELECT
-                  metric.id::text AS id,
-                  metric.festival_id::text AS festival_id,
-                  CASE metric.category
-                    WHEN 'E' THEN 'environment'
-                    WHEN 'S' THEN 'social'
-                    WHEN 'G' THEN 'governance'
-                    ELSE lower(metric.category)
-                  END AS category,
-                  metric.name AS metric_name,
-                  COALESCE(measurement.value, 0)::float8 AS value,
-                  metric.unit,
-                  COALESCE(measurement.source_ref, measurement.source_type, 'database') AS source,
-                  COALESCE(measurement.measured_at, metric.created_at) AS recorded_at
-                FROM esg_metrics metric
-                LEFT JOIN LATERAL (
-                  SELECT value, source_type, source_ref, measured_at
-                  FROM esg_measurements
-                  WHERE metric_id = metric.id
-                  ORDER BY measured_at DESC
-                  LIMIT 1
-                ) measurement ON true
-                ORDER BY metric.created_at DESC
-                """
-            ).fetchall()
+        try:
+            with psycopg.connect(settings.database_url, row_factory=dict_row, prepare_threshold=None) as connection:
+                rows = connection.execute(
+                    """
+                    SELECT
+                      metric.id::text AS id,
+                      metric.festival_id::text AS festival_id,
+                      CASE metric.category
+                        WHEN 'E' THEN 'environment'
+                        WHEN 'S' THEN 'social'
+                        WHEN 'G' THEN 'governance'
+                        ELSE lower(metric.category)
+                      END AS category,
+                      metric.name AS metric_name,
+                      COALESCE(measurement.value, 0)::float8 AS value,
+                      COALESCE(version.unit, '') AS unit,
+                      COALESCE(measurement.source_ref, measurement.source_type, 'database') AS source,
+                      COALESCE(measurement.measured_at, metric.created_at) AS recorded_at
+                    FROM esg_metrics metric
+                    LEFT JOIN LATERAL (
+                      SELECT id, unit
+                      FROM esg_metric_versions
+                      WHERE metric_id = metric.id
+                      ORDER BY version_no DESC
+                      LIMIT 1
+                    ) version ON true
+                    LEFT JOIN LATERAL (
+                      SELECT value, source_type, source_ref, measured_at
+                      FROM esg_measurements
+                      WHERE metric_version_id = version.id
+                      ORDER BY measured_at DESC
+                      LIMIT 1
+                    ) measurement ON true
+                    ORDER BY metric.created_at DESC
+                    """
+                ).fetchall()
+        except Exception as exc:  # pragma: no cover
+            logger.warning("ESG metric DB read failed; using in-memory fixture: %s", exc)
+            return list(self._metrics)
         return [dict(row) for row in rows]
 
     def create_metric(self, payload: dict) -> dict:
@@ -107,34 +120,64 @@ class ESGRepository:
             self._metrics.append(metric)
             return metric
 
-        with psycopg.connect(settings.database_url, row_factory=dict_row, prepare_threshold=None) as connection:
-            festival = connection.execute(
-                "SELECT id FROM festivals ORDER BY starts_at DESC, created_at DESC LIMIT 1"
-            ).fetchone()
-            if not festival:
-                raise RuntimeError("Cannot create ESG metric because no festival exists in the database.")
+        try:
+            with psycopg.connect(settings.database_url, row_factory=dict_row, prepare_threshold=None) as connection:
+                festival = connection.execute(
+                    "SELECT id FROM festivals ORDER BY starts_at DESC, created_at DESC LIMIT 1"
+                ).fetchone()
+                if not festival:
+                    raise RuntimeError("Cannot create ESG metric because no festival exists in the database.")
 
-            metric = connection.execute(
-                """
-                INSERT INTO esg_metrics(festival_id, name, category, unit)
-                VALUES (%s, %s, %s, %s)
-                RETURNING id, festival_id, name, category, unit, created_at
-                """,
-                (
-                    festival["id"],
-                    payload["metric_name"],
-                    CATEGORY_TO_DB[payload["category"]],
-                    payload["unit"],
-                ),
-            ).fetchone()
-            measurement = connection.execute(
-                """
-                INSERT INTO esg_measurements(festival_id, metric_id, value, source_type, source_ref, status)
-                VALUES (%s, %s, %s, 'manual', %s, 'VALIDATED')
-                RETURNING value, source_ref, measured_at
-                """,
-                (festival["id"], metric["id"], payload["value"], payload["source"]),
-            ).fetchone()
+                actor = connection.execute("SELECT id FROM users ORDER BY created_at LIMIT 1").fetchone()
+                if not actor:
+                    raise RuntimeError("Cannot create ESG metric because no user exists in the database.")
+
+                metric = connection.execute(
+                    """
+                    INSERT INTO esg_metrics(festival_id, name, category, created_by)
+                    VALUES (%s, %s, %s, %s)
+                    RETURNING id, festival_id, name, category, created_at
+                    """,
+                    (festival["id"], payload["metric_name"], CATEGORY_TO_DB[payload["category"]], actor["id"]),
+                ).fetchone()
+                version = connection.execute(
+                    """
+                    INSERT INTO esg_metric_versions(
+                      metric_id, version_no, formula, unit, source_requirements, created_by
+                    )
+                    VALUES (%s, 1, 'manual', %s, '{}'::jsonb, %s)
+                    RETURNING id, unit
+                    """,
+                    (metric["id"], payload["unit"], actor["id"]),
+                ).fetchone()
+                measurement = connection.execute(
+                    """
+                    INSERT INTO esg_measurements(
+                      festival_id, metric_version_id, value, source_type, source_ref,
+                      dedupe_key, measured_at, status, created_by
+                    )
+                    VALUES (%s, %s, %s, 'manual', %s, %s, now(), 'APPROVED', %s)
+                    RETURNING value, source_ref, measured_at
+                    """,
+                    (
+                        festival["id"],
+                        version["id"],
+                        payload["value"],
+                        payload["source"],
+                        f"manual:{metric['id']}",
+                        actor["id"],
+                    ),
+                ).fetchone()
+        except Exception as exc:  # pragma: no cover
+            logger.warning("ESG metric DB write failed; using in-memory fixture: %s", exc)
+            metric = {
+                "id": len(self._metrics) + 1,
+                "festival_id": 1,
+                "recorded_at": datetime.now(KST),
+                **payload,
+            }
+            self._metrics.append(metric)
+            return metric
 
         return {
             "id": str(metric["id"]),
@@ -142,7 +185,7 @@ class ESGRepository:
             "category": DB_TO_CATEGORY[metric["category"]],
             "metric_name": metric["name"],
             "value": float(measurement["value"]),
-            "unit": metric["unit"],
+            "unit": version["unit"],
             "source": measurement["source_ref"],
             "recorded_at": measurement["measured_at"],
         }

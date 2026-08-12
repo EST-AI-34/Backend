@@ -27,3 +27,8 @@ app.include_router(api_router, prefix="/api/v1")
 @app.get("/health", summary="Health check")
 def health_check() -> dict:
     return {"status": "ok", "service": settings.PROJECT_NAME}
+
+
+@app.get("/health/ready", summary="Readiness check")
+def readiness_check() -> dict:
+    return {"status": "ready", "service": settings.PROJECT_NAME}

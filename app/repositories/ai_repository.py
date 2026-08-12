@@ -79,6 +79,15 @@ class AIRepository:
         result = self.call_llm(prompt, context)
         return {"briefing": self._one_sentence(result["reply"]), "source": "allen"}
 
+    def create_risk_briefing(self, context: list[str]) -> dict[str, str]:
+        prompt = (
+            "Use only the verified festival operations risk context below. "
+            "Write exactly one concise Korean admin risk summary sentence. "
+            "Do not add new scores, names, phone numbers, personal data, or unverified causes."
+        )
+        result = self.call_llm(prompt, context)
+        return {"briefing": self._one_sentence(result["reply"]), "source": "allen"}
+
     def _compose_user_prompt(self, prompt: str, context: list[str]) -> str:
         context_text = "\n".join(f"- {item}" for item in context)
         return (

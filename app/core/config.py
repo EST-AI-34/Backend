@@ -23,6 +23,8 @@ class Settings:
     SUPABASE_ANON_KEY: str = ""
     SUPABASE_SERVICE_ROLE_KEY: str = ""
     JWT_SECRET: str = "replace-with-at-least-32-random-characters"
+    JWT_ISSUER: str = "festai-admin"
+    JWT_AUDIENCE: str = "festai-admin-api"
     ACCESS_TOKEN_MINUTES: int = 15
     REFRESH_TOKEN_DAYS: int = 7
     VISITOR_SESSION_HOURS: int = 24
@@ -63,6 +65,8 @@ settings = Settings(
     SUPABASE_ANON_KEY=os.getenv("SUPABASE_ANON_KEY", ""),
     SUPABASE_SERVICE_ROLE_KEY=os.getenv("SUPABASE_SERVICE_ROLE_KEY", ""),
     JWT_SECRET=os.getenv("JWT_SECRET", "replace-with-at-least-32-random-characters"),
+    JWT_ISSUER=os.getenv("JWT_ISSUER", "festai-admin"),
+    JWT_AUDIENCE=os.getenv("JWT_AUDIENCE", "festai-admin-api"),
     ACCESS_TOKEN_MINUTES=int(os.getenv("ACCESS_TOKEN_MINUTES", "15")),
     REFRESH_TOKEN_DAYS=int(os.getenv("REFRESH_TOKEN_DAYS", "7")),
     VISITOR_SESSION_HOURS=int(os.getenv("VISITOR_SESSION_HOURS", "24")),

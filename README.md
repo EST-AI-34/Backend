@@ -23,6 +23,9 @@ basic ESG reporting.
 - Map locations with simple congestion status
 - Operator dashboard stats and incident registration
 - ESG metrics, dashboard summary, report draft generation, and Allen-only admin one-line briefing
+- Admin risk brief from verified PostgreSQL operations signals, with Allen-disabled fallback
+- Visitor business recommendations from approved PostgreSQL participating businesses, with sponsored results separated
+- Admin API Bearer token authorization with role and festival scope checks
 - Required Alan/Allen integration for AI answer/report generation using the myAlan API, fixed Alan v4.0 persona, and one explicit auth mode
 
 ## AI Role Policy
@@ -55,6 +58,8 @@ SUPABASE_URL=https://[PROJECT_REF].supabase.co
 SUPABASE_ANON_KEY=your_supabase_anon_key_here
 SUPABASE_SERVICE_ROLE_KEY=your_supabase_service_role_key_here
 JWT_SECRET=replace-with-at-least-32-random-characters
+JWT_ISSUER=festai-admin
+JWT_AUDIENCE=festai-admin-api
 ACCESS_TOKEN_MINUTES=15
 REFRESH_TOKEN_DAYS=7
 VISITOR_SESSION_HOURS=24
@@ -85,6 +90,15 @@ fall back to bearer or any other model.
 python -m scripts.migrate
 ```
 
+Current migration chain:
+
+- `001_init.sql`: core FEST schema
+- `002_ai_risk_and_business_recommendations.sql`: risk brief cache, recommendation policy, recommendation events
+- `003_harden_insight_tables.sql`: NOT VALID integrity constraints for generated insight tables
+- `004_participating_businesses.sql`: approved business source table for BIZ-03
+- `005_validate_insight_constraints.sql`: validates the 003 constraints after data checks
+- `006_participating_business_seed_key.sql`: idempotent demo business seed key
+
 This backend uses Supabase as managed PostgreSQL through `DATABASE_URL`. Use the
 Transaction pooler connection string when the runtime is serverless or IPv4-only.
 It should use a `pooler.supabase.com` host and port `6543`. The `SUPABASE_URL`
@@ -93,6 +107,16 @@ when those are added.
 
 For local-only development, you can still start the included Postgres container
 and set `DATABASE_URL=postgres://festival:festival@localhost:5432/festival`.
+
+Seed approved demo businesses for BIZ-03 after migrations:
+
+```bash
+python -m scripts.seed_businesses
+```
+
+The seed is idempotent through the `(festival_id, name)` unique index and stores
+only operational demo rows in `participating_businesses`; recommendation code
+does not hard-code business data.
 
 4. Start the server:
 
@@ -103,6 +127,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ## Example endpoints
 
 - `GET /health`
+- `GET /health/ready`
 - `GET /api/v1/festival/overview`
 - `GET /api/v1/festival/programs`
 - `GET /api/v1/festival/facilities`
@@ -122,6 +147,32 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 - `GET /api/v1/esg/summary`
 - `GET /api/v1/esg/briefing`
 - `POST /api/v1/esg/report`
+- `GET /api/v1/admin/festivals/{festival_id}/risk-brief`
+- `GET /api/v1/visitor/festivals/{festival_id}/business-recommendations`
+
+Admin endpoints require an `Authorization: Bearer <HS256 JWT>` header. The
+backend verifies the HS256 signature with `JWT_SECRET`, fixed `alg`, `exp`,
+optional `nbf`, `iss=JWT_ISSUER`, and `aud=JWT_AUDIENCE`. Tokens are issued by
+the external admin authentication system and delivered to clients through the
+frontend/admin identity flow; this backend only validates them and does not
+provide a temporary login endpoint. In non-development environments, placeholder
+or empty `JWT_SECRET` values fail closed.
+
+Admin roles are enforced per endpoint:
+
+- `SUPER_ADMIN`: all admin reads and writes, with `festival_scope=["*"]` allowed
+- `FESTIVAL_MANAGER`: festival admin reads and writes within scope
+- `FIELD_OPERATOR`: admin reads and operations ticket writes within scope
+- `REVIEWER`: admin reads and ESG/AI review reads within scope
+
+`festival_scope` must contain the requested festival code/id or `"*"`.
+AI-04 schedule-change risk uses `program_sessions` when that table exists. In
+deployments where it is absent, the repository falls back to existing `programs`
+update timestamps; if neither source exists, schedule-change evidence is simply
+omitted rather than treated as a normal/zero signal.
+
+Frontend integration examples for AI-04 and BIZ-03 are in
+[`docs/frontend-ai04-biz03-integration.md`](docs/frontend-ai04-biz03-integration.md).
 
 ## Example requests
 

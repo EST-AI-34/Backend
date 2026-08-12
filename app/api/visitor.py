@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 
 from app.api.responses import listed, ok
 from app.repositories.ai_repository import AllenAPIError
@@ -6,11 +6,13 @@ from app.schemas.ai import CourseRecommendRequest, GuideQuestionRequest
 from app.schemas.survey import SurveySubmission
 from app.services.ai_service import AIService
 from app.services.festival_service import FestivalService
+from app.services.insights_service import InsightsService
 from app.services.survey_service import SurveyService
 
 router = APIRouter()
 ai_service = AIService()
 festival_service = FestivalService()
+insights_service = InsightsService()
 survey_service = SurveyService()
 
 
@@ -88,3 +90,26 @@ def list_wait_tickets() -> dict:
 @router.post("/surveys/{survey_id}/responses", summary="Submit anonymous survey response")
 def submit_survey_response(survey_id: str, payload: SurveySubmission) -> dict:
     return ok(survey_service.submit(payload))
+
+
+@router.get("/festivals/{festival_id}/business-recommendations", summary="Recommend visitor businesses")
+def recommend_businesses(
+    festival_id: str,
+    latitude: float | None = Query(default=None, ge=-90, le=90),
+    longitude: float | None = Query(default=None, ge=-180, le=180),
+    category: str | None = Query(default=None, pattern="^(restaurant|cafe|market|souvenir)$"),
+    limit: int = Query(default=10, ge=1, le=50),
+    accessibility_required: bool = False,
+) -> dict:
+    if (latitude is None) != (longitude is None):
+        raise HTTPException(status_code=422, detail="latitude and longitude must be provided together.")
+    return ok(
+        insights_service.recommend_businesses(
+            festival_id=festival_id,
+            latitude=latitude,
+            longitude=longitude,
+            category=category,
+            limit=limit,
+            accessibility_required=accessibility_required,
+        )
+    )

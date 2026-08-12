@@ -1,0 +1,17 @@
+ALTER TABLE ai_risk_briefs
+  VALIDATE CONSTRAINT ai_risk_briefs_payload_object_chk;
+
+ALTER TABLE ai_risk_briefs
+  VALIDATE CONSTRAINT ai_risk_briefs_risk_level_chk;
+
+ALTER TABLE ai_risk_briefs
+  VALIDATE CONSTRAINT ai_risk_briefs_risk_score_chk;
+
+ALTER TABLE business_recommendation_events
+  VALIDATE CONSTRAINT business_recommendation_events_request_object_chk;
+
+ALTER TABLE business_recommendation_events
+  VALIDATE CONSTRAINT business_recommendation_events_response_object_chk;
+
+ALTER TABLE business_recommendation_events
+  VALIDATE CONSTRAINT business_recommendation_events_policy_nonempty_chk;
