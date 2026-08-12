@@ -1,4 +1,3 @@
-import re
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request, Response
@@ -6,7 +5,7 @@ from psycopg import Connection
 from psycopg.errors import UniqueViolation
 
 from ..db import all_rows, database, jsonb, one
-from ..domain import is_safe_question
+from ..domain import is_safe_question, search_terms
 from ..errors import bad_request, conflict, not_found
 from ..http import success
 from ..schemas import ConversationIn, MessageIn, ReportMessageIn, SurveyResponseIn
@@ -65,8 +64,7 @@ def send_message(conversation_id: str, body: MessageIn, request: Request, visito
             VALUES(%s,%s,%s,'BLOCKED',%s) RETURNING *""", (conversation_id, body.message, "보안 또는 개인정보와 관련된 요청에는 답변할 수 없습니다.", jsonb(fallback)))
         return success(request, {"messageId": row["id"], "answer": row["answer"], "safetyStatus": "BLOCKED", "sources": [], "fallback": fallback})
 
-    terms = list(dict.fromkeys(term for term in re.split(r"[^\w가-힣]+", body.message.lower()) if len(term) >= 2))[:8]
-    patterns = [f"%{term}%" for term in terms]
+    patterns = [f"%{term}%" for term in search_terms(body.message)]
     sources = all_rows(connection, """SELECT cv.id AS content_version_id,cv.body,cv.language,ci.content_type,ci.resource_type,
         ci.slug,ci.updated_at,f.code AS festival_code FROM content_items ci
         JOIN content_versions cv ON cv.id=ci.published_version_id JOIN festivals f ON f.id=ci.festival_id

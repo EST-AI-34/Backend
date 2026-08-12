@@ -6,6 +6,7 @@ from psycopg import Connection
 
 from ..config import settings
 from ..db import all_rows, database, jsonb, one
+from ..domain import supported_language
 from ..errors import not_found
 from ..http import success
 from ..schemas import VisitorSessionIn
@@ -52,7 +53,8 @@ def programs(
     language: str | None = None,
 ):
     festival = published_festival(connection, festival_code)
-    values: list = [festival["id"], language or festival["default_language"], festival["default_language"]]
+    language = supported_language(language or request.headers.get("Accept-Language"), festival["supported_languages"], festival["default_language"])
+    values: list = [festival["id"], language, festival["default_language"]]
     clauses = ["p.festival_id=%s", "p.status='PUBLISHED'", "ci.lifecycle_status='PUBLISHED'", "cv.language IN (%s,%s)"]
     if category:
         clauses.append("p.category=%s"); values.append(category)
@@ -82,7 +84,7 @@ def programs(
 @router.get("/public/festivals/{festival_code}/programs/{program_slug}")
 def program_detail(festival_code: str, program_slug: str, request: Request, response: Response, connection: Annotated[Connection, Depends(database)], language: str | None = None):
     festival = published_festival(connection, festival_code)
-    language = language or festival["default_language"]
+    language = supported_language(language or request.headers.get("Accept-Language"), festival["supported_languages"], festival["default_language"])
     row = one(
         connection,
         """SELECT p.id,p.slug,p.title,p.summary,p.category,p.accessibility,p.updated_at,cv.language,cv.body,
@@ -166,9 +168,10 @@ def create_visitor_session(festival_code: str, body: VisitorSessionIn, request: 
     festival = published_festival(connection, festival_code)
     token = random_token("vs")
     expires_at = datetime.now(UTC) + timedelta(hours=settings.visitor_session_hours)
+    language = supported_language(body.language or request.headers.get("Accept-Language"), festival["supported_languages"], festival["default_language"])
     row = one(connection, """INSERT INTO visitor_sessions(festival_id,anonymous_token_hash,language,accessibility_preferences,consents,expires_at)
-        VALUES(%s,%s,%s,%s,%s,%s) RETURNING id""", (festival["id"], hash_token(token), body.language, jsonb(body.accessibility_preferences), jsonb(body.consents), expires_at))
-    return success(request, {"id": row["id"], "sessionToken": token, "expiresAt": expires_at, "festival": {"code": festival["code"], "timezone": festival["timezone"]}})
+        VALUES(%s,%s,%s,%s,%s,%s) RETURNING id""", (festival["id"], hash_token(token), language, jsonb(body.accessibility_preferences), jsonb(body.consents), expires_at))
+    return success(request, {"id": row["id"], "sessionToken": token, "expiresAt": expires_at, "language": language, "accessibilityPreferences": body.accessibility_preferences, "festival": {"code": festival["code"], "timezone": festival["timezone"], "supportedLanguages": festival["supported_languages"]}})
 
 
 @router.get("/public/festivals/{festival_code}/surveys")

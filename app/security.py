@@ -107,7 +107,7 @@ def current_visitor(
         raise unauthorized()
     visitor = one(
         connection,
-        """SELECT id,festival_id,language FROM visitor_sessions
+        """SELECT id,festival_id,language,accessibility_preferences FROM visitor_sessions
            WHERE anonymous_token_hash=%s AND ended_at IS NULL AND expires_at>now()""",
         (hash_token(credentials.credentials),),
     )

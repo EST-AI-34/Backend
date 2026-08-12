@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "festival-dx-backend"
-version = "1.0.0"
+version = "1.1.0"
 description = "AI·ESG 기반 지역축제 DX FastAPI backend"
 requires-python = ">=3.12"
 dependencies = [

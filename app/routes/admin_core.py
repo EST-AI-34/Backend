@@ -62,7 +62,7 @@ def patch_row(
 def list_festivals(request: Request, user: Annotated[dict, Depends(current_user)], connection: Annotated[Connection, Depends(database)]):
     rows = all_rows(connection, """SELECT id,code,name,description,timezone,starts_at,ends_at,status,default_language,
         supported_languages,version,updated_at FROM festivals WHERE organization_id=%s
-        AND (%s OR festival_scope_allowed(%s,id)) ORDER BY starts_at DESC""".replace("festival_scope_allowed(%s,id)", "%s::jsonb ? id::text OR %s::jsonb ? '*'"),
+        AND (%s OR %s::jsonb ? id::text OR %s::jsonb ? '*') ORDER BY starts_at DESC""",
         (user["organization_id"], user["role"] == "SUPER_ADMIN", jsonb(user["festival_scope"]), jsonb(user["festival_scope"])))
     return success(request, rows)
 

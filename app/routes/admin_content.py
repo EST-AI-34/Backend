@@ -8,7 +8,7 @@ from ..domain import validate_content_review
 from ..errors import bad_request, not_found, unprocessable
 from ..http import success
 from ..schemas import AIDecisionIn, ContentItemIn, ContentVersionIn, PublishContentIn, ReviewIn
-from ..security import current_user, festival_access, roles
+from ..security import festival_access, roles
 
 
 router = APIRouter()
