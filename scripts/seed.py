@@ -19,14 +19,17 @@ def main() -> None:
             ("manager@example.com", "축제 담당자", "FESTIVAL_MANAGER"),
             ("reviewer@example.com", "검토 담당자", "REVIEWER"),
             ("operator@example.com", "현장 운영자", "FIELD_OPERATOR"),
+            ("merchant@example.com", "참여 상인", "MERCHANT"),
         ]
         users = {}
+        memberships = {}
         for email, name, role in accounts:
             user = connection.execute("""INSERT INTO users(email,password_hash,name) VALUES(%s,%s,%s)
                 ON CONFLICT(email) DO UPDATE SET password_hash=excluded.password_hash,name=excluded.name RETURNING *""", (email,password_hash,name)).fetchone()
             connection.execute("""INSERT INTO memberships(organization_id,user_id,role,festival_scope) VALUES(%s,%s,%s,%s)
                 ON CONFLICT(organization_id,user_id) DO UPDATE SET role=excluded.role,festival_scope=excluded.festival_scope,status='ACTIVE'""", (organization["id"],user["id"],role,Jsonb(["*"])))
             users[role]=user
+            memberships[role]=connection.execute("SELECT * FROM memberships WHERE organization_id=%s AND user_id=%s",(organization["id"],user["id"])).fetchone()
         festival = connection.execute("""INSERT INTO festivals(organization_id,code,name,description,starts_at,ends_at,status)
             VALUES(%s,'EST34-2026','2026 지역문화축제','AI·ESG 기반 지역축제 DX 데모','2026-09-12T00:00:00Z','2026-09-14T12:00:00Z','PUBLISHED')
             ON CONFLICT(code) DO UPDATE SET name=excluded.name,status='PUBLISHED',updated_at=now() RETURNING *""", (organization["id"],)).fetchone()
@@ -85,8 +88,40 @@ def main() -> None:
                 measurement = connection.execute("""INSERT INTO esg_measurements(festival_id,metric_version_id,value,source_type,source_ref,dedupe_key,measured_at,status,created_by)
                     VALUES(%s,%s,%s,%s,'데모 운영 로그','seed-2026','2026-09-13T03:00:00Z','APPROVED',%s) RETURNING id""", (festival["id"],metric_version["id"],value,source_type,users["FESTIVAL_MANAGER"]["id"])).fetchone()
                 connection.execute("INSERT INTO esg_reviews(measurement_id,reviewer_id,decision,comment) VALUES(%s,%s,'APPROVED','데모 시드 승인')", (measurement["id"],users["REVIEWER"]["id"]))
+        business=connection.execute("""INSERT INTO businesses(organization_id,registration_no,name,address)
+            VALUES(%s,'EST34-DEMO-MERCHANT','제주 로컬 카페',%s)
+            ON CONFLICT(organization_id,registration_no) DO UPDATE SET name=excluded.name,address=excluded.address,updated_at=now() RETURNING *""",
+            (organization["id"],Jsonb({"road":"제주시 축제로 34"}))).fetchone()
+        festival_business=connection.execute("SELECT * FROM festival_businesses WHERE festival_id=%s AND business_id=%s",(festival["id"],business["id"])).fetchone()
+        if not festival_business:
+            festival_business=connection.execute("""INSERT INTO festival_businesses(festival_id,business_id,owner_membership_id,category,description,menu,
+                operating_hours,accessibility,participation_status,approved_by,approved_at)
+                VALUES(%s,%s,%s,'CAFE','지역 농산물 음료와 다회용 컵을 제공합니다.',%s,%s,%s,'APPROVED',%s,now()) RETURNING *""",
+                (festival["id"],business["id"],memberships["MERCHANT"]["id"],Jsonb([{"name":"감귤 에이드","price":5000}]),Jsonb({"daily":"10:00-20:00"}),Jsonb({"wheelchair":True}),users["SUPER_ADMIN"]["id"])).fetchone()
+        connection.execute("""INSERT INTO booths(festival_business_id,area_id,booth_no)
+            SELECT %s,%s,'L-01' WHERE NOT EXISTS(SELECT 1 FROM booths WHERE festival_business_id=%s AND booth_no='L-01')""",
+            (festival_business["id"],area["id"],festival_business["id"]))
+        connection.execute("""INSERT INTO coupons(festival_business_id,name,description,benefit_type,benefit_value,issue_limit,valid_from,valid_until,created_by)
+            SELECT %s,'다회용 컵 할인','다회용 컵 사용 시 1천 원 할인','FIXED',1000,100,%s,%s,%s
+            WHERE NOT EXISTS(SELECT 1 FROM coupons WHERE festival_business_id=%s AND name='다회용 컵 할인')""",
+            (festival_business["id"],festival["starts_at"],festival["ends_at"],users["MERCHANT"]["id"],festival_business["id"]))
+        connection.execute("""INSERT INTO crowd_snapshots(festival_id,area_id,source_type,crowd_level,people_count,estimated_wait_min,captured_at,expires_at,created_by)
+            SELECT %s,%s,'MANUAL','MODERATE',85,10,now(),now()+interval '30 minutes',%s
+            WHERE NOT EXISTS(SELECT 1 FROM crowd_snapshots WHERE festival_id=%s)""",
+            (festival["id"],area["id"],users["FIELD_OPERATOR"]["id"],festival["id"]))
+        campaign=connection.execute("SELECT * FROM reward_campaigns WHERE festival_id=%s AND name='친환경 축제 행동'",(festival["id"],)).fetchone()
+        if not campaign:
+            campaign=connection.execute("""INSERT INTO reward_campaigns(festival_id,name,starts_at,ends_at,daily_point_limit,created_by)
+                VALUES(%s,'친환경 축제 행동',%s,%s,100,%s) RETURNING *""",(festival["id"],festival["starts_at"],festival["ends_at"],users["FESTIVAL_MANAGER"]["id"])).fetchone()
+        connection.execute("""INSERT INTO reward_actions(campaign_id,action_type,verification_type,points,per_user_limit,rule)
+            VALUES(%s,'REUSABLE_CUP_RETURN','QR',10,3,%s) ON CONFLICT(campaign_id,action_type) DO NOTHING""",
+            (campaign["id"],Jsonb({"verificationKeys":["cup-return-main"]})))
+        connection.execute("""INSERT INTO internal_documents(festival_id,title,document_type,body,allowed_roles,created_by)
+            SELECT %s,'폭염 대응 매뉴얼','SAFETY_MANUAL','온열 증상 발생 시 의료 부스로 안내하고 현장 책임자에게 즉시 보고합니다.',%s,%s
+            WHERE NOT EXISTS(SELECT 1 FROM internal_documents WHERE festival_id=%s AND title='폭염 대응 매뉴얼')""",
+            (festival["id"],Jsonb(["SUPER_ADMIN","FESTIVAL_MANAGER","FIELD_OPERATOR"]),users["FESTIVAL_MANAGER"]["id"],festival["id"]))
     print("seeded demo data")
-    print("accounts: admin/manager/reviewer/operator @example.com, password: ChangeMe123!")
+    print("accounts: admin/manager/reviewer/operator/merchant @example.com, password: ChangeMe123!")
 
 
 if __name__ == "__main__":

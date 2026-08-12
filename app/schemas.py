@@ -306,3 +306,144 @@ class ExportIn(APIModel):
 class GenericExportIn(APIModel):
     resource_type: str
     format: Literal["CSV", "JSON"]
+
+
+class VisitorPreferencesPatch(APIModel):
+    language: str | None = Field(default=None, min_length=2, max_length=10)
+    accessibility_preferences: dict[str, Any] | None = None
+
+
+class StaffAssignmentIn(DateRangeModel):
+    membership_id: str
+    area_id: str
+    duty_role: str = Field(min_length=1, max_length=100)
+    task: str | None = Field(default=None, max_length=1000)
+
+
+class CrowdSnapshotIn(APIModel):
+    area_id: str
+    program_session_id: str | None = None
+    source_type: Literal["MANUAL", "ENTRY", "RESERVATION", "SENSOR"] = "MANUAL"
+    crowd_level: Literal["QUIET", "MODERATE", "BUSY", "FULL"]
+    people_count: int | None = Field(default=None, ge=0)
+    estimated_wait_min: int | None = Field(default=None, ge=0)
+    captured_at: datetime
+    expires_at: datetime
+
+    @model_validator(mode="after")
+    def valid_expiry(self):
+        if self.captured_at >= self.expires_at:
+            raise ValueError("expiresAt은 capturedAt 이후여야 합니다.")
+        return self
+
+
+class BookingIn(APIModel):
+    party_size: int = Field(default=1, ge=1, le=20)
+    contact: dict[str, str] | None = None
+
+
+class BookingStatusIn(APIModel):
+    status: Literal["CALLED", "NO_SHOW", "COMPLETED"]
+    note: str | None = Field(default=None, max_length=500)
+
+
+class CoursePlanIn(APIModel):
+    interests: list[str] = Field(default_factory=list, max_length=10)
+    companion_type: str | None = Field(default=None, max_length=50)
+    duration_min: int = Field(ge=30, le=720)
+    starts_at: datetime | None = None
+    area_id: str | None = None
+    accessibility: dict[str, Any] = Field(default_factory=dict)
+    excluded_program_ids: list[str] = Field(default_factory=list)
+
+
+class BusinessIn(APIModel):
+    registration_no: str = Field(min_length=3, max_length=50)
+    name: str = Field(min_length=1, max_length=200)
+    category: str = Field(min_length=1, max_length=100)
+    description: str | None = Field(default=None, max_length=4000)
+    contact: dict[str, str] | None = None
+    address: dict[str, Any] = Field(default_factory=dict)
+    menu: list[dict[str, Any]] = Field(default_factory=list)
+    operating_hours: dict[str, Any] = Field(default_factory=dict)
+    accessibility: dict[str, Any] = Field(default_factory=dict)
+    owner_membership_id: str | None = None
+    area_id: str | None = None
+    booth_no: str | None = Field(default=None, max_length=50)
+
+
+class BusinessPatch(APIModel):
+    name: str | None = None
+    category: str | None = None
+    description: str | None = None
+    menu: list[dict[str, Any]] | None = None
+    operating_hours: dict[str, Any] | None = None
+    accessibility: dict[str, Any] | None = None
+    version: int
+
+
+class BusinessReviewIn(APIModel):
+    decision: Literal["APPROVED", "REJECTED"]
+    comment: str | None = Field(default=None, max_length=2000)
+
+
+class CouponIn(DateRangeModel):
+    name: str = Field(min_length=1, max_length=200)
+    description: str | None = None
+    benefit_type: Literal["FIXED", "PERCENT", "GIFT"]
+    benefit_value: float = Field(ge=0)
+    issue_limit: int = Field(gt=0)
+    per_visitor_limit: int = Field(default=1, gt=0)
+
+
+class CouponRedeemIn(APIModel):
+    issue_token: str = Field(pattern=r"^cp_")
+
+
+class CouponReverseIn(APIModel):
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class RewardCampaignIn(DateRangeModel):
+    name: str = Field(min_length=1, max_length=200)
+    daily_point_limit: int = Field(gt=0)
+
+
+class RewardActionIn(APIModel):
+    action_type: str = Field(min_length=1, max_length=100)
+    verification_type: str = Field(min_length=1, max_length=100)
+    points: int = Field(gt=0)
+    per_user_limit: int = Field(default=1, gt=0)
+    rule: dict[str, Any] = Field(default_factory=dict)
+
+
+class RewardEventIn(APIModel):
+    reward_action_id: str
+    verification_key: str = Field(min_length=1, max_length=200)
+    evidence: dict[str, Any] = Field(default_factory=dict)
+    occurred_at: datetime | None = None
+
+
+class InternalDocumentIn(APIModel):
+    title: str = Field(min_length=1, max_length=200)
+    document_type: str = Field(min_length=1, max_length=100)
+    body: str = Field(min_length=1, max_length=100_000)
+    source_url: str | None = None
+    allowed_roles: list[Role] = Field(default_factory=lambda: ["SUPER_ADMIN", "FESTIVAL_MANAGER"])
+
+
+class InternalSearchIn(APIModel):
+    question: str = Field(min_length=2, max_length=1000)
+
+
+class IssueAnalysisPatch(APIModel):
+    topic: str = Field(min_length=1, max_length=100)
+    sentiment: Literal["POSITIVE", "NEUTRAL", "NEGATIVE"]
+    urgent: bool = False
+    note: str | None = Field(default=None, max_length=1000)
+
+
+class BusinessEventIn(APIModel):
+    event_type: Literal["VISIT", "SALE"]
+    sales_amount: float | None = Field(default=None, ge=0)
+    source: str = Field(default="MERCHANT", min_length=1, max_length=100)

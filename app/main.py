@@ -12,7 +12,8 @@ from .db import one, pool
 from .errors import AppError
 from .http import meta
 from .jobs import start_worker
-from .routes import admin_content, admin_core, admin_esg, admin_ops, auth, public, visitor
+from .routes import (admin_content, admin_core, admin_esg, admin_ops, auth, merchant, p2_admin,
+                     p2_visitor, public, visitor)
 
 
 @asynccontextmanager
@@ -27,8 +28,8 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="지역축제 DX API",
-    version="1.0.0",
-    description="AI·ESG 기반 지역축제 DX 플랫폼 1단계 MVP",
+    version="1.1.0",
+    description="AI·ESG 기반 지역축제 DX 플랫폼 1·2단계 백엔드",
     lifespan=lifespan,
 )
 
@@ -90,5 +91,6 @@ def ready(request:Request):
     return {"data":{"status":"UP"},"meta":meta(request)}
 
 
-for route in (auth.router,public.router,visitor.router,admin_core.router,admin_content.router,admin_ops.router,admin_esg.router):
+for route in (auth.router,public.router,visitor.router,p2_visitor.router,admin_core.router,admin_content.router,
+              admin_ops.router,admin_esg.router,p2_admin.router,merchant.router):
     app.include_router(route,prefix="/api/v1")

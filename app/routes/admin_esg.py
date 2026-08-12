@@ -7,13 +7,32 @@ from psycopg.errors import UniqueViolation
 from ..db import all_rows, audit, database, idempotent, jsonb, one
 from ..domain import validate_measurement_review
 from ..errors import bad_request, conflict, not_found
-from ..http import success
+from ..http import idempotent_success, success
 from ..schemas import (EsgReportIn, EvidenceIn, ExportIn, MeasurementIn, MeasurementPatch, MetricIn,
                        MetricVersionIn, ReportPatch, ReviewIn)
 from ..security import festival_access, roles
 
 
 router=APIRouter()
+
+
+@router.get("/admin/festivals/{festival_id}/esg/dashboard")
+def esg_dashboard(festival_id:str,request:Request,_:Annotated[dict,Depends(festival_access)],connection:Annotated[Connection,Depends(database)],category:str|None=None):
+    rows=all_rows(connection,"""WITH latest AS (
+        SELECT DISTINCT ON (metric_id) * FROM esg_metric_versions ORDER BY metric_id,version_no DESC
+      ) SELECT m.id,m.name,m.category,v.id AS metric_version_id,v.version_no,v.formula,v.unit,v.target,
+        coalesce(sum(em.value) FILTER(WHERE em.status='APPROVED'),0) AS approved_value,
+        count(em.*) FILTER(WHERE em.status IN('DRAFT','IN_REVIEW','REJECTED'))::int AS unapproved_count,
+        count(em.*) FILTER(WHERE em.status='APPROVED')::int AS approved_count,
+        CASE WHEN v.target IS NULL OR v.target=0 THEN NULL
+          ELSE round(coalesce(sum(em.value) FILTER(WHERE em.status='APPROVED'),0)/v.target*100,2) END AS achievement_rate,
+        max(em.measured_at) FILTER(WHERE em.status='APPROVED') AS latest_measurement_at
+      FROM esg_metrics m LEFT JOIN latest v ON v.metric_id=m.id LEFT JOIN esg_measurements em ON em.metric_version_id=v.id
+      WHERE m.festival_id=%s AND m.status='ACTIVE' AND (%s::text IS NULL OR m.category=%s)
+      GROUP BY m.id,v.id,v.version_no,v.formula,v.unit,v.target ORDER BY m.category,m.name""",(festival_id,category,category))
+    warnings=[{"metricId":row["id"],"type":"MISSING_DATA" if row["approved_count"]==0 else "UNAPPROVED_DATA","count":row["unapproved_count"]}
+        for row in rows if row["approved_count"]==0 or row["unapproved_count"]>0]
+    return success(request,{"metrics":rows,"dataQualityWarnings":warnings,"source":"APPROVED_MEASUREMENTS_ONLY"})
 
 
 @router.get("/admin/festivals/{festival_id}/esg/metrics")
@@ -60,10 +79,7 @@ def create_measurement(festival_id:str,body:MeasurementIn,request:Request,respon
                 measured_at,supersedes_id,created_by) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *""",(festival_id,body.metric_version_id,body.value,body.source_type,body.source_ref,body.dedupe_key,body.measured_at,body.supersedes_id,user["id"]))
         except UniqueViolation as error:raise conflict("DUPLICATE_MEASUREMENT","같은 지표 버전과 중복 키의 실적이 이미 존재합니다.") from error
         audit(connection,festival_id=festival_id,actor_id=str(user["id"]),action="CREATE",resource_type="ESG_MEASUREMENT",resource_id=str(row["id"]),after_data=row,request_id=request.state.request_id);return 201,row
-    status_code,result,replayed=idempotent(connection,key=idempotency_key,scope=f"esg-measurement:{festival_id}",body=body.model_dump(),work=work)
-    response.status_code=status_code
-    if replayed:response.headers["Idempotency-Replayed"]="true"
-    return success(request,result)
+    return idempotent_success(request,response,idempotent(connection,key=idempotency_key,scope=f"esg-measurement:{festival_id}",body=body.model_dump(),work=work))
 
 
 @router.get("/admin/festivals/{festival_id}/esg/measurements/{measurement_id}")
@@ -114,9 +130,7 @@ def create_report(festival_id:str,body:EsgReportIn,request:Request,response:Resp
             VALUES(%s,%s,%s,%s,%s,%s,%s) RETURNING *""",(festival_id,body.title,body.period.from_,body.period.to,body.compare_with_festival_id,body.format,user["id"]))
         job=one(connection,"INSERT INTO jobs(festival_id,job_type,resource_type,resource_id) VALUES(%s,'GENERATE_ESG_REPORT','ESG_REPORT',%s) RETURNING *",(festival_id,report["id"]))
         audit(connection,festival_id=festival_id,actor_id=str(user["id"]),action="GENERATE",resource_type="ESG_REPORT",resource_id=str(report["id"]),after_data={"jobId":str(job["id"])},request_id=request.state.request_id);return 202,{"reportId":report["id"],"jobId":job["id"],"status":"GENERATING"}
-    status_code,result,replayed=idempotent(connection,key=idempotency_key,scope=f"esg-report:{festival_id}",body=body.model_dump(),work=work);response.status_code=status_code
-    if replayed:response.headers["Idempotency-Replayed"]="true"
-    return success(request,result)
+    return idempotent_success(request,response,idempotent(connection,key=idempotency_key,scope=f"esg-report:{festival_id}",body=body.model_dump(),work=work))
 
 
 @router.get("/admin/festivals/{festival_id}/esg/reports/{report_id}")

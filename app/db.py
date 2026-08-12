@@ -4,7 +4,6 @@ from collections.abc import Callable, Generator
 from typing import Any
 
 from psycopg import Connection
-from psycopg.errors import ForeignKeyViolation, UniqueViolation
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
@@ -82,11 +81,3 @@ def idempotent(
         (scope, key, request_hash, status, json.dumps(response, default=str)),
     )
     return status, response, False
-
-
-def translate_db_error(error: Exception) -> AppError:
-    if isinstance(error, UniqueViolation):
-        return conflict("DUPLICATE_ACTION", "이미 존재하는 값입니다.")
-    if isinstance(error, ForeignKeyViolation):
-        return AppError(422, "REFERENCE_CONSTRAINT", "연결된 리소스를 확인해 주세요.")
-    raise error
