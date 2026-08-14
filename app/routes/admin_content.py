@@ -67,8 +67,8 @@ def submit_version(festival_id:str,version_id:str,request:Request,_:Annotated[di
 
 
 @router.post("/admin/festivals/{festival_id}/content-versions/{version_id}/reviews")
-def review_version(festival_id:str,version_id:str,body:ReviewIn,request:Request,_:Annotated[dict,Depends(festival_access)],user:Annotated[dict,Depends(roles("SUPER_ADMIN","REVIEWER"))],connection:Annotated[Connection,Depends(database)]):
-    version=one(connection,"""SELECT cv.* FROM content_versions cv JOIN content_items ci ON ci.id=cv.content_item_id
+def review_version(festival_id:str,version_id:str,body:ReviewIn,request:Request,_:Annotated[dict,Depends(festival_access)],user:Annotated[dict,Depends(roles("SUPER_ADMIN","REVIEWER","FESTIVAL_MANAGER"))],connection:Annotated[Connection,Depends(database)]):
+    version=one(connection,"""SELECT cv.*,ci.content_type FROM content_versions cv JOIN content_items ci ON ci.id=cv.content_item_id
         WHERE cv.id=%s AND ci.festival_id=%s""",(version_id,festival_id))
     if not version:raise not_found()
     validate_content_review(version,str(user["id"]),body.decision)
