@@ -108,39 +108,6 @@ def with_settings(monkeypatch, **overrides):
     monkeypatch.setattr(ai, "settings", dataclasses.replace(ai.settings, **overrides))
 
 
-def test_briefing_returns_none_when_disabled_or_unconfigured(monkeypatch):
-    with_settings(monkeypatch, external_ai_enabled=False)
-    assert ai.briefing(ai.RISK_INSTRUCTION, ["혼잡 90%"]) is None
-
-    # 켜 두고 키를 안 채운 배포는 예외가 아니라 규칙 기반 문장으로 떨어진다.
-    with_settings(monkeypatch, external_ai_enabled=True, allen_auth_mode="bearer", allen_api_key="")
-    assert ai.briefing(ai.RISK_INSTRUCTION, ["혼잡 90%"]) is None
-
-    with_settings(monkeypatch, external_ai_enabled=True, allen_auth_mode="implicit", allen_client_id="")
-    assert ai.briefing(ai.RISK_INSTRUCTION, ["혼잡 90%"]) is None
-
-    with_settings(monkeypatch, external_ai_enabled=True, allen_auth_mode="nonsense")
-    assert ai.briefing(ai.RISK_INSTRUCTION, ["혼잡 90%"]) is None
-
-
-def test_one_sentence_trims_markdown_and_keeps_decimals():
-    assert ai.one_sentence("  **혼잡도가 높습니다.** 추가 안내입니다. ") == "혼잡도가 높습니다."
-    assert ai.one_sentence("달성률은 12.5% 입니다. 다음 문장.") == "달성률은 12.5% 입니다."
-    assert ai.one_sentence("출처 없는 한 문장 [출처1](http://a.b) 입니다.") == "출처 없는 한 문장  입니다."
-    assert ai.one_sentence("문장 부호가 없으면 그대로") == "문장 부호가 없으면 그대로"
-
-
-def test_extract_reply_prefers_assistant_message():
-    assert ai.extract_reply({"content": "직접 답변"}) == "직접 답변"
-    assert ai.extract_reply({"message": {"content": "중첩 답변"}}) == "중첩 답변"
-    assert ai.extract_reply({"messages": [
-        {"userRole": "user", "content": "질문"},
-        {"userRole": "assistant", "content": "마지막 답변"},
-    ]}) == "마지막 답변"
-    assert ai.extract_reply({"messages": [{"userRole": "user", "content": "질문만"}]}) is None
-    assert ai.extract_reply({}) is None
-
-
 def stub_transport(monkeypatch, handler):
     """ai.py가 만드는 httpx.Client에 가짜 전송을 끼운다."""
     import httpx
@@ -150,21 +117,37 @@ def stub_transport(monkeypatch, handler):
     monkeypatch.setattr(ai.time, "sleep", lambda _: None)
 
 
-def test_briefing_creates_channel_then_reads_reply(monkeypatch):
+def test_briefing_returns_none_when_disabled_or_unconfigured(monkeypatch):
+    with_settings(monkeypatch, external_ai_enabled=False, allen_client_id="uuid")
+    assert ai.briefing(ai.RISK_INSTRUCTION, ["혼잡 90%"]) is None
+
+    # 켜 두고 키를 안 채운 배포는 예외가 아니라 규칙 기반 문장으로 떨어진다.
+    with_settings(monkeypatch, external_ai_enabled=True, allen_client_id="")
+    assert ai.briefing(ai.RISK_INSTRUCTION, ["혼잡 90%"]) is None
+
+
+def test_one_sentence_trims_markdown_and_keeps_decimals():
+    assert ai.one_sentence("  **혼잡도가 높습니다.** 추가 안내입니다. ") == "혼잡도가 높습니다."
+    assert ai.one_sentence("달성률은 12.5% 입니다. 다음 문장.") == "달성률은 12.5% 입니다."
+    assert ai.one_sentence("출처 없는 한 문장 [출처1](http://a.b) 입니다.") == "출처 없는 한 문장  입니다."
+    assert ai.one_sentence("문장 부호가 없으면 그대로") == "문장 부호가 없으면 그대로"
+    # 앨런은 답변을 굵게 감싸고 따옴표를 덧붙여 돌려주는 일이 잦다.
+    assert ai.one_sentence('**"혼잡도 100%로 위험이 높습니다."**') == "혼잡도 100%로 위험이 높습니다."
+
+
+def test_briefing_sends_client_id_and_reads_answer(monkeypatch):
     import httpx
 
-    seen = []
+    seen = {}
 
     def handler(request):
-        seen.append(f"{request.method} {request.url.path}")
-        if request.url.path.endswith("/messages"):
-            return httpx.Response(200, json={"content": "혼잡도가 높습니다. 뒤 문장은 잘린다."})
-        return httpx.Response(200, json={"inserted_id": "ch1"})
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json={"answer": "혼잡도가 높습니다. 뒤 문장은 잘린다.", "references": []})
 
-    with_settings(monkeypatch, external_ai_enabled=True, allen_auth_mode="bearer", allen_api_key="secret")
+    with_settings(monkeypatch, external_ai_enabled=True, allen_client_id="test-uuid")
     stub_transport(monkeypatch, handler)
     assert ai.briefing(ai.RISK_INSTRUCTION, ["혼잡 90%"]) == "혼잡도가 높습니다."
-    assert seen == ["POST /api/v1/channels", "POST /api/v1/channels/ch1/messages"]
+    assert "client_id=test-uuid" in seen["url"] and "content=" in seen["url"]
 
 
 def test_request_retries_then_succeeds(monkeypatch):
@@ -176,31 +159,25 @@ def test_request_retries_then_succeeds(monkeypatch):
         calls["n"] += 1
         if calls["n"] == 1:
             raise httpx.ConnectError("일시적 실패")
-        return httpx.Response(200, json={"inserted_id": "ch1"})
+        return httpx.Response(200, json={"answer": "복구된 답변입니다."})
 
-    with_settings(monkeypatch, external_ai_enabled=True, allen_auth_mode="bearer", allen_api_key="secret", allen_max_retries=2)
+    with_settings(monkeypatch, external_ai_enabled=True, allen_client_id="test-uuid", allen_max_retries=2)
     stub_transport(monkeypatch, handler)
-    assert ai.channel_id() == "ch1"
+    assert ai.briefing(ai.RISK_INSTRUCTION, ["혼잡 90%"]) == "복구된 답변입니다."
     assert calls["n"] == 2
 
 
 def test_briefing_falls_back_when_allen_keeps_failing(monkeypatch):
     import httpx
 
-    with_settings(monkeypatch, external_ai_enabled=True, allen_auth_mode="bearer", allen_api_key="secret", allen_max_retries=1)
+    with_settings(monkeypatch, external_ai_enabled=True, allen_client_id="test-uuid", allen_max_retries=1)
     stub_transport(monkeypatch, lambda request: httpx.Response(500, json={"error": "boom"}))
     assert ai.briefing(ai.RISK_INSTRUCTION, ["혼잡 90%"]) is None
 
 
-def test_empty_reply_is_not_passed_off_as_a_briefing(monkeypatch):
+def test_empty_answer_is_not_passed_off_as_a_briefing(monkeypatch):
     import httpx
 
-    def handler(request):
-        if request.url.path.endswith("/messages"):
-            return httpx.Response(200, json={"messages": [{"userRole": "user", "content": "질문만"}]})
-        return httpx.Response(200, json={"inserted_id": "ch1"})
-
-    with_settings(monkeypatch, external_ai_enabled=True, allen_auth_mode="bearer",
-                  allen_api_key="secret", allen_poll_attempts=2)
-    stub_transport(monkeypatch, handler)
+    with_settings(monkeypatch, external_ai_enabled=True, allen_client_id="test-uuid")
+    stub_transport(monkeypatch, lambda request: httpx.Response(200, json={"answer": "   ", "references": []}))
     assert ai.briefing(ai.RISK_INSTRUCTION, ["혼잡 90%"]) is None
