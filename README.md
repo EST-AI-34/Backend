@@ -96,6 +96,8 @@ docker run --rm -p 8000:8000 --env-file .env \
 API_URL=http://127.0.0.1:8000/api/v1 .venv/bin/python -m scripts.smoke
 ```
 
+`tests/test_domain.py`는 DB 없이 도는 규칙·AI 클라이언트 테스트이고, `tests/test_api.py`는 `DATABASE_URL`이 가리키는 PostgreSQL에 마이그레이션과 데모 시드를 적용한 뒤 실제 엔드포인트를 호출합니다. DB에 접속할 수 없으면 API 테스트는 건너뜁니다(`docker compose up -d`로 띄운 뒤 실행하세요). 테스트도 시드를 쓰므로 운영 DB를 가리킨 채 실행하지 마세요.
+
 `smoke`는 실행 중인 시드 서버를 대상으로 인증, 공개 조회, 익명 세션, AI, 설문, 콘텐츠 승인·게시, 티켓 전체 상태 전이, ESG 보고서 생성을 검증합니다.
 
 > `scripts.smoke`는 읽기 전용 테스트가 아닙니다. 지정한 환경에 방문 세션, 설문 응답, 프로그램, 티켓, ESG 실적과 보고서를 생성하므로 로컬 또는 전용 데모 환경에서만 실행하세요.

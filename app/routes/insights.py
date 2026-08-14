@@ -4,8 +4,10 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Query, Request
 from psycopg import Connection
 
+from .. import ai
 from ..db import all_rows, database
 from ..domain import recommendation_bias, risk_brief, score_business
+from ..errors import bad_request
 from ..http import success
 from ..security import festival_access
 from .public import published_festival
@@ -36,7 +38,10 @@ def admin_risk_brief(festival_id: str, request: Request, _: Annotated[dict, Depe
         HAVING count(*)>0""", (festival_id,))
     signals = crowding + tickets + staffing + schedule
     brief = risk_brief(signals)
+    summary = ai.briefing(ai.RISK_INSTRUCTION, brief["reasons"]) if signals else None
     return success(request, {**brief, "festival_id": festival_id,
+                             "summary": summary or brief["summary"],
+                             "external_ai_used": summary is not None,
                              "source_updated_at": max((signal["source_updated_at"] for signal in signals), default=None),
                              "include_resolved": include_resolved})
 
@@ -52,6 +57,8 @@ def business_recommendations(
     limit: Annotated[int, Query(ge=1, le=50)] = 10,
     accessibility_required: bool = False,
 ):
+    if (latitude is None) != (longitude is None):
+        raise bad_request("VALIDATION_ERROR", "latitude와 longitude는 함께 입력해야 합니다.")
     festival = published_festival(connection, festival_code)
     rows = all_rows(connection, """SELECT fb.id,b.name,fb.category,fb.is_sponsored,fb.esg_participating,
         bo.area_id,a.name AS area_name,a.latitude,a.longitude,
