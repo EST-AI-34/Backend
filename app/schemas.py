@@ -160,7 +160,7 @@ class CloneFestivalIn(DateRangeModel):
 
 
 class ContentItemIn(APIModel):
-    content_type: str
+    content_type: Literal["ANNOUNCEMENT", "PROGRAM"]
     resource_type: str | None = None
     resource_id: str | None = None
     slug: str = Field(pattern=r"^[a-z0-9-]+$")
