@@ -13,12 +13,27 @@ from ..security import festival_access, roles
 
 router = APIRouter()
 
+VERSIONS_SQL="""SELECT cv.*,coalesce(jsonb_agg(jsonb_build_object('reviewerId',ca.reviewer_id,
+    'decision',ca.decision,'comment',ca.comment,'decidedAt',ca.decided_at)) FILTER(WHERE ca.id IS NOT NULL),'[]') reviews
+    FROM content_versions cv LEFT JOIN content_approvals ca ON ca.content_version_id=cv.id
+    WHERE cv.content_item_id=ANY(%s::uuid[]) GROUP BY cv.id ORDER BY cv.version_no DESC"""
+
+
+def versions_by_item(connection:Connection,item_ids:list)->dict[str,list[dict]]:
+    grouped:dict[str,list[dict]]={str(item_id):[] for item_id in item_ids}
+    if item_ids:
+        for version in all_rows(connection,VERSIONS_SQL,([str(item_id) for item_id in item_ids],)):grouped[str(version["content_item_id"])].append(version)
+    return grouped
+
 
 @router.get("/admin/festivals/{festival_id}/content-items")
 def items(festival_id:str,request:Request,_:Annotated[dict,Depends(festival_access)],connection:Annotated[Connection,Depends(database)]):
     rows=all_rows(connection,"""SELECT ci.*,cv.version_no,cv.language,cv.status AS published_version_status
         FROM content_items ci LEFT JOIN content_versions cv ON cv.id=ci.published_version_id
-        WHERE ci.festival_id=%s ORDER BY ci.updated_at DESC""",(festival_id,));return success(request,rows)
+        WHERE ci.festival_id=%s ORDER BY ci.updated_at DESC""",(festival_id,))
+    grouped=versions_by_item(connection,[row["id"] for row in rows])
+    for row in rows:row["versions"]=grouped[str(row["id"])]
+    return success(request,rows)
 
 
 @router.post("/admin/festivals/{festival_id}/content-items",status_code=201)
@@ -32,10 +47,7 @@ def create_item(festival_id:str,body:ContentItemIn,request:Request,_:Annotated[d
 def item_detail(festival_id:str,item_id:str,request:Request,_:Annotated[dict,Depends(festival_access)],connection:Annotated[Connection,Depends(database)]):
     item=one(connection,"SELECT * FROM content_items WHERE id=%s AND festival_id=%s",(item_id,festival_id))
     if not item:raise not_found()
-    item["versions"]=all_rows(connection,"""SELECT cv.*,coalesce(jsonb_agg(jsonb_build_object('reviewerId',ca.reviewer_id,
-        'decision',ca.decision,'comment',ca.comment,'decidedAt',ca.decided_at)) FILTER(WHERE ca.id IS NOT NULL),'[]') reviews
-        FROM content_versions cv LEFT JOIN content_approvals ca ON ca.content_version_id=cv.id
-        WHERE cv.content_item_id=%s GROUP BY cv.id ORDER BY cv.version_no DESC""",(item_id,));return success(request,item)
+    item["versions"]=versions_by_item(connection,[item_id])[str(item_id)];return success(request,item)
 
 
 @router.post("/admin/festivals/{festival_id}/content-items/{item_id}/versions",status_code=201)
