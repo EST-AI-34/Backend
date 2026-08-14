@@ -3,6 +3,7 @@
 DATABASE_URL이 가리키는 DB에 마이그레이션과 데모 시드를 한 번 적용한다.
 DB가 없으면 테스트를 건너뛴다(도메인 테스트는 DB 없이도 돈다).
 """
+import os
 import subprocess
 import sys
 import uuid
@@ -29,8 +30,10 @@ def database_ready() -> bool:
 def client():
     if not database_ready():
         pytest.skip("DATABASE_URL로 접속할 수 있는 PostgreSQL이 필요합니다 (docker compose up -d).")
+    # 스크립트를 파일 경로로 돌리면 sys.path에 scripts/만 들어가 app을 못 찾는다.
+    env = {**os.environ, "PYTHONPATH": str(ROOT)}
     for script in ("scripts/migrate.py", "scripts/seed.py"):
-        subprocess.run([sys.executable, script], cwd=ROOT, check=True, capture_output=True)
+        subprocess.run([sys.executable, script], cwd=ROOT, env=env, check=True, capture_output=True)
 
     from app.db import pool
     from app.main import app

@@ -38,7 +38,8 @@ def briefing(instruction: str, context: list[str]) -> str | None:
         return None
     try:
         return one_sentence(ask(prompt(instruction, context)))
-    except (AIUnavailable, httpx.HTTPError) as error:
+    # ValueError는 response.json()이 JSON이 아닌 본문(게이트웨이 HTML 등)을 만났을 때다.
+    except (AIUnavailable, httpx.HTTPError, ValueError) as error:
         logger.warning("외부 AI 브리핑 실패, 규칙 기반 문장을 사용합니다: %s", error)
         return None
 
@@ -83,13 +84,22 @@ def request(params: dict) -> dict:
                 raise AIUnavailable("앨런이 객체가 아닌 JSON을 반환했습니다.")
             return data
         except httpx.HTTPStatusError as error:
-            raise AIUnavailable(f"앨런이 오류 상태를 반환했습니다: {error.response.status_code} {error.response.text[:200]}") from error
+            detail = f"앨런이 오류 상태를 반환했습니다: {error.response.status_code} {error.response.text[:200]}"
+            # 4xx는 키·요청 문제라 다시 보내도 같다. 5xx만 재시도한다.
+            if error.response.status_code < 500:
+                raise AIUnavailable(detail) from error
+            backoff(attempt, attempts, detail, error)
         except httpx.HTTPError as error:
-            logger.warning("앨런 요청 실패 %s/%s: %s", attempt, attempts, error)
-            if attempt >= attempts:
-                raise AIUnavailable(f"앨런 요청이 {attempts}회 모두 실패했습니다: {error}") from error
-            time.sleep(min(0.5 * attempt, 2.0))
+            backoff(attempt, attempts, str(error), error)
     raise AIUnavailable("앨런 요청이 실패했습니다.")
+
+
+def backoff(attempt: int, attempts: int, detail: str, error: Exception) -> None:
+    """마지막 시도면 AIUnavailable, 아니면 잠깐 쉬고 호출부 루프로 돌아간다."""
+    logger.warning("앨런 요청 실패 %s/%s: %s", attempt, attempts, detail)
+    if attempt >= attempts:
+        raise AIUnavailable(f"앨런 요청이 {attempts}회 모두 실패했습니다: {detail}") from error
+    time.sleep(min(0.5 * attempt, 2.0))
 
 
 def timeout() -> httpx.Timeout:

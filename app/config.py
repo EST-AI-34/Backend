@@ -14,8 +14,10 @@ class Settings:
     allen_question_url: str = os.getenv("ALLEN_QUESTION_URL", "https://kdt-api-function.azurewebsites.net/api/v1/question")
     allen_client_id: str = os.getenv("ALLEN_CLIENT_ID", "")
     allen_connect_timeout: float = float(os.getenv("ALLEN_CONNECT_TIMEOUT_SECONDS", "3"))
-    allen_read_timeout: float = float(os.getenv("ALLEN_READ_TIMEOUT_SECONDS", "30"))
-    allen_max_retries: int = int(os.getenv("ALLEN_MAX_RETRIES", "2"))
+    # 대시보드 응답이 앨런 지연에 묶이지 않도록 짧게 잡는다. 브리핑 한 문장은 이 안에 온다.
+    allen_read_timeout: float = float(os.getenv("ALLEN_READ_TIMEOUT_SECONDS", "8"))
+    allen_max_retries: int = int(os.getenv("ALLEN_MAX_RETRIES", "1"))
+    recommendation_event_retention_days: int = int(os.getenv("RECOMMENDATION_EVENT_RETENTION_DAYS", "90"))
 
     def validate(self) -> None:
         if self.environment == "production" and len(self.jwt_secret) < 32:

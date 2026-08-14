@@ -291,11 +291,15 @@ def test_risk_brief_reports_insufficient_data_without_signals(client, manager, c
 
 
 def test_risk_brief_scores_crowding_from_snapshots(client, festival, manager, operator, connection):
+    from datetime import UTC, datetime, timedelta
+
     base = f"/api/v1/admin/festivals/{festival['id']}"
     area = connection.execute("SELECT id FROM festival_areas WHERE festival_id=%s LIMIT 1", (festival["id"],)).fetchone()
+    # 구역별 최신 스냅샷만 센다. 고정 시각을 쓰면 시드가 now()로 넣은 MODERATE에 밀린다.
     data(client.post(f"{base}/crowd-snapshots", headers=operator, json={
         "areaId": str(area["id"]), "crowdLevel": "FULL", "sourceType": "MANUAL",
-        "capturedAt": "2026-08-14T00:00:00Z", "expiresAt": "2099-01-01T00:00:00Z",
+        "capturedAt": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+        "expiresAt": (datetime.now(UTC) + timedelta(days=1)).isoformat(),
     }))
     brief = data(client.get(f"{base}/risk-brief", headers=manager))
     crowding = [signal for signal in brief["evidence"] if signal["type"] == "crowding"]
@@ -316,6 +320,27 @@ def test_recommendations_keep_ads_out_of_organic_results(client, festival, conne
     # 점수 내림차순으로 정렬된다.
     scores = [item["score"] for item in result["items"]]
     assert scores == sorted(scores, reverse=True)
+
+
+def test_business_with_two_booths_appears_once(client, festival, connection):
+    """booths는 booth_no로만 유일해서 업체당 여러 행이 나올 수 있다."""
+    business = connection.execute("""SELECT fb.id,a.id AS area_id FROM festival_businesses fb
+        JOIN festival_areas a ON a.festival_id=fb.festival_id
+        WHERE fb.festival_id=%s AND fb.participation_status='APPROVED' LIMIT 1""", (festival["id"],)).fetchone()
+    for booth_no in ("DUP-1", "DUP-2"):
+        connection.execute("""INSERT INTO booths(festival_business_id,area_id,booth_no) VALUES(%s,%s,%s)
+            ON CONFLICT DO NOTHING""", (business["id"], business["area_id"], booth_no))
+    result = data(client.get(f"/api/v1/public/festivals/{festival['code']}/business-recommendations?limit=50"))
+    ids = [item["business_id"] for item in result["items"] + result["sponsored_items"]]
+    assert ids.count(str(business["id"])) == 1
+    assert len(ids) == len(set(ids))
+
+
+def test_sponsored_items_have_their_own_cap(client, festival, connection):
+    connection.execute("UPDATE festival_businesses SET is_sponsored=true WHERE festival_id=%s", (festival["id"],))
+    result = data(client.get(f"/api/v1/public/festivals/{festival['code']}/business-recommendations?limit=50"))
+    assert len(result["sponsored_items"]) <= 3
+    connection.execute("UPDATE festival_businesses SET is_sponsored=false WHERE festival_id=%s", (festival["id"],))
 
 
 def test_recommendations_reject_partial_or_out_of_range_coordinates(client, festival):

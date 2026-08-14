@@ -181,3 +181,36 @@ def test_empty_answer_is_not_passed_off_as_a_briefing(monkeypatch):
     with_settings(monkeypatch, external_ai_enabled=True, allen_client_id="test-uuid")
     stub_transport(monkeypatch, lambda request: httpx.Response(200, json={"answer": "   ", "references": []}))
     assert ai.briefing(ai.RISK_INSTRUCTION, ["혼잡 90%"]) is None
+
+
+def test_non_json_body_falls_back_instead_of_raising(monkeypatch):
+    """게이트웨이가 200으로 HTML을 주면 대시보드가 500이 되면 안 된다."""
+    import httpx
+
+    with_settings(monkeypatch, external_ai_enabled=True, allen_client_id="test-uuid")
+    stub_transport(monkeypatch, lambda request: httpx.Response(200, text="<html>gateway error</html>"))
+    assert ai.briefing(ai.RISK_INSTRUCTION, ["혼잡 90%"]) is None
+
+
+def count_calls(monkeypatch, status):
+    import httpx
+
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        return httpx.Response(status, json={"error": "boom"})
+
+    with_settings(monkeypatch, external_ai_enabled=True, allen_client_id="test-uuid", allen_max_retries=2)
+    stub_transport(monkeypatch, handler)
+    assert ai.briefing(ai.RISK_INSTRUCTION, ["혼잡 90%"]) is None
+    return calls["n"]
+
+
+def test_client_errors_are_not_retried(monkeypatch):
+    """401은 키 문제라 다시 보내도 같다."""
+    assert count_calls(monkeypatch, 401) == 1
+
+
+def test_server_errors_are_retried(monkeypatch):
+    assert count_calls(monkeypatch, 503) == 3
