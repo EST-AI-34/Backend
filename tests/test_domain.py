@@ -1,8 +1,13 @@
+import dataclasses
+
 import pytest
 from datetime import UTC, datetime, timedelta
 
-from app.domain import (classify_issue, is_safe_question, mask_sensitive, search_terms, select_course,
-                        supported_language, validate_booking_transition, validate_content_review,
+from app import ai
+
+from app.domain import (classify_issue, is_safe_question, mask_sensitive, recommendation_bias,
+                        risk_brief, score_business, search_terms, select_course, supported_language,
+                        validate_booking_transition, validate_content_review,
                         validate_measurement_review, validate_ticket_transition)
 from app.errors import AppError
 from app.security import hash_password, verify_password
@@ -58,3 +63,154 @@ def test_course_selection_skips_overlaps_and_deadline():
         {"id": "late", "starts_at": start + timedelta(minutes=100), "ends_at": start + timedelta(minutes=130)},
     ]
     assert [row["id"] for row in select_course(sessions, 90, start)] == ["a", "b"]
+
+
+def test_risk_brief_scores_only_verified_signals():
+    assert risk_brief([])["risk_level"] == "INSUFFICIENT_DATA"
+    brief = risk_brief([
+        {"type": "crowding", "value": 92, "threshold": 50},
+        {"type": "unresolved_safety_complaints", "value": 2, "threshold": 1},
+    ])
+    assert brief["risk_level"] == "CRITICAL" and brief["risk_score"] == 75
+    assert len(brief["reasons"]) == 2 and len(brief["recommended_actions"]) == 2
+    assert risk_brief([{"type": "schedule_change", "value": 1, "threshold": 0}])["risk_level"] == "NORMAL"
+
+
+def test_business_score_prefers_near_matching_business():
+    near = {"id": "1", "name": "가", "category": "FOOD", "latitude": 37.5285, "longitude": 126.9325,
+            "coupon_available": True, "esg_participating": True, "area_id": None}
+    far = {**near, "id": "2", "name": "나", "latitude": 37.6, "coupon_available": False, "esg_participating": False}
+    scored_near = score_business(near, 37.5285, 126.9325, "FOOD")
+    scored_far = score_business(far, 37.5285, 126.9325, "FOOD")
+    assert scored_near["score"] == 1.0 and scored_near["distance_meters"] == 0
+    assert scored_far["score"] < scored_near["score"]
+    # 1km 밖이면 거리 가점도, "가깝다"는 설명도 붙지 않는다.
+    assert scored_far["distance_meters"] > 1000
+    assert not any("거리" in reason for reason in scored_far["reasons"])
+    assert score_business({"id": "3", "name": "다", "category": "FOOD"})["distance_meters"] is None
+
+
+def test_recommendation_bias_flags_concentration():
+    assert recommendation_bias([])["status"] == "INSUFFICIENT_DATA"
+    skewed = [{"response_snapshot": {"items": [{"business_id": "1", "name": "가", "category": "FOOD"}],
+                                     "sponsored_items": [{"business_id": "2", "name": "나", "category": "FOOD",
+                                                          "is_sponsored": True}]}}] * 3
+    audit = recommendation_bias(skewed, max_business_share=0.4, max_category_share=0.75)
+    assert audit["status"] == "WARNING" and audit["total_exposures"] == 6
+    assert audit["sponsored_exposures"] == 3
+    assert [row["exposure_share"] for row in audit["business_exposures"]] == [0.5, 0.5]
+    balanced = [{"response_snapshot": {"items": [{"business_id": "1", "name": "가", "category": "FOOD"},
+                                                 {"business_id": "2", "name": "나", "category": "CAFE"}]}}]
+    assert recommendation_bias(balanced)["status"] == "PASS"
+
+
+def with_settings(monkeypatch, **overrides):
+    monkeypatch.setattr(ai, "settings", dataclasses.replace(ai.settings, **overrides))
+
+
+def stub_transport(monkeypatch, handler):
+    """ai.py가 만드는 httpx.Client에 가짜 전송을 끼운다."""
+    import httpx
+
+    real_client = httpx.Client  # 패치 전에 잡아두지 않으면 람다가 자기를 부른다.
+    monkeypatch.setattr(ai.httpx, "Client", lambda **_: real_client(transport=httpx.MockTransport(handler)))
+    monkeypatch.setattr(ai.time, "sleep", lambda _: None)
+
+
+def test_briefing_returns_none_when_disabled_or_unconfigured(monkeypatch):
+    with_settings(monkeypatch, external_ai_enabled=False, allen_client_id="uuid")
+    assert ai.briefing(ai.RISK_INSTRUCTION, ["혼잡 90%"]) is None
+
+    # 켜 두고 키를 안 채운 배포는 예외가 아니라 규칙 기반 문장으로 떨어진다.
+    with_settings(monkeypatch, external_ai_enabled=True, allen_client_id="")
+    assert ai.briefing(ai.RISK_INSTRUCTION, ["혼잡 90%"]) is None
+
+
+def test_one_sentence_trims_markdown_and_keeps_decimals():
+    assert ai.one_sentence("  **혼잡도가 높습니다.** 추가 안내입니다. ") == "혼잡도가 높습니다."
+    assert ai.one_sentence("달성률은 12.5% 입니다. 다음 문장.") == "달성률은 12.5% 입니다."
+    assert ai.one_sentence("출처 없는 한 문장 [출처1](http://a.b) 입니다.") == "출처 없는 한 문장  입니다."
+    assert ai.one_sentence("문장 부호가 없으면 그대로") == "문장 부호가 없으면 그대로"
+    # 앨런은 답변을 굵게 감싸고 따옴표를 덧붙여 돌려주는 일이 잦다.
+    assert ai.one_sentence('**"혼잡도 100%로 위험이 높습니다."**') == "혼잡도 100%로 위험이 높습니다."
+
+
+def test_briefing_sends_client_id_and_reads_answer(monkeypatch):
+    import httpx
+
+    seen = {}
+
+    def handler(request):
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json={"answer": "혼잡도가 높습니다. 뒤 문장은 잘린다.", "references": []})
+
+    with_settings(monkeypatch, external_ai_enabled=True, allen_client_id="test-uuid")
+    stub_transport(monkeypatch, handler)
+    assert ai.briefing(ai.RISK_INSTRUCTION, ["혼잡 90%"]) == "혼잡도가 높습니다."
+    assert "client_id=test-uuid" in seen["url"] and "content=" in seen["url"]
+
+
+def test_request_retries_then_succeeds(monkeypatch):
+    import httpx
+
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.ConnectError("일시적 실패")
+        return httpx.Response(200, json={"answer": "복구된 답변입니다."})
+
+    with_settings(monkeypatch, external_ai_enabled=True, allen_client_id="test-uuid", allen_max_retries=2)
+    stub_transport(monkeypatch, handler)
+    assert ai.briefing(ai.RISK_INSTRUCTION, ["혼잡 90%"]) == "복구된 답변입니다."
+    assert calls["n"] == 2
+
+
+def test_briefing_falls_back_when_allen_keeps_failing(monkeypatch):
+    import httpx
+
+    with_settings(monkeypatch, external_ai_enabled=True, allen_client_id="test-uuid", allen_max_retries=1)
+    stub_transport(monkeypatch, lambda request: httpx.Response(500, json={"error": "boom"}))
+    assert ai.briefing(ai.RISK_INSTRUCTION, ["혼잡 90%"]) is None
+
+
+def test_empty_answer_is_not_passed_off_as_a_briefing(monkeypatch):
+    import httpx
+
+    with_settings(monkeypatch, external_ai_enabled=True, allen_client_id="test-uuid")
+    stub_transport(monkeypatch, lambda request: httpx.Response(200, json={"answer": "   ", "references": []}))
+    assert ai.briefing(ai.RISK_INSTRUCTION, ["혼잡 90%"]) is None
+
+
+def test_non_json_body_falls_back_instead_of_raising(monkeypatch):
+    """게이트웨이가 200으로 HTML을 주면 대시보드가 500이 되면 안 된다."""
+    import httpx
+
+    with_settings(monkeypatch, external_ai_enabled=True, allen_client_id="test-uuid")
+    stub_transport(monkeypatch, lambda request: httpx.Response(200, text="<html>gateway error</html>"))
+    assert ai.briefing(ai.RISK_INSTRUCTION, ["혼잡 90%"]) is None
+
+
+def count_calls(monkeypatch, status):
+    import httpx
+
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        return httpx.Response(status, json={"error": "boom"})
+
+    with_settings(monkeypatch, external_ai_enabled=True, allen_client_id="test-uuid", allen_max_retries=2)
+    stub_transport(monkeypatch, handler)
+    assert ai.briefing(ai.RISK_INSTRUCTION, ["혼잡 90%"]) is None
+    return calls["n"]
+
+
+def test_client_errors_are_not_retried(monkeypatch):
+    """401은 키 문제라 다시 보내도 같다."""
+    assert count_calls(monkeypatch, 401) == 1
+
+
+def test_server_errors_are_retried(monkeypatch):
+    assert count_calls(monkeypatch, 503) == 3
