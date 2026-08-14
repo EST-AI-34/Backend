@@ -12,8 +12,8 @@ from .db import one, pool
 from .errors import AppError
 from .http import meta
 from .jobs import start_worker
-from .routes import (admin_content, admin_core, admin_esg, admin_ops, auth, merchant, p2_admin,
-                     p2_visitor, public, visitor)
+from .routes import (admin_content, admin_core, admin_esg, admin_ops, auth, insights, merchant,
+                     p2_admin, p2_visitor, public, visitor)
 
 
 @asynccontextmanager
@@ -92,5 +92,5 @@ def ready(request:Request):
 
 
 for route in (auth.router,public.router,visitor.router,p2_visitor.router,admin_core.router,admin_content.router,
-              admin_ops.router,admin_esg.router,p2_admin.router,merchant.router):
+              admin_ops.router,admin_esg.router,p2_admin.router,merchant.router,insights.router):
     app.include_router(route,prefix="/api/v1")
