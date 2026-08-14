@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, Header, Request, Response
 from psycopg import Connection
 from psycopg.errors import UniqueViolation
 
+from .. import ai
 from ..db import all_rows, audit, database, idempotent, jsonb, one
 from ..domain import validate_measurement_review
 from ..errors import bad_request, conflict, not_found
@@ -32,7 +33,10 @@ def esg_dashboard(festival_id:str,request:Request,_:Annotated[dict,Depends(festi
       GROUP BY m.id,v.id,v.version_no,v.formula,v.unit,v.target ORDER BY m.category,m.name""",(festival_id,category,category))
     warnings=[{"metricId":row["id"],"type":"MISSING_DATA" if row["approved_count"]==0 else "UNAPPROVED_DATA","count":row["unapproved_count"]}
         for row in rows if row["approved_count"]==0 or row["unapproved_count"]>0]
-    return success(request,{"metrics":rows,"dataQualityWarnings":warnings,"source":"APPROVED_MEASUREMENTS_ONLY"})
+    context=[f"{row['name']}({row['category']}) 승인값 {row['approved_value']}{row['unit'] or ''}, 달성률 {row['achievement_rate']}%, 미승인 {row['unapproved_count']}건" for row in rows]
+    brief=ai.briefing(ai.ESG_INSTRUCTION,context) if context else None
+    return success(request,{"metrics":rows,"dataQualityWarnings":warnings,"source":"APPROVED_MEASUREMENTS_ONLY",
+        "aiBrief":brief,"externalAiUsed":brief is not None})
 
 
 @router.get("/admin/festivals/{festival_id}/esg/metrics")
