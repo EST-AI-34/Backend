@@ -26,6 +26,7 @@ def test_separated_content_approval():
     with pytest.raises(AppError) as error:
         validate_content_review({"status":"IN_REVIEW","author_id":"same"},"same","APPROVED")
     assert error.value.code=="AUTHOR_CANNOT_FINAL_APPROVE"
+    validate_content_review({"status":"IN_REVIEW","author_id":"same","content_type":"ANNOUNCEMENT"},"same","APPROVED")
 
 
 def test_esg_evidence_and_safe_questions():
