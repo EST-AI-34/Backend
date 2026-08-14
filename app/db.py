@@ -9,7 +9,7 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
 from .config import settings
-from .errors import AppError, conflict
+from .errors import AppError, bad_request, conflict
 
 
 pool = ConnectionPool(
@@ -38,6 +38,18 @@ def all_rows(connection: Connection, sql: str, params: tuple | list = ()) -> lis
     return connection.execute(sql, params).fetchall()
 
 
+def set_clause(values: dict) -> tuple[str, list]:
+    """{"name":"봄축제","menu":[...]} -> ("name=%s,menu=%s", ["봄축제", Jsonb([...])]).
+
+    키는 SQL에 그대로 들어가므로 컬럼명이어야 한다. 호출부는 모두
+    `extra="forbid"` 스키마의 `model_dump()`라 필드 집합이 고정이다.
+    """
+    if not values:
+        raise bad_request("VALIDATION_ERROR", "변경할 값이 없습니다.")
+    return (",".join(f"{column}=%s" for column in values),
+            [jsonb(value) if isinstance(value, dict | list) else value for value in values.values()])
+
+
 def audit(
     connection: Connection,
     *,
@@ -53,8 +65,9 @@ def audit(
     connection.execute(
         """INSERT INTO audit_logs(festival_id,actor_id,action,resource_type,resource_id,before_data,after_data,request_id)
            VALUES(%s,%s,%s,%s,%s,%s,%s,%s)""",
-        (festival_id, actor_id, action, resource_type, resource_id, json.dumps(before_data, default=str) if before_data is not None else None,
-         json.dumps(after_data, default=str) if after_data is not None else None, request_id),
+        (festival_id, actor_id, action, resource_type, resource_id,
+         jsonb(before_data) if before_data is not None else None,
+         jsonb(after_data) if after_data is not None else None, request_id),
     )
 
 

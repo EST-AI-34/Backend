@@ -1,17 +1,16 @@
-import json
 import random
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Query, Request
 from psycopg import Connection
 
 from .. import ai
 from ..config import settings
-from ..db import all_rows, database
+from ..db import all_rows, jsonb
+from ..deps import Db, Scope
 from ..domain import recommendation_bias, risk_brief, score_business
 from ..errors import bad_request
 from ..http import success
-from ..security import festival_access
 from .public import published_festival
 
 
@@ -25,7 +24,7 @@ SPONSORED_LIMIT = 3
 
 
 @router.get("/admin/festivals/{festival_id}/risk-brief")
-def admin_risk_brief(festival_id: str, request: Request, _: Annotated[dict, Depends(festival_access)], connection: Annotated[Connection, Depends(database)], include_resolved: bool = False):
+def admin_risk_brief(festival_id: str, request: Request, _: Scope, connection: Db, include_resolved: bool = False):
     # 임계값 0이면 1건만 있어도 최고 점수라 CRITICAL이 상시화된다. 누적을 봐야 신호가 산다.
     tickets = all_rows(connection, """SELECT CASE WHEN ticket_type='COMPLAINT' THEN 'unresolved_safety_complaints' ELSE 'safety_incidents' END AS type,
         count(*)::int AS value,CASE WHEN ticket_type='COMPLAINT' THEN 3 ELSE 2 END AS threshold,
@@ -59,7 +58,7 @@ def admin_risk_brief(festival_id: str, request: Request, _: Annotated[dict, Depe
 def business_recommendations(
     festival_code: str,
     request: Request,
-    connection: Annotated[Connection, Depends(database)],
+    connection: Db,
     latitude: Annotated[float | None, Query(ge=-90, le=90)] = None,
     longitude: Annotated[float | None, Query(ge=-180, le=180)] = None,
     category: str | None = None,
@@ -90,11 +89,11 @@ def business_recommendations(
         "recommendation_policy_version": RECOMMENDATION_POLICY,
     }
     connection.execute("""INSERT INTO business_recommendation_events(festival_id,request_snapshot,response_snapshot,policy_version)
-        VALUES(%s,%s::jsonb,%s::jsonb,%s)""",
+        VALUES(%s,%s,%s,%s)""",
         (festival["id"],
-         json.dumps({"latitude": latitude, "longitude": longitude, "category": category, "limit": limit,
-                     "accessibility_required": accessibility_required}),
-         json.dumps(result, ensure_ascii=False, default=str), RECOMMENDATION_POLICY))
+         jsonb({"latitude": latitude, "longitude": longitude, "category": category, "limit": limit,
+                "accessibility_required": accessibility_required}),
+         jsonb(result), RECOMMENDATION_POLICY))
     prune_recommendation_events(connection, festival["id"])
     # ponytail: 노출 이력을 남겨야 편향 점검이 성립하므로 이 GET은 캐시하지 않는다.
     return success(request, result)
@@ -117,8 +116,8 @@ def prune_recommendation_events(connection: Connection, festival_id) -> None:
 def admin_recommendation_bias(
     festival_id: str,
     request: Request,
-    _: Annotated[dict, Depends(festival_access)],
-    connection: Annotated[Connection, Depends(database)],
+    _: Scope,
+    connection: Db,
     window_days: Annotated[int, Query(ge=1, le=90)] = 7,
     max_business_share: Annotated[float, Query(gt=0, le=1)] = 0.6,
     max_category_share: Annotated[float, Query(gt=0, le=1)] = 0.75,

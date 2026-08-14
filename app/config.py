@@ -11,12 +11,12 @@ class Settings:
     visitor_session_hours: int = int(os.getenv("VISITOR_SESSION_HOURS", "24"))
     environment: str = os.getenv("ENVIRONMENT", "development")
     external_ai_enabled: bool = os.getenv("ENABLE_EXTERNAL_AI", "false").lower() == "true"
-    allen_question_url: str = os.getenv("ALLEN_QUESTION_URL", "https://kdt-api-function.azurewebsites.net/api/v1/question")
-    allen_client_id: str = os.getenv("ALLEN_CLIENT_ID", "")
-    allen_connect_timeout: float = float(os.getenv("ALLEN_CONNECT_TIMEOUT_SECONDS", "3"))
-    # 대시보드 응답이 앨런 지연에 묶이지 않도록 짧게 잡는다. 브리핑 한 문장은 이 안에 온다.
-    allen_read_timeout: float = float(os.getenv("ALLEN_READ_TIMEOUT_SECONDS", "8"))
-    allen_max_retries: int = int(os.getenv("ALLEN_MAX_RETRIES", "1"))
+    alan_question_url: str = os.getenv("ALAN_QUESTION_URL", "https://kdt-api-function.azurewebsites.net/api/v1/question")
+    alan_client_id: str = os.getenv("ALAN_CLIENT_ID", "")
+    alan_connect_timeout: float = float(os.getenv("ALAN_CONNECT_TIMEOUT_SECONDS", "3"))
+    # 대시보드 응답이 Alan 지연에 묶이지 않도록 짧게 잡는다. 브리핑 한 문장은 이 안에 온다.
+    alan_read_timeout: float = float(os.getenv("ALAN_READ_TIMEOUT_SECONDS", "8"))
+    alan_max_retries: int = int(os.getenv("ALAN_MAX_RETRIES", "1"))
     recommendation_event_retention_days: int = int(os.getenv("RECOMMENDATION_EVENT_RETENTION_DAYS", "90"))
 
     def validate(self) -> None:

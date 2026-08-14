@@ -112,20 +112,23 @@ RISK_ACTIONS = {
 }
 
 
+# 신호 종류별 (임계값 초과 점수, 이하 점수). schedule_change는 발생 자체가 신호라 같은 값을 준다.
+RISK_POINTS = {
+    "safety_incidents": (35, 15),
+    "unresolved_safety_complaints": (30, 15),
+    "staffing_gap": (25, 10),
+    "schedule_change": (20, 20),
+}
+
+
 def risk_points(signal: dict) -> int:
     """crowding은 혼잡 구역 비율(0-100), 나머지는 건수 기준이다."""
     value, threshold = float(signal["value"]), float(signal.get("threshold") or 0)
+    # crowding만 3단계다 — 90% 이상은 임계값과 무관하게 최고점.
     if signal["type"] == "crowding":
         return 45 if value >= 90 else 30 if value >= threshold else 10
-    if signal["type"] == "safety_incidents":
-        return 35 if value > threshold else 15
-    if signal["type"] == "unresolved_safety_complaints":
-        return 30 if value > threshold else 15
-    if signal["type"] == "staffing_gap":
-        return 25 if value > threshold else 10
-    if signal["type"] == "schedule_change":
-        return 20
-    return 10
+    over, under = RISK_POINTS.get(signal["type"], (10, 10))
+    return over if value > threshold else under
 
 
 def risk_brief(signals: list[dict]) -> dict:

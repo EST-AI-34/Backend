@@ -4,6 +4,8 @@ builder = "DOCKERFILE"
 [deploy]
 preDeployCommand = "python -m scripts.migrate"
 startCommand = "sh -c 'uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1'"
-healthcheckPath = "/health/ready"
+# ponytail: DB를 찌르지 않는 /health/live로 원인 분리. 통과하면 DB 풀 문제, 실패하면 기동 실패.
+# 원인 확인 뒤 /health/ready로 되돌릴 것.
+healthcheckPath = "/health/live"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10

@@ -1,13 +1,14 @@
 from datetime import UTC, date, datetime, timedelta
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, Request, Response
+from fastapi import APIRouter, Query, Request, Response
 from psycopg import Connection
 
 from ..config import settings
-from ..db import all_rows, database, jsonb, one
+from ..db import all_rows, jsonb, one
+from ..deps import Db
 from ..domain import supported_language
-from ..errors import not_found
+from ..errors import found
 from ..http import success
 from ..schemas import VisitorSessionIn
 from ..security import hash_token, random_token
@@ -17,24 +18,25 @@ router = APIRouter()
 
 
 def published_festival(connection: Connection, code: str) -> dict:
-    festival = one(
+    return found(one(
         connection,
         """SELECT id,code,name,description,timezone,starts_at,ends_at,status,default_language,
-                  supported_languages,updated_at FROM festivals
+                  supported_languages,visitor_menus,updated_at FROM festivals
            WHERE code=%s AND status IN ('PUBLISHED','ONGOING','ENDED')""",
         (code,),
-    )
-    if not festival:
-        raise not_found("게시된 축제를 찾을 수 없습니다.")
-    return festival
+    ), "게시된 축제를 찾을 수 없습니다.")
 
 
 def cached(response: Response, seconds: int = 60) -> None:
     response.headers["Cache-Control"] = f"public, max-age={seconds}, stale-while-revalidate={seconds}"
 
 
+def visitor_language(festival: dict, requested: str | None, request: Request) -> str:
+    return supported_language(requested or request.headers.get("Accept-Language"), festival["supported_languages"], festival["default_language"])
+
+
 @router.get("/public/festivals/{festival_code}")
-def festival_home(festival_code: str, request: Request, response: Response, connection: Annotated[Connection, Depends(database)]):
+def festival_home(festival_code: str, request: Request, response: Response, connection: Db):
     result = published_festival(connection, festival_code)
     cached(response, 120)
     return success(request, result)
@@ -45,7 +47,7 @@ def programs(
     festival_code: str,
     request: Request,
     response: Response,
-    connection: Annotated[Connection, Depends(database)],
+    connection: Db,
     selected_date: Annotated[date | None, Query(alias="date")] = None,
     area_id: Annotated[str | None, Query(alias="areaId")] = None,
     category: str | None = None,
@@ -53,17 +55,14 @@ def programs(
     language: str | None = None,
 ):
     festival = published_festival(connection, festival_code)
-    language = supported_language(language or request.headers.get("Accept-Language"), festival["supported_languages"], festival["default_language"])
+    language = visitor_language(festival, language, request)
     values: list = [festival["id"], language, festival["default_language"]]
     clauses = ["p.festival_id=%s", "p.status='PUBLISHED'", "ci.lifecycle_status='PUBLISHED'", "cv.language IN (%s,%s)"]
-    if category:
-        clauses.append("p.category=%s"); values.append(category)
-    if area_id:
-        clauses.append("ps.area_id=%s"); values.append(area_id)
-    if status:
-        clauses.append("ps.status=%s"); values.append(status)
-    if selected_date:
-        clauses.append("(ps.starts_at AT TIME ZONE f.timezone)::date=%s"); values.append(selected_date)
+    for clause, value in (("p.category=%s", category), ("ps.area_id=%s", area_id), ("ps.status=%s", status),
+                          ("(ps.starts_at AT TIME ZONE f.timezone)::date=%s", selected_date)):
+        if value:
+            clauses.append(clause)
+            values.append(value)
     rows = all_rows(
         connection,
         f"""SELECT p.id,p.slug,p.title,p.summary,p.category,p.accessibility,p.updated_at,cv.language,
@@ -82,10 +81,10 @@ def programs(
 
 
 @router.get("/public/festivals/{festival_code}/programs/{program_slug}")
-def program_detail(festival_code: str, program_slug: str, request: Request, response: Response, connection: Annotated[Connection, Depends(database)], language: str | None = None):
+def program_detail(festival_code: str, program_slug: str, request: Request, response: Response, connection: Db, language: str | None = None):
     festival = published_festival(connection, festival_code)
-    language = supported_language(language or request.headers.get("Accept-Language"), festival["supported_languages"], festival["default_language"])
-    row = one(
+    language = visitor_language(festival, language, request)
+    row = found(one(
         connection,
         """SELECT p.id,p.slug,p.title,p.summary,p.category,p.accessibility,p.updated_at,cv.language,cv.body,
                   ci.updated_at AS published_at,
@@ -99,15 +98,13 @@ def program_detail(festival_code: str, program_slug: str, request: Request, resp
            WHERE p.festival_id=%s AND p.slug=%s AND p.status='PUBLISHED'
            GROUP BY p.id,cv.id,ci.updated_at ORDER BY (cv.language=%s) DESC LIMIT 1""",
         (language, festival["default_language"], festival["id"], program_slug, language),
-    )
-    if not row:
-        raise not_found("게시된 프로그램을 찾을 수 없습니다.")
+    ), "게시된 프로그램을 찾을 수 없습니다.")
     cached(response)
     return success(request, row)
 
 
 @router.get("/public/festivals/{festival_code}/areas")
-def areas(festival_code: str, request: Request, response: Response, connection: Annotated[Connection, Depends(database)]):
+def areas(festival_code: str, request: Request, response: Response, connection: Db):
     festival = published_festival(connection, festival_code)
     rows = all_rows(connection, "SELECT id,name,area_type,latitude,longitude,status,updated_at FROM festival_areas WHERE festival_id=%s AND status='ACTIVE' ORDER BY name", (festival["id"],))
     cached(response)
@@ -115,7 +112,7 @@ def areas(festival_code: str, request: Request, response: Response, connection: 
 
 
 @router.get("/public/festivals/{festival_code}/facilities")
-def facilities(festival_code: str, request: Request, response: Response, connection: Annotated[Connection, Depends(database)], type_: Annotated[str | None, Query(alias="type")] = None):
+def facilities(festival_code: str, request: Request, response: Response, connection: Db, type_: Annotated[str | None, Query(alias="type")] = None):
     festival = published_festival(connection, festival_code)
     rows = all_rows(connection, """SELECT f.id,f.name,f.facility_type,f.accessibility,f.operating_hours,f.status,f.updated_at,
         jsonb_build_object('id',a.id,'name',a.name,'latitude',a.latitude,'longitude',a.longitude) AS area
@@ -126,7 +123,7 @@ def facilities(festival_code: str, request: Request, response: Response, connect
 
 
 @router.get("/public/festivals/{festival_code}/map")
-def festival_map(festival_code: str, request: Request, response: Response, connection: Annotated[Connection, Depends(database)]):
+def festival_map(festival_code: str, request: Request, response: Response, connection: Db):
     festival = published_festival(connection, festival_code)
     areas_data = all_rows(connection, "SELECT id,name,area_type,latitude,longitude,status FROM festival_areas WHERE festival_id=%s AND status='ACTIVE'", (festival["id"],))
     facilities_data = all_rows(connection, "SELECT id,area_id,name,facility_type,accessibility,operating_hours,status FROM facilities WHERE festival_id=%s AND status='ACTIVE'", (festival["id"],))
@@ -138,7 +135,7 @@ def festival_map(festival_code: str, request: Request, response: Response, conne
 
 
 @router.get("/public/festivals/{festival_code}/announcements")
-def announcements(festival_code: str, request: Request, response: Response, connection: Annotated[Connection, Depends(database)]):
+def announcements(festival_code: str, request: Request, response: Response, connection: Db):
     festival = published_festival(connection, festival_code)
     rows = all_rows(connection, """SELECT a.id,a.title,a.severity,a.audience,a.target_area_ids,a.starts_at,a.ends_at,
         CASE WHEN a.ends_at IS NOT NULL AND a.ends_at<=now() THEN 'EXPIRED' ELSE 'ACTIVE' END AS status,
@@ -151,31 +148,31 @@ def announcements(festival_code: str, request: Request, response: Response, conn
 
 
 @router.get("/public/festivals/{festival_code}/announcements/{announcement_id}")
-def announcement(festival_code: str, announcement_id: str, request: Request, response: Response, connection: Annotated[Connection, Depends(database)]):
+def announcement(festival_code: str, announcement_id: str, request: Request, response: Response, connection: Db):
     festival = published_festival(connection, festival_code)
-    row = one(connection, """SELECT a.id,a.title,a.severity,a.audience,a.target_area_ids,a.starts_at,a.ends_at,cv.body,cv.language,a.updated_at
+    row = found(one(connection, """SELECT a.id,a.title,a.severity,a.audience,a.target_area_ids,a.starts_at,a.ends_at,cv.body,cv.language,a.updated_at
         FROM announcements a JOIN content_versions cv ON cv.id=a.content_version_id WHERE a.id=%s AND a.festival_id=%s
           AND a.status IN ('ACTIVE','SCHEDULED') AND a.starts_at<=now() AND (a.ends_at IS NULL OR a.ends_at>now())
-          AND a.audience ? 'VISITOR' AND cv.status='APPROVED'""", (announcement_id, festival["id"]))
-    if not row:
-        raise not_found("노출 중인 공지를 찾을 수 없습니다.")
+          AND a.audience ? 'VISITOR' AND cv.status='APPROVED'""", (announcement_id, festival["id"])), "노출 중인 공지를 찾을 수 없습니다.")
     cached(response, 15)
     return success(request, row)
 
 
 @router.post("/public/festivals/{festival_code}/visitor-sessions", status_code=201)
-def create_visitor_session(festival_code: str, body: VisitorSessionIn, request: Request, connection: Annotated[Connection, Depends(database)]):
+def create_visitor_session(festival_code: str, body: VisitorSessionIn, request: Request, connection: Db):
     festival = published_festival(connection, festival_code)
     token = random_token("vs")
     expires_at = datetime.now(UTC) + timedelta(hours=settings.visitor_session_hours)
-    language = supported_language(body.language or request.headers.get("Accept-Language"), festival["supported_languages"], festival["default_language"])
+    language = visitor_language(festival, body.language, request)
     row = one(connection, """INSERT INTO visitor_sessions(festival_id,anonymous_token_hash,language,accessibility_preferences,consents,expires_at)
         VALUES(%s,%s,%s,%s,%s,%s) RETURNING id""", (festival["id"], hash_token(token), language, jsonb(body.accessibility_preferences), jsonb(body.consents), expires_at))
-    return success(request, {"id": row["id"], "sessionToken": token, "expiresAt": expires_at, "language": language, "accessibilityPreferences": body.accessibility_preferences, "festival": {"code": festival["code"], "timezone": festival["timezone"], "supportedLanguages": festival["supported_languages"]}})
+    return success(request, {"id": row["id"], "sessionToken": token, "expiresAt": expires_at, "language": language,
+                             "accessibilityPreferences": body.accessibility_preferences,
+                             "festival": {"code": festival["code"], "timezone": festival["timezone"], "supportedLanguages": festival["supported_languages"]}})
 
 
 @router.get("/public/festivals/{festival_code}/surveys")
-def surveys(festival_code: str, request: Request, response: Response, connection: Annotated[Connection, Depends(database)]):
+def surveys(festival_code: str, request: Request, response: Response, connection: Db):
     festival = published_festival(connection, festival_code)
     rows = all_rows(connection, """SELECT s.id,s.title,s.description,s.starts_at,s.ends_at,
         coalesce(jsonb_agg(jsonb_build_object('id',q.id,'prompt',q.prompt,'type',q.question_type,'options',q.options,
