@@ -89,19 +89,40 @@ def test_visitor_can_update_accessibility_preferences(client, visitor):
     assert updated["accessibility_preferences"]["wheelchair"] is True
 
 
+def test_stamp_action_is_marked_completed_after_collecting(client, visitor, unique):
+    actions = data(client.get("/api/v1/visitor/reward-actions", headers=visitor))
+    stamp = next(action for action in actions if action["verification_type"] == "SELF")
+    assert stamp["completed"] is False and "verificationKeys" not in stamp
+    client.post("/api/v1/visitor/reward-events", headers={**visitor, "Idempotency-Key": unique("stamp")},
+                json={"rewardActionId": stamp["id"], "verificationKey": f"stamp:{stamp['id']}", "evidence": {}})
+    after = data(client.get("/api/v1/visitor/reward-actions", headers=visitor))
+    assert next(action for action in after if action["id"] == stamp["id"])["completed"] is True
+
+
+def test_visitor_complaint_becomes_open_ticket(client, festival, manager, visitor):
+    created = data(client.post("/api/v1/visitor/complaints", headers=visitor,
+                               json={"title": "그늘막이 부족해요", "category": "편의시설", "description": "정문 대기줄에 그늘이 없어요."}))
+    assert created["status"] == "OPEN"
+    tickets = data(client.get(f"/api/v1/admin/festivals/{festival['id']}/ops-tickets", headers=manager))
+    ticket = next(row for row in tickets if row["id"] == created["id"])
+    assert ticket["ticket_type"] == "COMPLAINT"
+    assert ticket["title"] == "[편의시설] 그늘막이 부족해요"
+
+
 # --- 콘텐츠 분리 승인 --------------------------------------------------------
 
 def test_author_cannot_approve_own_content(client, festival, manager, reviewer, unique):
     base = f"/api/v1/admin/festivals/{festival['id']}"
+    # ANNOUNCEMENT는 작성자 자가 승인이 허용된 타입이라 분리 승인 검증에는 쓸 수 없다.
     item = data(client.post(f"{base}/content-items", headers=manager,
-                            json={"contentType": "NOTICE", "slug": unique("notice")}))
+                            json={"contentType": "PROGRAM", "slug": unique("notice")}))
     version = data(client.post(f"{base}/content-items/{item['id']}/versions", headers=manager,
                                json={"language": "ko", "body": {"title": "안내", "summary": "본문"}}))
     data(client.post(f"{base}/content-versions/{version['id']}/submit", headers=manager))
 
-    # manager는 SUPER_ADMIN/REVIEWER가 아니라 검수 자체를 할 수 없다.
+    # manager는 검수 권한이 있지만, 자신이 작성한 버전은 최종 승인할 수 없다.
     assert error_code(client.post(f"{base}/content-versions/{version['id']}/reviews", headers=manager,
-                                  json={"decision": "APPROVED"}), 403) == "FORBIDDEN"
+                                  json={"decision": "APPROVED"}), 422) == "AUTHOR_CANNOT_FINAL_APPROVE"
     approved = data(client.post(f"{base}/content-versions/{version['id']}/reviews", headers=reviewer,
                                 json={"decision": "APPROVED", "comment": "확인"}))
     assert approved["status"] == "APPROVED"
@@ -113,7 +134,7 @@ def test_author_cannot_approve_own_content(client, festival, manager, reviewer, 
 def test_unapproved_version_cannot_be_published(client, festival, manager, unique):
     base = f"/api/v1/admin/festivals/{festival['id']}"
     item = data(client.post(f"{base}/content-items", headers=manager,
-                            json={"contentType": "NOTICE", "slug": unique("draft")}))
+                            json={"contentType": "ANNOUNCEMENT", "slug": unique("draft")}))
     version = data(client.post(f"{base}/content-items/{item['id']}/versions", headers=manager,
                                json={"language": "ko", "body": {"title": "초안"}}))
     response = client.post(f"{base}/content-items/{item['id']}/publish", headers=manager,
@@ -375,3 +396,15 @@ def test_esg_dashboard_carries_ai_brief_flag(client, festival, manager):
     dashboard = data(client.get(f"/api/v1/admin/festivals/{festival['id']}/esg/dashboard", headers=manager))
     assert dashboard["source"] == "APPROVED_MEASUREMENTS_ONLY"
     assert dashboard["externalAiUsed"] is False and dashboard["aiBrief"] is None
+
+
+def test_malformed_uuid_is_a_client_error(client, manager, festival):
+    """빈 문자열 UUID는 500이 아니라 400으로 돌아와야 한다."""
+    response = client.post(
+        f"/api/v1/admin/festivals/{festival['id']}/staff-assignments",
+        headers=manager,
+        json={"membershipId": "", "areaId": "", "dutyRole": "안전 관리",
+              "startsAt": "2026-09-13T10:00:00Z", "endsAt": "2026-09-13T12:00:00Z"},
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "VALIDATION_ERROR"

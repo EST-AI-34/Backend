@@ -81,6 +81,7 @@ class FestivalPatch(APIModel):
     status: Literal["DRAFT", "PUBLISHED", "ONGOING", "ENDED", "ARCHIVED"] | None = None
     default_language: str | None = None
     supported_languages: list[str] | None = None
+    visitor_menus: dict[str, bool] | None = None
     version: int | None = None
 
 
@@ -215,6 +216,12 @@ class TicketIn(APIModel):
     area_id: str | None = None
     priority: Literal["LOW", "NORMAL", "HIGH", "EMERGENCY"] = "NORMAL"
     assignee_id: str | None = None
+
+
+class ComplaintIn(APIModel):
+    title: str = Field(min_length=1, max_length=200)
+    description: str = Field(min_length=1, max_length=2000)
+    category: str | None = Field(default=None, max_length=20)
 
 
 class TicketPatch(APIModel):
@@ -380,11 +387,6 @@ class BusinessPatch(APIModel):
     operating_hours: dict[str, Any] | None = None
     accessibility: dict[str, Any] | None = None
     version: int
-
-
-class BusinessReviewIn(APIModel):
-    decision: Literal["APPROVED", "REJECTED"]
-    comment: str | None = Field(default=None, max_length=2000)
 
 
 class CouponIn(DateRangeModel):

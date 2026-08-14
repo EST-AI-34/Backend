@@ -20,10 +20,6 @@ def forbidden(code: str = "FORBIDDEN", message: str = "접근 권한이 없습�
     return AppError(403, code, message)
 
 
-def not_found(message: str = "리소스를 찾을 수 없습니다.") -> AppError:
-    return AppError(404, "RESOURCE_NOT_FOUND", message)
-
-
 def conflict(code: str, message: str) -> AppError:
     return AppError(409, code, message)
 
@@ -31,3 +27,9 @@ def conflict(code: str, message: str) -> AppError:
 def unprocessable(code: str, message: str) -> AppError:
     return AppError(422, code, message)
 
+
+def found[T](row: T, message: str = "리소스를 찾을 수 없습니다.") -> T:
+    """조회 결과를 그대로 돌려주고, 비어 있으면 404. `row=one(...); if not row: raise ...` 자리."""
+    if not row:
+        raise AppError(404, "RESOURCE_NOT_FOUND", message)
+    return row

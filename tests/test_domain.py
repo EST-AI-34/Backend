@@ -119,11 +119,11 @@ def stub_transport(monkeypatch, handler):
 
 
 def test_briefing_returns_none_when_disabled_or_unconfigured(monkeypatch):
-    with_settings(monkeypatch, external_ai_enabled=False, allen_client_id="uuid")
+    with_settings(monkeypatch, external_ai_enabled=False, alan_client_id="uuid")
     assert ai.briefing(ai.RISK_INSTRUCTION, ["혼잡 90%"]) is None
 
     # 켜 두고 키를 안 채운 배포는 예외가 아니라 규칙 기반 문장으로 떨어진다.
-    with_settings(monkeypatch, external_ai_enabled=True, allen_client_id="")
+    with_settings(monkeypatch, external_ai_enabled=True, alan_client_id="")
     assert ai.briefing(ai.RISK_INSTRUCTION, ["혼잡 90%"]) is None
 
 
@@ -132,7 +132,7 @@ def test_one_sentence_trims_markdown_and_keeps_decimals():
     assert ai.one_sentence("달성률은 12.5% 입니다. 다음 문장.") == "달성률은 12.5% 입니다."
     assert ai.one_sentence("출처 없는 한 문장 [출처1](http://a.b) 입니다.") == "출처 없는 한 문장  입니다."
     assert ai.one_sentence("문장 부호가 없으면 그대로") == "문장 부호가 없으면 그대로"
-    # 앨런은 답변을 굵게 감싸고 따옴표를 덧붙여 돌려주는 일이 잦다.
+    # Alan은 답변을 굵게 감싸고 따옴표를 덧붙여 돌려주는 일이 잦다.
     assert ai.one_sentence('**"혼잡도 100%로 위험이 높습니다."**') == "혼잡도 100%로 위험이 높습니다."
 
 
@@ -145,7 +145,7 @@ def test_briefing_sends_client_id_and_reads_answer(monkeypatch):
         seen["url"] = str(request.url)
         return httpx.Response(200, json={"answer": "혼잡도가 높습니다. 뒤 문장은 잘린다.", "references": []})
 
-    with_settings(monkeypatch, external_ai_enabled=True, allen_client_id="test-uuid")
+    with_settings(monkeypatch, external_ai_enabled=True, alan_client_id="test-uuid")
     stub_transport(monkeypatch, handler)
     assert ai.briefing(ai.RISK_INSTRUCTION, ["혼잡 90%"]) == "혼잡도가 높습니다."
     assert "client_id=test-uuid" in seen["url"] and "content=" in seen["url"]
@@ -162,16 +162,16 @@ def test_request_retries_then_succeeds(monkeypatch):
             raise httpx.ConnectError("일시적 실패")
         return httpx.Response(200, json={"answer": "복구된 답변입니다."})
 
-    with_settings(monkeypatch, external_ai_enabled=True, allen_client_id="test-uuid", allen_max_retries=2)
+    with_settings(monkeypatch, external_ai_enabled=True, alan_client_id="test-uuid", alan_max_retries=2)
     stub_transport(monkeypatch, handler)
     assert ai.briefing(ai.RISK_INSTRUCTION, ["혼잡 90%"]) == "복구된 답변입니다."
     assert calls["n"] == 2
 
 
-def test_briefing_falls_back_when_allen_keeps_failing(monkeypatch):
+def test_briefing_falls_back_when_alan_keeps_failing(monkeypatch):
     import httpx
 
-    with_settings(monkeypatch, external_ai_enabled=True, allen_client_id="test-uuid", allen_max_retries=1)
+    with_settings(monkeypatch, external_ai_enabled=True, alan_client_id="test-uuid", alan_max_retries=1)
     stub_transport(monkeypatch, lambda request: httpx.Response(500, json={"error": "boom"}))
     assert ai.briefing(ai.RISK_INSTRUCTION, ["혼잡 90%"]) is None
 
@@ -179,7 +179,7 @@ def test_briefing_falls_back_when_allen_keeps_failing(monkeypatch):
 def test_empty_answer_is_not_passed_off_as_a_briefing(monkeypatch):
     import httpx
 
-    with_settings(monkeypatch, external_ai_enabled=True, allen_client_id="test-uuid")
+    with_settings(monkeypatch, external_ai_enabled=True, alan_client_id="test-uuid")
     stub_transport(monkeypatch, lambda request: httpx.Response(200, json={"answer": "   ", "references": []}))
     assert ai.briefing(ai.RISK_INSTRUCTION, ["혼잡 90%"]) is None
 
@@ -188,7 +188,7 @@ def test_non_json_body_falls_back_instead_of_raising(monkeypatch):
     """게이트웨이가 200으로 HTML을 주면 대시보드가 500이 되면 안 된다."""
     import httpx
 
-    with_settings(monkeypatch, external_ai_enabled=True, allen_client_id="test-uuid")
+    with_settings(monkeypatch, external_ai_enabled=True, alan_client_id="test-uuid")
     stub_transport(monkeypatch, lambda request: httpx.Response(200, text="<html>gateway error</html>"))
     assert ai.briefing(ai.RISK_INSTRUCTION, ["혼잡 90%"]) is None
 
@@ -202,7 +202,7 @@ def count_calls(monkeypatch, status):
         calls["n"] += 1
         return httpx.Response(status, json={"error": "boom"})
 
-    with_settings(monkeypatch, external_ai_enabled=True, allen_client_id="test-uuid", allen_max_retries=2)
+    with_settings(monkeypatch, external_ai_enabled=True, alan_client_id="test-uuid", alan_max_retries=2)
     stub_transport(monkeypatch, handler)
     assert ai.briefing(ai.RISK_INSTRUCTION, ["혼잡 90%"]) is None
     return calls["n"]
