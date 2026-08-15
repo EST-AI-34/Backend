@@ -31,9 +31,10 @@ def main() -> None:
                 ON CONFLICT(organization_id,user_id) DO UPDATE SET role=excluded.role,festival_scope=excluded.festival_scope,status='ACTIVE'""", (organization["id"],user["id"],role,Jsonb(["*"])))
             users[role]=user
             memberships[role]=one(connection, "SELECT * FROM memberships WHERE organization_id=%s AND user_id=%s",(organization["id"],user["id"]))
-        festival = one(connection, """INSERT INTO festivals(organization_id,code,name,description,starts_at,ends_at,status)
-            VALUES(%s,'EST34-2026','2026 지역문화축제','AI·ESG 기반 지역축제 DX 데모','2026-09-12T00:00:00Z','2026-09-14T12:00:00Z','PUBLISHED')
-            ON CONFLICT(code) DO UPDATE SET name=excluded.name,status='PUBLISHED',updated_at=now() RETURNING *""", (organization["id"],))
+        festival = one(connection, """INSERT INTO festivals(organization_id,code,name,description,starts_at,ends_at,status,supported_languages)
+            VALUES(%s,'EST34-2026','2026 지역문화축제','AI·ESG 기반 지역축제 DX 데모','2026-09-12T00:00:00Z','2026-09-14T12:00:00Z','PUBLISHED','["ko","en","zh","ja"]')
+            ON CONFLICT(code) DO UPDATE SET name=excluded.name,status='PUBLISHED',
+                supported_languages=excluded.supported_languages,updated_at=now() RETURNING *""", (organization["id"],))
         area = (one(connection, "SELECT * FROM festival_areas WHERE festival_id=%s AND name='메인 광장'",(festival["id"],))
                 or one(connection, "INSERT INTO festival_areas(festival_id,name,area_type,latitude,longitude) VALUES(%s,'메인 광장','MAIN',37.5665,126.9780) RETURNING *",(festival["id"],)))
         connection.execute("""INSERT INTO facilities(festival_id,area_id,name,facility_type,accessibility,operating_hours)
