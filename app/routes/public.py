@@ -7,7 +7,7 @@ from psycopg import Connection
 from ..config import settings
 from ..db import all_rows, jsonb, one
 from ..deps import Db
-from ..domain import supported_language
+from ..domain import safety_facility_order, supported_language
 from ..errors import found
 from ..http import success
 from ..schemas import VisitorSessionIn
@@ -114,12 +114,44 @@ def areas(festival_code: str, request: Request, response: Response, connection: 
 @router.get("/public/festivals/{festival_code}/facilities")
 def facilities(festival_code: str, request: Request, response: Response, connection: Db, type_: Annotated[str | None, Query(alias="type")] = None):
     festival = published_festival(connection, festival_code)
-    rows = all_rows(connection, """SELECT f.id,f.name,f.facility_type,f.accessibility,f.operating_hours,f.status,f.updated_at,
+    rows = all_rows(connection, f"""SELECT f.id,f.name,f.facility_type,f.accessibility,f.operating_hours,f.status,f.updated_at,
         jsonb_build_object('id',a.id,'name',a.name,'latitude',a.latitude,'longitude',a.longitude) AS area
         FROM facilities f JOIN festival_areas a ON a.id=f.area_id WHERE f.festival_id=%s AND f.status='ACTIVE'
-        AND (%s::text IS NULL OR f.facility_type=%s) ORDER BY f.name""", (festival["id"], type_, type_))
+        AND (%s::text IS NULL OR f.facility_type=%s) ORDER BY {safety_facility_order('f.facility_type')},f.name""", (festival["id"], type_, type_))
     cached(response)
     return success(request, rows)
+
+
+@router.get("/public/festivals/{festival_code}/crowd")
+def crowd(festival_code: str, request: Request, response: Response, connection: Db):
+    festival = published_festival(connection, festival_code)
+    zones = all_rows(connection, """SELECT DISTINCT ON (cs.area_id) cs.area_id,a.name,cs.crowd_level,cs.people_count,
+        cs.estimated_wait_min,cs.captured_at,cs.expires_at,(cs.expires_at<=now()) AS stale
+        FROM crowd_snapshots cs JOIN festival_areas a ON a.id=cs.area_id
+        WHERE cs.festival_id=%s AND a.status='ACTIVE' ORDER BY cs.area_id,cs.captured_at DESC""", (festival["id"],))
+    crowded = any(zone["crowd_level"] in ("BUSY", "FULL") and not zone["stale"] for zone in zones)
+    # 혼잡(BUSY/FULL)하지 않은 구역에서 지금 참여할 수 있는 공개 프로그램을 대체로 제시한다.
+    # 스냅샷이 없거나 오래된(stale) 구역은 "혼잡하지 않다고 확인된 건 아니라"고 보지 않고 후보로 둔다.
+    alternatives = all_rows(connection, """WITH latest AS (
+          SELECT DISTINCT ON (area_id) area_id,crowd_level,expires_at FROM crowd_snapshots
+          WHERE festival_id=%s ORDER BY area_id,captured_at DESC
+        )
+        SELECT DISTINCT ON (p.id) p.id,p.slug,p.title,ps.starts_at,ps.ends_at,a.id AS area_id,a.name AS area_name
+        FROM program_sessions ps JOIN programs p ON p.id=ps.program_id JOIN festival_areas a ON a.id=ps.area_id
+        JOIN content_items ci ON ci.festival_id=p.festival_id AND ci.resource_type='PROGRAM' AND ci.resource_id=p.id AND ci.lifecycle_status='PUBLISHED'
+        LEFT JOIN latest l ON l.area_id=ps.area_id
+        WHERE p.festival_id=%s AND p.status='PUBLISHED' AND ps.status='OPEN' AND ps.ends_at>now()
+          AND (l.area_id IS NULL OR l.crowd_level NOT IN ('BUSY','FULL') OR l.expires_at<=now())
+        ORDER BY p.id,ps.starts_at LIMIT 5""", (festival["id"], festival["id"])) if crowded else []
+    for zone in zones:
+        zone["alternative_programs"] = alternatives if zone["crowd_level"] in ("BUSY", "FULL") else []
+    cached(response, 15)
+    return success(request, {
+        "updatedAt": max((zone["captured_at"] for zone in zones), default=None),
+        "stale": (not any(not zone["stale"] for zone in zones)) if zones else True,
+        "zones": zones,
+        "sources": ["crowd_snapshots", "program_sessions"],
+    })
 
 
 @router.get("/public/festivals/{festival_code}/map")

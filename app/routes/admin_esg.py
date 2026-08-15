@@ -191,7 +191,9 @@ def approve_report(festival_id: str, report_id: str, request: Request, _: Scope,
 def export_report(festival_id: str, report_id: str, body: ExportIn, request: Request, _: Scope, user: Manager, connection: Db):
     if not one(connection, "SELECT 1 FROM esg_reports WHERE id=%s AND festival_id=%s AND status='APPROVED'", (report_id, festival_id)):
         raise bad_request("INVALID_STATE_TRANSITION", "승인된 보고서만 내보낼 수 있습니다.")
+    # result에 요청 format을 임시로 실어 두면 잡 워커(app/jobs.py)가 완료 시 실제 산출물로 덮어쓴다.
     job = one(connection, """INSERT INTO jobs(festival_id,job_type,resource_type,resource_id,status,result)
-        VALUES(%s,'EXPORT_ESG_REPORT','ESG_REPORT',%s,'COMPLETED',%s) RETURNING *""", (festival_id, report_id, jsonb({"format": body.format})))
-    connection.execute("UPDATE esg_reports SET status='EXPORTED',updated_at=now() WHERE id=%s", (report_id,))
+        VALUES(%s,'EXPORT_ESG_REPORT','ESG_REPORT',%s,'PENDING',%s) RETURNING *""", (festival_id, report_id, jsonb({"format": body.format})))
+    audit(connection, festival_id=festival_id, actor_id=str(user["id"]), action="EXPORT", resource_type="ESG_REPORT",
+          resource_id=report_id, after_data={"jobId": str(job["id"]), "format": body.format}, request_id=request.state.request_id)
     return success(request, {"jobId": job["id"], "status": job["status"]})

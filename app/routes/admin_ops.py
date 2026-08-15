@@ -139,6 +139,41 @@ def ticket_events(festival_id: str, ticket_id: str, request: Request, _: Scope, 
     return success(request, all_rows(connection, "SELECT * FROM ops_ticket_events WHERE ticket_id=%s ORDER BY created_at", (ticket_id,)))
 
 
+@router.get("/admin/festivals/{festival_id}/surveys/{survey_id}/summary")
+def survey_summary(festival_id: str, survey_id: str, request: Request, _: Scope, connection: Db):
+    """방문객 제출·중복방지·익명 저장은 있었지만 운영자가 결과를 모아 볼 API가 없었다.
+    개별 응답(visitor_session_id 등)은 절대 내보내지 않고 문항별 집계만 돌려준다."""
+    survey = found(one(connection, "SELECT id,title,prevent_duplicates FROM surveys WHERE id=%s AND festival_id=%s", (survey_id, festival_id)))
+    response_count = one(connection, "SELECT count(*)::int AS count FROM survey_responses WHERE survey_id=%s", (survey_id,))["count"]
+    questions = all_rows(connection, "SELECT id,prompt,question_type,position FROM survey_questions WHERE survey_id=%s ORDER BY position", (survey_id,))
+    answers = all_rows(connection, """SELECT sa.question_id,sa.value FROM survey_answers sa
+        JOIN survey_responses sr ON sr.id=sa.response_id WHERE sr.survey_id=%s""", (survey_id,))
+    answers_by_question: dict[str, list] = {}
+    for answer in answers:
+        answers_by_question.setdefault(str(answer["question_id"]), []).append(answer["value"])
+
+    def summarize(question: dict) -> dict:
+        values = answers_by_question.get(str(question["id"]), [])
+        average_rating = None
+        if question["question_type"] == "RATING":
+            numeric = [float(value) for value in values if isinstance(value, int | float)]
+            average_rating = round(sum(numeric) / len(numeric), 2) if numeric else None
+        option_counts: dict[str, int] = {}
+        if question["question_type"] in ("SINGLE_CHOICE", "MULTIPLE_CHOICE"):
+            for value in values:
+                for option in (value if isinstance(value, list) else [value]):
+                    if isinstance(option, str):
+                        option_counts[option] = option_counts.get(option, 0) + 1
+        return {"question_id": question["id"], "prompt": question["prompt"], "question_type": question["question_type"],
+                "response_count": len(values), "average_rating": average_rating, "option_counts": option_counts}
+
+    return success(request, {
+        "survey_id": survey_id, "title": survey["title"], "response_count": response_count,
+        "anonymous": True, "duplicate_prevention": survey["prevent_duplicates"],
+        "questions": [summarize(question) for question in questions],
+    })
+
+
 def same_organization(organization_id: str, user: dict) -> None:
     if organization_id != str(user["organization_id"]):
         raise forbidden()
