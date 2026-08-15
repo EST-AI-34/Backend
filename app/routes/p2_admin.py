@@ -252,6 +252,11 @@ def dashboard(festival_id: str, request: Request, _: Scope, connection: Db):
         cs.estimated_wait_min,cs.captured_at,cs.expires_at,(cs.expires_at<=now()) AS stale
         FROM crowd_snapshots cs JOIN festival_areas a ON a.id=cs.area_id WHERE cs.festival_id=%s
         ORDER BY cs.area_id,cs.captured_at DESC""", (festival_id,))
-    return success(request, {"stats": stats, "crowd": crowd,
+    # AI-05 언어별 이용 로그. 자동 전환 여부·키오스크 여부는 방문객 세션 설정값에 남는다.
+    languages = all_rows(connection, """SELECT language,count(*)::int AS sessions,
+        count(*) FILTER(WHERE accessibility_preferences->>'languageSource'='AUTO')::int AS auto_switched,
+        count(*) FILTER(WHERE accessibility_preferences->>'visitorMode'='kiosk')::int AS kiosk_sessions
+        FROM visitor_sessions WHERE festival_id=%s GROUP BY language ORDER BY sessions DESC,language""", (festival_id,))
+    return success(request, {"stats": stats, "crowd": crowd, "languages": languages,
                              "updatedAt": max((row["captured_at"] for row in crowd), default=None),
                              "sources": ["visitor_sessions", "bookings", "ops_tickets", "crowd_snapshots", "coupon_issues", "point_ledger"]})

@@ -72,10 +72,20 @@ def test_public_programs_are_cacheable(client, festival):
 
 def test_visitor_session_language_falls_back_to_default(client, festival):
     session = data(client.post(f"/api/v1/public/festivals/{festival['code']}/visitor-sessions",
-                               json={"language": "ja", "consents": {"privacy": True}}))
+                               json={"language": "fr", "consents": {"privacy": True}}))
     # 축제가 지원하지 않는 언어는 기본 언어로 대체된다.
     assert session["language"] == "ko"
     assert session["sessionToken"].startswith("vs_")
+    assert session["festival"]["supportedLanguages"] == ["ko", "en", "zh", "ja"]
+
+
+def test_dashboard_reports_language_usage(client, festival, manager, visitor):
+    # AI-05: 자동 전환 결과가 언어별 이용 로그에 남는다.
+    client.patch("/api/v1/visitor-sessions/current", headers=visitor,
+                 json={"language": "en", "accessibilityPreferences": {"languageSource": "AUTO", "visitorMode": "kiosk"}})
+    languages = data(client.get(f"/api/v1/admin/festivals/{festival['id']}/dashboard", headers=manager))["languages"]
+    english = next(row for row in languages if row["language"] == "en")
+    assert english["auto_switched"] >= 1 and english["kiosk_sessions"] >= 1
 
 
 def test_visitor_token_required_for_visitor_routes(client):
