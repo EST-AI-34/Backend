@@ -21,6 +21,10 @@ RECOMMENDATION_POLICY = "biz-rec-v1"
 SCHEDULE_CHANGE_HOURS = 24
 # 광고는 일반 추천과 같은 상한을 쓰면 응답이 두 배가 된다. 별도 상한으로 묶는다.
 SPONSORED_LIMIT = 3
+# 급증 판정에 쓸 스냅샷을 이 범위 안에서만 본다(오래된 스냅샷끼리 비교하지 않는다).
+SURGE_LOOKBACK_MINUTES = 30
+# 직전 스냅샷과 이 시간 안에 찍힌 것만 "짧은 시간에 급증"으로 본다.
+SURGE_WINDOW_MINUTES = 10
 
 
 @router.get("/admin/festivals/{festival_id}/risk-brief")
@@ -44,7 +48,29 @@ def admin_risk_brief(festival_id: str, request: Request, _: Scope, connection: D
         FROM program_sessions WHERE festival_id=%s AND updated_at>created_at+interval '1 minute'
           AND updated_at>now()-make_interval(hours => %s)
         HAVING count(*)>0""", (festival_id, SCHEDULE_CHANGE_HOURS))
-    signals = crowding + tickets + staffing + schedule
+    # BUSY/FULL 비율(위 crowding)은 "지금 얼마나 찼는가"만 본다. 절대 비율이 낮아도 짧은 시간에
+    # 급격히 찬 구역(예: QUIET->FULL)은 그 자체로 이상 신호라 별도로 잡는다: 같은 구역의 직전
+    # 스냅샷 대비 혼잡 단계가 SURGE_WINDOW_MINUTES 안에 2단계 이상 뛰면 급증으로 본다.
+    surge = all_rows(connection, """WITH ranked AS (
+          SELECT area_id,crowd_level,captured_at,
+                 lag(crowd_level) OVER (PARTITION BY area_id ORDER BY captured_at) AS previous_level,
+                 lag(captured_at) OVER (PARTITION BY area_id ORDER BY captured_at) AS previous_at
+          FROM crowd_snapshots
+          WHERE festival_id=%s AND captured_at>now()-make_interval(mins => %s)
+        ), leveled AS (
+          SELECT area_id,captured_at,previous_at,
+                 CASE crowd_level WHEN 'QUIET' THEN 0 WHEN 'MODERATE' THEN 1 WHEN 'BUSY' THEN 2 WHEN 'FULL' THEN 3 END AS level,
+                 CASE previous_level WHEN 'QUIET' THEN 0 WHEN 'MODERATE' THEN 1 WHEN 'BUSY' THEN 2 WHEN 'FULL' THEN 3 END AS previous_level_rank
+          FROM ranked WHERE previous_at IS NOT NULL
+        ), surged AS (
+          SELECT area_id,captured_at,level-previous_level_rank AS jump FROM leveled
+          WHERE captured_at<=previous_at+make_interval(mins => %s) AND level-previous_level_rank>=2
+        )
+        SELECT 'abnormal_crowd_surge' AS type,max(jump)::int AS value,2 AS threshold,max(s.captured_at) AS source_updated_at,
+               a.name AS area_name,s.area_id::text AS area_id,%s AS window_minutes
+        FROM surged s JOIN festival_areas a ON a.id=s.area_id GROUP BY a.name,s.area_id""",
+        (festival_id, SURGE_LOOKBACK_MINUTES, SURGE_WINDOW_MINUTES, SURGE_WINDOW_MINUTES))
+    signals = crowding + tickets + staffing + schedule + surge
     brief = risk_brief(signals)
     summary = ai.briefing(ai.RISK_INSTRUCTION, brief["reasons"]) if signals else None
     return success(request, {**brief, "festival_id": festival_id,
