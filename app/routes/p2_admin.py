@@ -1,6 +1,7 @@
 import json
 
 from fastapi import APIRouter, Request
+from psycopg.errors import UniqueViolation
 
 from ..config import settings
 from ..db import all_rows, audit, jsonb, one
@@ -8,9 +9,10 @@ from ..deps import Db, Manager, ManagerOrReviewer, Operator, Scope, User
 from ..domain import classify_issue, is_safe_question, mask_sensitive, search_terms, validate_booking_transition
 from ..errors import bad_request, conflict, found
 from ..http import success
-from ..schemas import (BookingStatusIn, BusinessIn, CouponIn, CrowdSnapshotIn, InternalDocumentIn,
+from ..schemas import (BookingStatusIn, BusinessIn, CouponIn, CouponRedeemIn, CrowdSnapshotIn, InternalDocumentIn,
                        InternalSearchIn, IssueAnalysisPatch, ReviewIn, RewardActionIn, RewardCampaignIn,
                        StaffAssignmentIn)
+from ..security import hash_token
 
 
 router = APIRouter()
@@ -168,6 +170,37 @@ def reward_campaigns(festival_id: str, request: Request, _: Scope, connection: D
         FROM reward_campaigns c LEFT JOIN reward_actions a ON a.campaign_id=c.id
         WHERE c.festival_id=%s GROUP BY c.id ORDER BY c.starts_at DESC""", (festival_id,))
     return success(request, rows)
+
+
+@router.post("/admin/festivals/{festival_id}/coupon-redemptions")
+def redeem_coupon_on_site(festival_id: str, body: CouponRedeemIn, request: Request, _: Scope, user: Operator, connection: Db):
+    """현장 운영자가 방문객 QR(사용 토큰)을 읽어 쿠폰을 사용 처리한다.
+
+    상인용 경로(/merchant/coupon-issues/{issue_id}/redeem)는 업체 소유자로 범위가 묶여 있어
+    운영자가 대신 처리할 수 없다. 여기서는 축제 범위로만 제한하고, 스캔한 토큰 하나로 발급
+    건을 찾는다 — QR에 발급 ID까지 담지 않아도 되도록.
+    """
+    issue = one(connection, """SELECT ci.id,ci.status,ci.visitor_session_id,(ci.expires_at<=now()) AS expired,
+        c.festival_business_id,c.name FROM coupon_issues ci JOIN coupons c ON c.id=ci.coupon_id
+        JOIN festival_businesses fb ON fb.id=c.festival_business_id
+        WHERE ci.issue_token_hash=%s AND fb.festival_id=%s FOR UPDATE OF ci""",
+        (hash_token(body.issue_token), festival_id))
+    if not issue:
+        raise bad_request("INVALID_COUPON_TOKEN", "이 축제에서 발급된 쿠폰을 찾을 수 없습니다.")
+    if issue["status"] != "ISSUED" or issue["expired"]:
+        raise conflict("INVALID_COUPON_STATUS", "사용 가능 상태의 쿠폰이 아닙니다.")
+    try:
+        redemption = one(connection, """INSERT INTO coupon_redemptions(coupon_issue_id,festival_business_id,processed_by)
+            VALUES(%s,%s,%s) RETURNING *""", (issue["id"], issue["festival_business_id"], user["id"]))
+    except UniqueViolation as error:
+        # 사용 취소된 발급 건은 상태가 ISSUED로 돌아오지만 사용 이력 행은 남아 있다.
+        raise conflict("DUPLICATE_ACTION", "이미 사용 처리된 쿠폰입니다.") from error
+    connection.execute("UPDATE coupon_issues SET status='REDEEMED' WHERE id=%s", (issue["id"],))
+    connection.execute("INSERT INTO business_events(festival_business_id,visitor_session_id,event_type,source) VALUES(%s,%s,'COUPON_REDEEM','COUPON')",
+        (issue["festival_business_id"], issue["visitor_session_id"]))
+    audit(connection, festival_id=festival_id, actor_id=str(user["id"]), action="REDEEM", resource_type="COUPON_ISSUE",
+          resource_id=str(issue["id"]), after_data=redemption, request_id=request.state.request_id)
+    return success(request, {**redemption, "couponName": issue["name"]})
 
 
 @router.post("/admin/festivals/{festival_id}/reward-campaigns", status_code=201)
