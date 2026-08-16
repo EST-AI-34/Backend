@@ -6,6 +6,15 @@ from datetime import timedelta
 from .errors import bad_request, unprocessable
 
 
+# facility_type은 자유 텍스트 컬럼이라 고정된 값 집합이 없다. 안전 관련 키워드가 이름에
+# 있으면 이름순보다 먼저 노출한다 — 공개(public.py)·운영자(admin_core.py) 목록 둘 다 이 순서를 쓴다.
+# f-string으로 그대로 SQL에 넣는 상수라 컬럼 참조(column)에 사용자 입력이 들어가면 안 된다.
+def safety_facility_order(column: str = "facility_type") -> str:
+    keywords = ("MEDICAL", "SAFETY", "FIRST_AID", "FIRSTAID", "AED", "EMERGENCY", "SECURITY")
+    array = ",".join(f"'%{keyword}%'" for keyword in keywords)
+    return f"CASE WHEN {column} ILIKE ANY(ARRAY[{array}]) THEN 0 ELSE 1 END"
+
+
 TICKET_TRANSITIONS = {
     "OPEN": ["ASSIGNED"],
     "ASSIGNED": ["IN_PROGRESS"],
@@ -109,7 +118,12 @@ RISK_ACTIONS = {
     "unresolved_safety_complaints": "미해결 안전 민원을 처리한 뒤 위험도를 낮춰 주세요.",
     "staffing_gap": "예비 인력을 해당 구역에 재배치해 주세요.",
     "schedule_change": "변경된 일정을 현장 담당자와 확인한 뒤 방문객 공지를 게시해 주세요.",
+    "abnormal_crowd_surge": "급증 구역에 즉시 안전 인력을 배치하고 우회·대기 안내를 방문객에게 보내 주세요.",
 }
+
+# BUSY/FULL 비율은 "지금 얼마나 찼는가"만 본다. 짧은 시간에 급격히 찬 것(비정상 급증)은
+# 놓친다 — 절대 비율이 임계값 밑이어도 짧은 시간에 여러 단계 뛰면 그 자체로 위험 신호다.
+ABNORMAL_SURGE_TYPE = "abnormal_crowd_surge"
 
 
 # 신호 종류별 (임계값 초과 점수, 이하 점수). schedule_change는 발생 자체가 신호라 같은 값을 준다.
@@ -118,11 +132,12 @@ RISK_POINTS = {
     "unresolved_safety_complaints": (30, 15),
     "staffing_gap": (25, 10),
     "schedule_change": (20, 20),
+    ABNORMAL_SURGE_TYPE: (40, 20),
 }
 
 
 def risk_points(signal: dict) -> int:
-    """crowding은 혼잡 구역 비율(0-100), 나머지는 건수 기준이다."""
+    """crowding은 혼잡 구역 비율(0-100), abnormal_crowd_surge는 급증 구역 수, 나머지는 건수 기준이다."""
     value, threshold = float(signal["value"]), float(signal.get("threshold") or 0)
     # crowding만 3단계다 — 90% 이상은 임계값과 무관하게 최고점.
     if signal["type"] == "crowding":
@@ -131,11 +146,21 @@ def risk_points(signal: dict) -> int:
     return over if value > threshold else under
 
 
+def risk_alerts(signals: list[dict]) -> list[str]:
+    """즉시 통보가 필요한 신호만 별도로 뽑는다. BUSY/FULL 비율 임계값 초과는 evidence/reasons로
+    충분히 보이지만, 비정상 급증은 조용히 묻히면 안 되는 신호라 alerts로 분리한다."""
+    return [
+        f"{signal.get('area_name') or signal.get('area_id') or '구역 미상'} 구역: "
+        f"{signal.get('window_minutes', 10)}분 내 혼잡도가 {int(signal['value'])}단계 급증했습니다."
+        for signal in signals if signal["type"] == ABNORMAL_SURGE_TYPE
+    ]
+
+
 def risk_brief(signals: list[dict]) -> dict:
     """검증된 운영 신호만으로 위험도를 계산한다. 신호가 없으면 추정하지 않는다."""
     if not signals:
         return {
-            "risk_level": "INSUFFICIENT_DATA", "risk_score": 0, "evidence": [],
+            "risk_level": "INSUFFICIENT_DATA", "risk_score": 0, "evidence": [], "alerts": [],
             "summary": "위험도를 판단할 만한 운영 데이터가 없습니다.",
             "reasons": ["혼잡·민원·일정·인력 신호가 수집되지 않았습니다."],
             "recommended_actions": ["현장 보고와 운영 기록을 갱신한 뒤 다시 확인해 주세요."],
@@ -146,7 +171,7 @@ def risk_brief(signals: list[dict]) -> dict:
     level = "CRITICAL" if score >= 75 else "WARNING" if score >= 40 else "NORMAL"
     types = {signal["type"] for signal in signals}
     return {
-        "risk_level": level, "risk_score": score, "evidence": signals,
+        "risk_level": level, "risk_score": score, "evidence": signals, "alerts": risk_alerts(signals),
         "summary": f"검증된 신호 {', '.join(sorted(types))} 기준 위험도는 {level}(점수 {score})입니다.",
         "reasons": [f"{signal['type']} 값 {signal['value']}을(를) 임계값 {signal.get('threshold')}과(와) 비교했습니다." for signal in signals],
         "recommended_actions": [RISK_ACTIONS[name] for name in sorted(types) if name in RISK_ACTIONS] or ["운영 신호를 계속 관찰해 주세요."],

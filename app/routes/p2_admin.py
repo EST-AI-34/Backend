@@ -1,6 +1,8 @@
 import json
+from datetime import datetime
+from typing import Annotated
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request
 from psycopg.errors import UniqueViolation
 
 from ..config import settings
@@ -272,24 +274,58 @@ def override_issue_analysis(festival_id: str, ticket_id: str, body: IssueAnalysi
 
 
 @router.get("/admin/festivals/{festival_id}/dashboard")
-def dashboard(festival_id: str, request: Request, _: Scope, connection: Db):
+def dashboard(
+    festival_id: str,
+    request: Request,
+    _: Scope,
+    connection: Db,
+    area_id: Annotated[str | None, Query(alias="areaId")] = None,
+    time_from: Annotated[datetime | None, Query(alias="timeFrom")] = None,
+    time_to: Annotated[datetime | None, Query(alias="timeTo")] = None,
+):
+    # 구역(area) 필터는 해당 지표가 구역과 실제로 연결된 경우에만 적용한다 — 방문 세션·포인트
+    # 적립은 구역 없이 축제 전체 단위라 areaId를 줘도 그대로 전체 값을 낸다.
     stats = one(connection, """SELECT
-        (SELECT count(*) FROM visitor_sessions WHERE festival_id=%s)::int AS visitors,
-        (SELECT count(*) FROM bookings WHERE festival_id=%s AND status IN ('CONFIRMED','WAITING','CALLED'))::int AS active_bookings,
-        (SELECT count(*) FROM ops_tickets WHERE festival_id=%s AND status NOT IN ('RESOLVED','CLOSED'))::int AS open_tickets,
-        (SELECT count(*) FROM festival_businesses WHERE festival_id=%s AND participation_status='APPROVED')::int AS approved_businesses,
-        (SELECT count(*) FROM coupon_issues ci JOIN coupons c ON c.id=ci.coupon_id JOIN festival_businesses fb ON fb.id=c.festival_business_id WHERE fb.festival_id=%s)::int AS coupon_issues,
-        (SELECT coalesce(sum(pl.points_delta),0)::int FROM point_ledger pl JOIN visitor_sessions vs ON vs.id=pl.visitor_session_id WHERE vs.festival_id=%s) AS points_issued""",
-        (festival_id,) * 6)
+        (SELECT count(*) FROM visitor_sessions WHERE festival_id=%s
+           AND (%s::timestamptz IS NULL OR created_at>=%s) AND (%s::timestamptz IS NULL OR created_at<=%s))::int AS visitors,
+        (SELECT count(*) FROM bookings b JOIN program_sessions ps ON ps.id=b.program_session_id
+           WHERE b.festival_id=%s AND b.status IN ('CONFIRMED','WAITING','CALLED')
+           AND (%s::uuid IS NULL OR ps.area_id=%s)
+           AND (%s::timestamptz IS NULL OR b.created_at>=%s) AND (%s::timestamptz IS NULL OR b.created_at<=%s))::int AS active_bookings,
+        (SELECT count(*) FROM ops_tickets WHERE festival_id=%s AND status NOT IN ('RESOLVED','CLOSED')
+           AND (%s::uuid IS NULL OR area_id=%s)
+           AND (%s::timestamptz IS NULL OR created_at>=%s) AND (%s::timestamptz IS NULL OR created_at<=%s))::int AS open_tickets,
+        (SELECT count(DISTINCT fb.id) FROM festival_businesses fb LEFT JOIN booths bo ON bo.festival_business_id=fb.id
+           WHERE fb.festival_id=%s AND fb.participation_status='APPROVED'
+           AND (%s::uuid IS NULL OR bo.area_id=%s))::int AS approved_businesses,
+        (SELECT count(*) FROM coupon_issues ci JOIN coupons c ON c.id=ci.coupon_id JOIN festival_businesses fb ON fb.id=c.festival_business_id
+           WHERE fb.festival_id=%s
+           AND (%s::timestamptz IS NULL OR ci.issued_at>=%s) AND (%s::timestamptz IS NULL OR ci.issued_at<=%s))::int AS coupon_issues,
+        (SELECT coalesce(sum(pl.points_delta),0)::int FROM point_ledger pl JOIN visitor_sessions vs ON vs.id=pl.visitor_session_id
+           WHERE vs.festival_id=%s
+           AND (%s::timestamptz IS NULL OR pl.created_at>=%s) AND (%s::timestamptz IS NULL OR pl.created_at<=%s)) AS points_issued""",
+        (festival_id, time_from, time_from, time_to, time_to,
+         festival_id, area_id, area_id, time_from, time_from, time_to, time_to,
+         festival_id, area_id, area_id, time_from, time_from, time_to, time_to,
+         festival_id, area_id, area_id,
+         festival_id, time_from, time_from, time_to, time_to,
+         festival_id, time_from, time_from, time_to, time_to))
     crowd = all_rows(connection, """SELECT DISTINCT ON (cs.area_id) cs.area_id,a.name,cs.crowd_level,cs.people_count,
         cs.estimated_wait_min,cs.captured_at,cs.expires_at,(cs.expires_at<=now()) AS stale
         FROM crowd_snapshots cs JOIN festival_areas a ON a.id=cs.area_id WHERE cs.festival_id=%s
-        ORDER BY cs.area_id,cs.captured_at DESC""", (festival_id,))
+        AND (%s::uuid IS NULL OR cs.area_id=%s)
+        AND (%s::timestamptz IS NULL OR cs.captured_at>=%s) AND (%s::timestamptz IS NULL OR cs.captured_at<=%s)
+        ORDER BY cs.area_id,cs.captured_at DESC""",
+        (festival_id, area_id, area_id, time_from, time_from, time_to, time_to))
     # AI-05 언어별 이용 로그. 자동 전환 여부·키오스크 여부는 방문객 세션 설정값에 남는다.
     languages = all_rows(connection, """SELECT language,count(*)::int AS sessions,
         count(*) FILTER(WHERE accessibility_preferences->>'languageSource'='AUTO')::int AS auto_switched,
         count(*) FILTER(WHERE accessibility_preferences->>'visitorMode'='kiosk')::int AS kiosk_sessions
-        FROM visitor_sessions WHERE festival_id=%s GROUP BY language ORDER BY sessions DESC,language""", (festival_id,))
+        FROM visitor_sessions WHERE festival_id=%s
+        AND (%s::timestamptz IS NULL OR created_at>=%s) AND (%s::timestamptz IS NULL OR created_at<=%s)
+        GROUP BY language ORDER BY sessions DESC,language""",
+        (festival_id, time_from, time_from, time_to, time_to))
     return success(request, {"stats": stats, "crowd": crowd, "languages": languages,
                              "updatedAt": max((row["captured_at"] for row in crowd), default=None),
-                             "sources": ["visitor_sessions", "bookings", "ops_tickets", "crowd_snapshots", "coupon_issues", "point_ledger"]})
+                             "sources": ["visitor_sessions", "bookings", "ops_tickets", "crowd_snapshots", "coupon_issues", "point_ledger"],
+                             "filters": {"areaId": area_id, "timeFrom": time_from, "timeTo": time_to}})

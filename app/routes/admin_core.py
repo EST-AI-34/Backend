@@ -5,6 +5,7 @@ from pydantic import BaseModel
 
 from ..db import all_rows, audit, jsonb, one, set_clause
 from ..deps import Db, IfMatch, Manager, Scope, User
+from ..domain import safety_facility_order
 from ..errors import bad_request, conflict, forbidden, found
 from ..http import success
 from ..schemas import (AreaIn, AreaPatch, CloneFestivalIn, FacilityIn, FacilityPatch, FestivalIn,
@@ -112,7 +113,8 @@ def archive_area(festival_id: str, area_id: str, request: Request, _: Scope, use
 
 @router.get("/admin/festivals/{festival_id}/facilities")
 def list_facilities(festival_id: str, request: Request, _: Scope, connection: Db):
-    return success(request, all_rows(connection, "SELECT * FROM facilities WHERE festival_id=%s ORDER BY name", (festival_id,)))
+    return success(request, all_rows(connection,
+        f"SELECT * FROM facilities WHERE festival_id=%s ORDER BY {safety_facility_order()},name", (festival_id,)))
 
 
 @router.post("/admin/festivals/{festival_id}/facilities", status_code=201)
