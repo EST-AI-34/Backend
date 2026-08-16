@@ -44,6 +44,8 @@ def create_item(festival_id: str, body: ContentItemIn, request: Request, _: Scop
         raise bad_request("FESTIVAL_SCOPE_MISMATCH", "프로그램이 같은 축제에 속하지 않습니다.")
     row = one(connection, "INSERT INTO content_items(festival_id,content_type,resource_type,resource_id,slug) VALUES(%s,%s,%s,%s,%s) RETURNING *",
         (festival_id, body.content_type, body.resource_type, body.resource_id, body.slug))
+    audit(connection, festival_id=festival_id, actor_id=str(user["id"]), action="CREATE", resource_type="CONTENT_ITEM",
+          resource_id=str(row["id"]), after_data=row, request_id=request.state.request_id)
     return success(request, row)
 
 
@@ -61,6 +63,9 @@ def create_version(festival_id: str, item_id: str, body: ContentVersionIn, reque
         SELECT %s,%s,coalesce(max(version_no),0)+1,%s,%s,%s FROM content_versions
         WHERE content_item_id=%s AND language=%s RETURNING *""",
         (item_id, user["id"], body.language, jsonb(body.body), body.change_note, item_id, body.language))
+    audit(connection, festival_id=festival_id, actor_id=str(user["id"]), action="CREATE",
+          resource_type="CONTENT_VERSION", resource_id=str(row["id"]), after_data=row,
+          request_id=request.state.request_id)
     return success(request, row)
 
 
@@ -70,6 +75,8 @@ def submit_version(festival_id: str, version_id: str, request: Request, _: Scope
         WHERE cv.id=%s AND cv.content_item_id=ci.id AND ci.festival_id=%s AND cv.status='DRAFT' RETURNING cv.*""", (version_id, festival_id))
     if not row:
         raise bad_request("INVALID_STATE_TRANSITION", "초안 버전만 검수를 요청할 수 있습니다.")
+    audit(connection, festival_id=festival_id, actor_id=str(user["id"]), action="SUBMIT_REVIEW",
+          resource_type="CONTENT_VERSION", resource_id=version_id, after_data=row, request_id=request.state.request_id)
     return success(request, row)
 
 
@@ -117,7 +124,8 @@ def unpublish_item(festival_id: str, item_id: str, request: Request, _: Scope, u
 def ai_reviews(festival_id: str, request: Request, _: Scope, user: ManagerOrReviewer, connection: Db, status: str = "OPEN"):
     rows = all_rows(connection, """SELECT r.*,m.question,m.answer,m.safety_status,m.model_version FROM ai_message_reports r
         JOIN ai_messages m ON m.id=r.message_id JOIN ai_conversations c ON c.id=m.conversation_id
-        WHERE c.festival_id=%s AND (%s::text IS NULL OR r.status=%s) ORDER BY r.created_at""", (festival_id, status, status))
+        WHERE c.festival_id=%(festival_id)s AND (%(status)s::text IS NULL OR r.status=%(status)s)
+        ORDER BY r.created_at""", {"festival_id": festival_id, "status": status})
     return success(request, rows)
 
 

@@ -1,11 +1,17 @@
+import re
 from pathlib import Path
 
 from app.routes.admin_content import versions_by_item
 
 
+# 캐스트 없는 파라미터를 IS NULL과 비교하면 Postgres가 타입을 정하지 못한다.
+# 위치 인자(%s)와 이름 인자(%(name)s) 둘 다 막는다.
+UNTYPED_NULL_CHECK = re.compile(r"%(\([a-z_]+\))?s IS NULL")
+
+
 def test_nullable_sql_parameters_have_explicit_types():
     routes = Path("app/routes")
-    assert not [path for path in routes.glob("*.py") if "%s IS NULL" in path.read_text()]
+    assert not [path for path in routes.glob("*.py") if UNTYPED_NULL_CHECK.search(path.read_text())]
 
 
 class FakeConnection:

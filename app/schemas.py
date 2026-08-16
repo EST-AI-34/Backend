@@ -22,6 +22,17 @@ class TokenIn(APIModel):
     refresh_token: str = Field(pattern=r"^rt_")
 
 
+class PasswordChangeIn(APIModel):
+    current_password: str = Field(min_length=8)
+    new_password: str = Field(min_length=8, max_length=200)
+
+    @model_validator(mode="after")
+    def different(self):
+        if self.current_password == self.new_password:
+            raise ValueError("새 비밀번호는 현재 비밀번호와 달라야 합니다.")
+        return self
+
+
 class VisitorSessionIn(APIModel):
     language: str = Field(default="ko", max_length=10)
     accessibility_preferences: dict[str, Any] = Field(default_factory=dict)
@@ -72,6 +83,14 @@ class FestivalIn(DateRangeModel):
     supported_languages: list[str] = Field(default_factory=lambda: ["ko", "en"], min_length=1)
 
 
+class TransportOptionIn(APIModel):
+    """방문객 화면 교통 안내 한 줄. 프론트 상수로 하드코딩돼 있어 운영자가 못 고치던 값이다."""
+    mode: Literal["지하철", "버스", "셔틀", "주차", "자전거", "도보"]
+    label: str = Field(min_length=1, max_length=200)
+    detail: str = Field(default="", max_length=300)
+    status: Literal["원활", "보통", "혼잡", "지연"] = "원활"
+
+
 class FestivalPatch(APIModel):
     name: str | None = None
     description: str | None = None
@@ -82,23 +101,32 @@ class FestivalPatch(APIModel):
     default_language: str | None = None
     supported_languages: list[str] | None = None
     visitor_menus: dict[str, bool] | None = None
+    transport: list[TransportOptionIn] | None = None
     version: int | None = None
+
+
+AreaStatus = Literal["ACTIVE", "INACTIVE", "ARCHIVED"]
+FacilityStatus = Literal["ACTIVE", "INACTIVE", "ARCHIVED"]
+ProgramStatus = Literal["DRAFT", "PUBLISHED", "UNPUBLISHED", "ARCHIVED"]
+SessionStatus = Literal["OPEN", "CLOSED", "CANCELLED", "ENDED"]
 
 
 class AreaIn(APIModel):
     name: str = Field(min_length=1)
     area_type: str = Field(min_length=1)
+    description: str | None = Field(default=None, max_length=1000)
     latitude: float | None = Field(default=None, ge=-90, le=90)
     longitude: float | None = Field(default=None, ge=-180, le=180)
-    status: str = "ACTIVE"
+    status: AreaStatus = "ACTIVE"
 
 
 class AreaPatch(APIModel):
     name: str | None = None
     area_type: str | None = None
+    description: str | None = Field(default=None, max_length=1000)
     latitude: float | None = Field(default=None, ge=-90, le=90)
     longitude: float | None = Field(default=None, ge=-180, le=180)
-    status: str | None = None
+    status: AreaStatus | None = None
     version: int | None = None
 
 
@@ -108,7 +136,7 @@ class FacilityIn(APIModel):
     facility_type: str = Field(min_length=1)
     accessibility: dict[str, Any] = Field(default_factory=dict)
     operating_hours: dict[str, Any] = Field(default_factory=dict)
-    status: str = "ACTIVE"
+    status: FacilityStatus = "ACTIVE"
 
 
 class FacilityPatch(APIModel):
@@ -117,7 +145,7 @@ class FacilityPatch(APIModel):
     facility_type: str | None = None
     accessibility: dict[str, Any] | None = None
     operating_hours: dict[str, Any] | None = None
-    status: str | None = None
+    status: FacilityStatus | None = None
     version: int | None = None
 
 
@@ -127,7 +155,7 @@ class ProgramIn(APIModel):
     summary: str | None = None
     category: str = Field(min_length=1)
     accessibility: dict[str, Any] = Field(default_factory=dict)
-    status: str = "DRAFT"
+    status: ProgramStatus = "DRAFT"
 
 
 class ProgramPatch(APIModel):
@@ -136,14 +164,14 @@ class ProgramPatch(APIModel):
     summary: str | None = None
     category: str | None = None
     accessibility: dict[str, Any] | None = None
-    status: str | None = None
+    status: ProgramStatus | None = None
     version: int | None = None
 
 
 class ProgramSessionIn(DateRangeModel):
     area_id: str
     capacity: int | None = Field(default=None, ge=0)
-    status: str = "OPEN"
+    status: SessionStatus = "OPEN"
 
 
 class ProgramSessionPatch(APIModel):
@@ -151,7 +179,7 @@ class ProgramSessionPatch(APIModel):
     starts_at: datetime | None = None
     ends_at: datetime | None = None
     capacity: int | None = Field(default=None, ge=0)
-    status: str | None = None
+    status: SessionStatus | None = None
     version: int | None = None
 
 
@@ -207,6 +235,66 @@ class PublishAnnouncementIn(APIModel):
     target_area_ids: list[str] = Field(default_factory=list)
     starts_at: datetime
     ends_at: datetime | None = None
+
+
+class AnnouncementDraftIn(APIModel):
+    """공지 생성부터 게시까지 한 번에 받는 입력.
+
+    예전에는 클라이언트가 공지 생성 → 콘텐츠 항목 → 버전 → 검수 제출 → 승인 → 게시를
+    6번의 요청으로 나눠 호출했다. 중간에 하나라도 실패하면 방문객에게 보이지 않는
+    DRAFT 공지와 콘텐츠 항목이 남고, 지울 API도 없었다.
+    """
+    title: str = Field(min_length=1, max_length=200)
+    body: str = Field(min_length=1, max_length=4000)
+    severity: Literal["INFO", "WARNING", "EMERGENCY"]
+    audience: list[str] = Field(min_length=1)
+    target_area_ids: list[str] = Field(default_factory=list)
+    starts_at: datetime
+    ends_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def valid_window(self):
+        if self.ends_at and self.starts_at >= self.ends_at:
+            raise ValueError("endsAt은 startsAt 이후여야 합니다.")
+        return self
+
+
+class SurveyQuestionIn(APIModel):
+    prompt: str = Field(min_length=1, max_length=500)
+    question_type: Literal["RATING", "SINGLE_CHOICE", "MULTIPLE_CHOICE", "TEXT"]
+    options: list[str] = Field(default_factory=list, max_length=20)
+    required: bool = False
+
+    @model_validator(mode="after")
+    def options_for_choices(self):
+        if self.question_type in ("SINGLE_CHOICE", "MULTIPLE_CHOICE") and not self.options:
+            raise ValueError("선택형 질문에는 보기가 필요합니다.")
+        return self
+
+
+class SurveyIn(APIModel):
+    title: str = Field(min_length=1, max_length=200)
+    description: str | None = Field(default=None, max_length=1000)
+    starts_at: datetime | None = None
+    ends_at: datetime | None = None
+    prevent_duplicates: bool = True
+    status: Literal["DRAFT", "ACTIVE"] = "DRAFT"
+    questions: list[SurveyQuestionIn] = Field(min_length=1, max_length=30)
+
+    @model_validator(mode="after")
+    def valid_window(self):
+        if self.starts_at and self.ends_at and self.starts_at >= self.ends_at:
+            raise ValueError("endsAt은 startsAt 이후여야 합니다.")
+        return self
+
+
+class SurveyPatch(APIModel):
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    description: str | None = Field(default=None, max_length=1000)
+    starts_at: datetime | None = None
+    ends_at: datetime | None = None
+    status: Literal["DRAFT", "ACTIVE", "CLOSED"] | None = None
+    version: int | None = None
 
 
 class TicketIn(APIModel):
@@ -346,7 +434,6 @@ class CrowdSnapshotIn(APIModel):
 
 class BookingIn(APIModel):
     party_size: int = Field(default=1, ge=1, le=20)
-    contact: dict[str, str] | None = None
 
 
 class BookingStatusIn(APIModel):
@@ -369,7 +456,6 @@ class BusinessIn(APIModel):
     name: str = Field(min_length=1, max_length=200)
     category: str = Field(min_length=1, max_length=100)
     description: str | None = Field(default=None, max_length=4000)
-    contact: dict[str, str] | None = None
     address: dict[str, Any] = Field(default_factory=dict)
     menu: list[dict[str, Any]] = Field(default_factory=list)
     operating_hours: dict[str, Any] = Field(default_factory=dict)
@@ -377,6 +463,19 @@ class BusinessIn(APIModel):
     owner_membership_id: str | None = None
     area_id: str | None = None
     booth_no: str | None = Field(default=None, max_length=50)
+
+
+class FestivalBusinessPatch(APIModel):
+    """운영자가 고치는 참여업체 속성.
+
+    is_sponsored(광고 노출)와 esg_participating(ESG 참여)은 추천 점수·광고 분리의 입력값인데
+    등록·검토 어디에도 없어서 DB를 직접 고치지 않으면 켤 수 없었다.
+    """
+    category: str | None = Field(default=None, min_length=1, max_length=100)
+    description: str | None = Field(default=None, max_length=4000)
+    is_sponsored: bool | None = None
+    esg_participating: bool | None = None
+    version: int | None = None
 
 
 class BusinessPatch(APIModel):
@@ -432,6 +531,14 @@ class InternalDocumentIn(APIModel):
     body: str = Field(min_length=1, max_length=100_000)
     source_url: str | None = None
     allowed_roles: list[Role] = Field(default_factory=lambda: ["SUPER_ADMIN", "FESTIVAL_MANAGER"])
+
+
+class InternalDocumentPatch(APIModel):
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    document_type: str | None = Field(default=None, min_length=1, max_length=100)
+    body: str | None = Field(default=None, min_length=1, max_length=100_000)
+    source_url: str | None = None
+    allowed_roles: list[Role] | None = Field(default=None, min_length=1)
 
 
 class InternalSearchIn(APIModel):

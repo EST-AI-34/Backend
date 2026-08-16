@@ -31,10 +31,16 @@ def main() -> None:
                 ON CONFLICT(organization_id,user_id) DO UPDATE SET role=excluded.role,festival_scope=excluded.festival_scope,status='ACTIVE'""", (organization["id"],user["id"],role,Jsonb(["*"])))
             users[role]=user
             memberships[role]=one(connection, "SELECT * FROM memberships WHERE organization_id=%s AND user_id=%s",(organization["id"],user["id"]))
-        festival = one(connection, """INSERT INTO festivals(organization_id,code,name,description,starts_at,ends_at,status,supported_languages)
-            VALUES(%s,'EST34-2026','2026 지역문화축제','AI·ESG 기반 지역축제 DX 데모','2026-09-12T00:00:00Z','2026-09-14T12:00:00Z','PUBLISHED','["ko","en","zh","ja"]')
+        transport = Jsonb([
+            {"mode": "지하철", "status": "원활", "label": "5호선 여의나루역 2번 출구", "detail": "도보 5분, 엘리베이터 이용 가능"},
+            {"mode": "버스", "status": "보통", "label": "간선 462, 753 여의나루역 정류장", "detail": "배차 8~10분"},
+            {"mode": "셔틀", "status": "원활", "label": "여의도역 ↔ 축제장 무료 셔틀", "detail": "15분 간격 운행 · 전기버스"},
+        ])
+        festival = one(connection, """INSERT INTO festivals(organization_id,code,name,description,starts_at,ends_at,status,supported_languages,transport)
+            VALUES(%s,'EST34-2026','2026 지역문화축제','AI·ESG 기반 지역축제 DX 데모','2026-09-12T00:00:00Z','2026-09-14T12:00:00Z','PUBLISHED','["ko","en","zh","ja"]',%s)
             ON CONFLICT(code) DO UPDATE SET name=excluded.name,status='PUBLISHED',
-                supported_languages=excluded.supported_languages,updated_at=now() RETURNING *""", (organization["id"],))
+                supported_languages=excluded.supported_languages,transport=excluded.transport,updated_at=now() RETURNING *""",
+            (organization["id"], transport))
         area = (one(connection, "SELECT * FROM festival_areas WHERE festival_id=%s AND name='메인 광장'",(festival["id"],))
                 or one(connection, "INSERT INTO festival_areas(festival_id,name,area_type,latitude,longitude) VALUES(%s,'메인 광장','MAIN',37.5665,126.9780) RETURNING *",(festival["id"],)))
         connection.execute("""INSERT INTO facilities(festival_id,area_id,name,facility_type,accessibility,operating_hours)
@@ -113,14 +119,17 @@ def main() -> None:
         campaign=one(connection, """UPDATE reward_campaigns SET starts_at=least(starts_at,now()),status='ACTIVE'
             WHERE festival_id=%s AND name='친환경 축제 행동' RETURNING *""",(festival["id"],))
         connection.execute("""INSERT INTO reward_actions(campaign_id,action_type,verification_type,points,per_user_limit,rule)
-            VALUES(%s,'REUSABLE_CUP_RETURN','QR',10,3,%s) ON CONFLICT(campaign_id,action_type) DO NOTHING""",
-            (campaign["id"],Jsonb({"verificationKeys":["cup-return-main"]})))
-        # 스탬프 투어 스팟. QR 스캐너가 붙기 전까지는 방문객이 직접 인증(SELF)한다.
+            VALUES(%s,'REUSABLE_CUP_RETURN','QR',10,3,%s) ON CONFLICT(campaign_id,action_type) DO UPDATE SET rule=excluded.rule""",
+            (campaign["id"],Jsonb({"name":"다회용기 반납","location":"그린 스테이션","verificationKeys":["cup-return-main"]})))
+        # 스탬프 투어 스팟. 현장 QR을 찍어 인증한다 — verificationKeys가 QR에 담기는 값이다.
+        # 예전에는 SELF(자가 인증)라 현장에 가지 않아도 포인트를 받을 수 있었다.
         for action_type,name,location in [("STAMP_GUIDE_CENTER","통합 안내소","정문 입구"),("STAMP_UPCYCLE","업사이클링 공방","체험존 A-2"),
                 ("STAMP_GREEN_MARKET","그린마켓","마켓존 G-1"),("STAMP_PHOTO_EXHIBIT","지속가능 사진전","전시홀"),("STAMP_PHOTO_ZONE","물빛광장 포토존","물빛광장")]:
+            key=f"stamp:{action_type.lower().replace('_','-')}"
             connection.execute("""INSERT INTO reward_actions(campaign_id,action_type,verification_type,points,per_user_limit,rule)
-                VALUES(%s,%s,'SELF',10,1,%s) ON CONFLICT(campaign_id,action_type) DO NOTHING""",
-                (campaign["id"],action_type,Jsonb({"name":name,"location":location})))
+                VALUES(%s,%s,'QR',10,1,%s) ON CONFLICT(campaign_id,action_type) DO UPDATE SET
+                    verification_type=excluded.verification_type,rule=excluded.rule""",
+                (campaign["id"],action_type,Jsonb({"name":name,"location":location,"verificationKeys":[key]})))
         connection.execute("""INSERT INTO internal_documents(festival_id,title,document_type,body,allowed_roles,created_by)
             SELECT %s,'폭염 대응 매뉴얼','SAFETY_MANUAL','온열 증상 발생 시 의료 부스로 안내하고 현장 책임자에게 즉시 보고합니다.',%s,%s
             WHERE NOT EXISTS(SELECT 1 FROM internal_documents WHERE festival_id=%s AND title='폭염 대응 매뉴얼')""",

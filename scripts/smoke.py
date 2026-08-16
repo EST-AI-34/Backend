@@ -5,6 +5,7 @@ import httpx
 
 
 BASE=os.getenv("API_URL","http://127.0.0.1:8000/api/v1")
+FESTIVAL_CODE=os.getenv("FESTIVAL_CODE","EST34-2026")
 client=httpx.Client(base_url=BASE,timeout=10)
 
 
@@ -20,16 +21,19 @@ manager=request("POST","/auth/login",body={"email":"manager@example.com","passwo
 reviewer=request("POST","/auth/login",body={"email":"reviewer@example.com","password":"ChangeMe123!"})
 operator=request("POST","/auth/login",body={"email":"operator@example.com","password":"ChangeMe123!"})
 manager_token=manager["accessToken"];reviewer_token=reviewer["accessToken"];operator_token=operator["accessToken"]
-festivals=request("GET","/admin/festivals",token=manager_token);festival_id=str(festivals[0]["id"])
-assert request("GET","/public/festivals/EST34-2026")["status"]=="PUBLISHED"
-assert any(program["slug"]=="family-craft" for program in request("GET","/public/festivals/EST34-2026/programs"))
+festivals=request("GET","/admin/festivals",token=manager_token)
+# 아래 공개 조회가 전부 EST34-2026을 찍으므로 쓰기도 같은 축제에 해야 한다.
+# festivals[0]을 쓰면 복제·테스트로 축제가 늘어난 DB에서 엉뚱한 축제에 쓰고 404가 난다.
+festival_id=str(next(festival for festival in festivals if festival["code"]==FESTIVAL_CODE)["id"])
+assert request("GET",f"/public/festivals/{FESTIVAL_CODE}")["status"]=="PUBLISHED"
+assert any(program["slug"]=="family-craft" for program in request("GET",f"/public/festivals/{FESTIVAL_CODE}/programs"))
 
-visitor=request("POST","/public/festivals/EST34-2026/visitor-sessions",body={"language":"ko","accessibilityPreferences":{"largeText":True},"consents":{"analytics":False}})
+visitor=request("POST",f"/public/festivals/{FESTIVAL_CODE}/visitor-sessions",body={"language":"ko","accessibilityPreferences":{"largeText":True},"consents":{"analytics":False}})
 visitor_token=visitor["sessionToken"]
-conversation=request("POST","/visitor/ai/conversations",token=visitor_token,body={"festivalCode":"EST34-2026","language":"ko"})
+conversation=request("POST","/visitor/ai/conversations",token=visitor_token,body={"festivalCode":FESTIVAL_CODE,"language":"ko"})
 answer=request("POST",f"/visitor/ai/conversations/{conversation['id']}/messages",token=visitor_token,body={"message":"아이와 함께하는 가족 체험과 수유실을 알려줘."})
 assert answer["safetyStatus"]=="ALLOWED" and answer["sources"]
-surveys=request("GET","/public/festivals/EST34-2026/surveys")
+surveys=request("GET",f"/public/festivals/{FESTIVAL_CODE}/surveys")
 request("POST",f"/visitor/surveys/{surveys[0]['id']}/responses",token=visitor_token,body={"answers":[{"questionId":str(surveys[0]["questions"][0]["id"]),"value":5}]})
 
 suffix=hex(time.time_ns())[2:]
@@ -41,7 +45,7 @@ version=request("POST",f"/admin/festivals/{festival_id}/content-items/{item['id'
 request("POST",f"/admin/festivals/{festival_id}/content-versions/{version['id']}/submit",token=manager_token,body={})
 request("POST",f"/admin/festivals/{festival_id}/content-versions/{version['id']}/reviews",token=reviewer_token,body={"decision":"APPROVED","comment":"검증 승인"})
 request("POST",f"/admin/festivals/{festival_id}/content-items/{item['id']}/publish",token=manager_token,body={"versionId":str(version["id"])})
-assert request("GET",f"/public/festivals/EST34-2026/programs/{program['slug']}")["title"]=="검증 프로그램"
+assert request("GET",f"/public/festivals/{FESTIVAL_CODE}/programs/{program['slug']}")["title"]=="검증 프로그램"
 
 ticket=request("POST",f"/admin/festivals/{festival_id}/ops-tickets",token=manager_token,body={"ticketType":"INCIDENT","title":"검증 사고","description":"상태 전이 검증","priority":"HIGH","assigneeId":str(operator["user"]["id"])})
 request("POST",f"/admin/festivals/{festival_id}/ops-tickets/{ticket['id']}/transitions",token=manager_token,body={"toStatus":"ASSIGNED"})

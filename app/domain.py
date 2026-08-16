@@ -65,9 +65,43 @@ def validate_measurement_review(measurement: dict, evidence_count: int, decision
         raise unprocessable("EVIDENCE_REQUIRED", "필수 증빙을 연결해야 합니다.")
 
 
+# 자격증명·개인식별정보·시스템 내부 정보 요청을 막는다. 공백과 구분자를 제거한 문자열에
+# 대고 보므로 "p a s s w o r d", "시스템-프롬프트" 같은 단순 우회는 걸린다.
+UNSAFE_TERMS = (
+    "비밀번호", "패스워드", "password", "passwd", "credential", "자격증명",
+    "apikey", "api키", "accesstoken", "액세스토큰", "refreshtoken", "리프레시토큰",
+    "secretkey", "시크릿키", "privatekey", "개인키", "jwt", "환경변수", "envvar",
+    "주민등록번호", "주민번호", "여권번호", "운전면허번호", "socialsecurity", "ssn",
+    "카드번호", "계좌번호", "cardnumber", "creditcard",
+    "시스템프롬프트", "systemprompt", "developermessage", "이전지시무시",
+    "ignorepreviousinstructions", "ignoreallprevious", "disregardprevious",
+)
+
+# 개인정보로 취급하는 패턴. mask_sensitive와 위험 질문 판정이 같은 규칙을 쓴다.
+SENSITIVE_PATTERNS = (
+    (re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}"), "[이메일 마스킹]"),
+    # 주민등록번호: 생년월일 6자리 + 성별코드(1-4,5-8) + 6자리
+    (re.compile(r"(?<!\d)\d{6}[-\s]?[1-8]\d{6}(?!\d)"), "[주민등록번호 마스킹]"),
+    # 카드번호: 13~16자리(4자리 묶음 구분자 허용)
+    (re.compile(r"(?<!\d)(?:\d[ -]?){12,15}\d(?!\d)"), "[카드번호 마스킹]"),
+    # 휴대폰
+    (re.compile(r"(?<!\d)01[016789][- ]?\d{3,4}[- ]?\d{4}(?!\d)"), "[연락처 마스킹]"),
+    # 유선전화: 02 또는 03x~06x 지역번호
+    (re.compile(r"(?<!\d)(?:02|0[3-6]\d)[- ]?\d{3,4}[- ]?\d{4}(?!\d)"), "[연락처 마스킹]"),
+)
+
+
 def is_safe_question(message: str) -> bool:
-    lowered = message.lower()
-    return not any(term in lowered for term in ("비밀번호", "password", "주민등록번호", "social security", "시스템 프롬프트", "system prompt"))
+    """차단 대상이면 False.
+
+    예전 구현은 키워드 6개를 원문에 그대로 대조해서 대소문자·띄어쓰기만 바꿔도 통과했다.
+    지금은 영문 소문자화 + 공백/구분자 제거 후 비교하고, 개인정보 패턴이 질문 본문에
+    직접 들어 있는 경우도 막는다.
+    """
+    normalized = re.sub(r"[\s\-_.·]+", "", message.lower())
+    if any(term in normalized for term in UNSAFE_TERMS):
+        return False
+    return not any(pattern.search(message) for pattern, _ in SENSITIVE_PATTERNS)
 
 
 def search_terms(text: str) -> list[str]:
@@ -80,15 +114,27 @@ def supported_language(requested: str | None, supported: list[str], default: str
 
 
 def select_course(sessions: list[dict], duration_min: int, starts_at=None) -> list[dict]:
+    """겹치지 않는 회차를 요청한 소요 시간 안에서 고른다.
+
+    starts_at을 생략하면 예전에는 deadline이 None이 되어 duration_min이 통째로 무시됐다
+    (60분을 요청해도 후보 50개가 전부 코스에 들어갔다). 기준 시각이 없으면 첫 회차의
+    시작 시각을 기준으로 삼는다.
+    """
+    if not sessions:
+        return []
+    cursor = starts_at or min(session["starts_at"] for session in sessions)
+    deadline = cursor + timedelta(minutes=duration_min)
     selected: list[dict] = []
-    cursor = starts_at
-    deadline = starts_at + timedelta(minutes=duration_min) if starts_at else None
+    used_programs: set = set()
     for session in sessions:
-        if cursor and session["starts_at"] < cursor:
+        if session["starts_at"] < cursor or session["ends_at"] > deadline:
             continue
-        if deadline and session["ends_at"] > deadline:
+        # 같은 프로그램의 다른 회차를 두 번 넣으면 코스가 아니라 중복 안내가 된다.
+        program_id = session.get("program_id")
+        if program_id is not None and program_id in used_programs:
             continue
         selected.append(session)
+        used_programs.add(program_id)
         cursor = session["ends_at"]
     return selected
 
@@ -108,8 +154,14 @@ def classify_issue(text: str, priority: str = "NORMAL") -> dict:
 
 
 def mask_sensitive(text: str) -> str:
-    text = re.sub(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", "[이메일 마스킹]", text)
-    return re.sub(r"(?<!\d)01[016789][- ]?\d{3,4}[- ]?\d{4}(?!\d)", "[연락처 마스킹]", text)
+    """운영 문서 발췌에서 개인정보를 가린다.
+
+    순서가 중요하다 — 주민등록번호(13자리)를 카드번호 규칙보다 먼저 잡아야
+    "[카드번호 마스킹]"으로 잘못 표시되지 않는다. SENSITIVE_PATTERNS가 그 순서다.
+    """
+    for pattern, replacement in SENSITIVE_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
 
 
 RISK_ACTIONS = {

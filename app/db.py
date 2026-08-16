@@ -30,11 +30,15 @@ def database() -> Generator[Connection, None, None]:
         yield connection
 
 
-def one(connection: Connection, sql: str, params: tuple | list = ()) -> dict | None:
+# 같은 값을 여러 번 쓰는 쿼리는 dict를 넘겨 %(name)s로 참조한다(위치 인자 중복을 없앤다).
+Params = tuple | list | dict
+
+
+def one(connection: Connection, sql: str, params: Params = ()) -> dict | None:
     return connection.execute(sql, params).fetchone()
 
 
-def all_rows(connection: Connection, sql: str, params: tuple | list = ()) -> list[dict]:
+def all_rows(connection: Connection, sql: str, params: Params = ()) -> list[dict]:
     return connection.execute(sql, params).fetchall()
 
 
