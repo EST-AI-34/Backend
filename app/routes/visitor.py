@@ -3,7 +3,7 @@ from psycopg.errors import UniqueViolation
 
 from ..db import all_rows, jsonb, one
 from ..deps import Db, Visitor
-from ..domain import is_safe_question, search_terms
+from ..domain import classify_issue, is_safe_question, search_terms
 from ..errors import bad_request, conflict, found
 from ..http import success
 from ..schemas import ComplaintIn, ConversationIn, MessageIn, ReportMessageIn, SurveyResponseIn
@@ -48,8 +48,14 @@ def submit_survey(survey_id: str, body: SurveyResponseIn, request: Request, visi
 def submit_complaint(body: ComplaintIn, request: Request, visitor: Visitor, connection: Db):
     # ponytail: 분류는 제목 앞에 붙여 운영 화면의 기존 자동 분류 규칙에 태운다. 별도 컬럼은 필요해지면 추가.
     title = f"[{body.category}] {body.title}" if body.category else body.title
-    row = one(connection, """INSERT INTO ops_tickets(festival_id,ticket_type,title,description)
-        VALUES(%s,'COMPLAINT',%s,%s) RETURNING id,status,created_at""", (visitor["festival_id"], title, body.description))
+    # 예전에는 priority를 지정하지 않아 전부 NORMAL로 들어갔다. 위험 브리프는 HIGH·EMERGENCY만
+    # 집계하므로, 방문객이 올린 안전 민원이 운영자 위험도에 절대 반영되지 않았다.
+    # 티켓 화면이 이미 쓰는 분류 규칙을 그대로 태워 안전·긴급 신호는 HIGH로 올린다.
+    analysis = classify_issue(f"{title} {body.description}")
+    priority = "HIGH" if analysis["urgent"] else "NORMAL"
+    row = one(connection, """INSERT INTO ops_tickets(festival_id,ticket_type,title,description,priority)
+        VALUES(%s,'COMPLAINT',%s,%s,%s) RETURNING id,status,priority,created_at""",
+        (visitor["festival_id"], title, body.description, priority))
     return success(request, row)
 
 
@@ -69,9 +75,10 @@ def send_message(conversation_id: str, body: MessageIn, request: Request, visito
     owned_conversation(connection, conversation_id, visitor["id"])
     if not is_safe_question(body.message):
         fallback = {"type": "HELP_DESK"}
-        row = one(connection, """INSERT INTO ai_messages(conversation_id,question,answer,safety_status,fallback)
-            VALUES(%s,%s,%s,'BLOCKED',%s) RETURNING *""",
-            (conversation_id, body.message, "보안 또는 개인정보와 관련된 요청에는 답변할 수 없습니다.", jsonb(fallback)))
+        row = one(connection, """INSERT INTO ai_messages(conversation_id,question,answer,safety_status,fallback,context)
+            VALUES(%s,%s,%s,'BLOCKED',%s,%s) RETURNING *""",
+            (conversation_id, body.message, "보안 또는 개인정보와 관련된 요청에는 답변할 수 없습니다.",
+             jsonb(fallback), jsonb(body.context)))
         return success(request, {"messageId": row["id"], "answer": row["answer"], "safetyStatus": "BLOCKED", "sources": [], "fallback": fallback})
 
     patterns = [f"%{term}%" for term in search_terms(body.message)]
@@ -79,15 +86,17 @@ def send_message(conversation_id: str, body: MessageIn, request: Request, visito
         ci.slug,ci.updated_at,f.code AS festival_code FROM content_items ci
         JOIN content_versions cv ON cv.id=ci.published_version_id JOIN festivals f ON f.id=ci.festival_id
         WHERE ci.festival_id=%s AND ci.lifecycle_status='PUBLISHED' AND cv.status='APPROVED'
-          AND cv.body::text ILIKE ANY(%s) ORDER BY ci.updated_at DESC LIMIT 3""", (visitor["festival_id"], patterns)) if patterns else []
+          AND (coalesce(cv.body->>'title','') || ' ' || coalesce(cv.body->>'summary','') || ' ' ||
+               coalesce(cv.body->>'description','') || ' ' || coalesce(cv.body->>'text','')) ILIKE ANY(%s)
+        ORDER BY ci.updated_at DESC LIMIT 3""", (visitor["festival_id"], patterns)) if patterns else []
     allowed = bool(sources)
     excerpts = [source["body"].get("summary") or source["body"].get("description") or source["body"].get("title") for source in sources]
     answer = "\n\n".join(filter(None, excerpts)) if allowed else "승인된 축제 정보에서 충분한 근거를 찾지 못했습니다."
     fallback = None if allowed else {"type": "HELP_DESK", "message": "현장 안내데스크 또는 공식 연락처를 이용해 주세요."}
-    row = one(connection, """INSERT INTO ai_messages(conversation_id,question,answer,safety_status,freshness_at,fallback)
-        VALUES(%s,%s,%s,%s,%s,%s) RETURNING *""",
+    row = one(connection, """INSERT INTO ai_messages(conversation_id,question,answer,safety_status,freshness_at,fallback,context)
+        VALUES(%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
         (conversation_id, body.message, answer, "ALLOWED" if allowed else "INSUFFICIENT_GROUNDING",
-         sources[0]["updated_at"] if sources else None, jsonb(fallback) if fallback else None))
+         sources[0]["updated_at"] if sources else None, jsonb(fallback) if fallback else None, jsonb(body.context)))
     response_sources = []
     for rank, source in enumerate(sources, 1):
         connection.execute("INSERT INTO ai_message_sources(message_id,content_version_id,rank) VALUES(%s,%s,%s)", (row["id"], source["content_version_id"], rank))

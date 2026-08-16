@@ -14,11 +14,13 @@ Latin-1에 없는 한글 문자는 PDF 뷰어에서 제대로 그려지지 않�
 UTF-8 XML이라 한글이 항상 정확히 표시된다.
 """
 import base64
+import csv
+import json
 from datetime import UTC, datetime
 from typing import Any
 from xml.sax.saxutils import escape
 from zipfile import ZIP_DEFLATED, ZipFile
-from io import BytesIO
+from io import BytesIO, StringIO
 
 
 def _format_period(report: dict) -> str:
@@ -28,26 +30,43 @@ def _format_period(report: dict) -> str:
 
 
 def _report_lines(report: dict) -> list[str]:
+    """보고서 본문.
+
+    edit_metadata는 저장만 되고 어디에서도 읽히지 않아, 운영자가 편집한 제목·머리말·맺음말이
+    산출물에 전혀 반영되지 않았다(format이 EDITABLE_DOCUMENT여도 편집이 무의미했다).
+    스냅샷의 수치는 승인 실적이 근거이므로 편집 대상이 아니고, 서술 부분만 덮어쓴다.
+    """
     snapshot = report.get("snapshot") or {}
     metrics = snapshot.get("metrics") or []
+    edits = report.get("edit_metadata") or {}
+    comparison = snapshot.get("comparison") or {}
     lines = [
-        report["title"],
+        str(edits.get("title") or report["title"]),
         f"기간: {_format_period(report)}",
         f"생성 시각: {snapshot.get('generatedAt', '-')}",
-        "",
-        "지표",
     ]
+    if edits.get("intro"):
+        lines += ["", str(edits["intro"])]
+    lines += ["", "지표"]
     if not metrics:
         lines.append("- 승인된 실적이 없습니다.")
     for metric in metrics:
         value = metric.get("value")
         unit = metric.get("unit") or ""
         target = metric.get("target")
-        lines.append(
+        line = (
             f"- {metric.get('name')} ({metric.get('category')}): {value}{unit}"
             f" / 목표 {target}{unit} / 측정 {metric.get('measurementCount', 0)}건"
             f" / 증빙 {metric.get('evidenceCount', 0)}건"
         )
+        if metric.get("comparisonValue") is not None:
+            delta = metric.get("comparisonDelta")
+            line += f" / 비교 축제 {metric['comparisonValue']}{unit} (차이 {delta:+}{unit})"
+        lines.append(line)
+    if comparison.get("metrics"):
+        lines += ["", f"비교 축제: {comparison.get('festivalId', '-')} 같은 기간 승인 실적 {len(comparison['metrics'])}건"]
+    if edits.get("note"):
+        lines += ["", "비고", str(edits["note"])]
     return lines
 
 
@@ -130,17 +149,7 @@ def _minimal_docx(lines: list[str]) -> bytes:
     return buffer.getvalue()
 
 
-def build_report_artifact(report: dict, export_format: str) -> dict[str, Any]:
-    """승인된 ESG 보고서 스냅샷으로 실제 파일 바이트를 만들어 base64로 반환한다."""
-    lines = _report_lines(report)
-    if export_format == "DOCX":
-        content = _minimal_docx(lines)
-        file_name = f"esg-report-{report['id']}.docx"
-        mime_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    else:
-        content = _minimal_pdf(lines)
-        file_name = f"esg-report-{report['id']}.pdf"
-        mime_type = "application/pdf"
+def _artifact(content: bytes, file_name: str, mime_type: str) -> dict[str, Any]:
     return {
         "fileName": file_name,
         "mimeType": mime_type,
@@ -148,3 +157,37 @@ def build_report_artifact(report: dict, export_format: str) -> dict[str, Any]:
         "byteSize": len(content),
         "generatedAt": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
     }
+
+
+def build_table_artifact(rows: list[dict], columns: tuple[str, ...], export_format: str, stem: str) -> dict[str, Any]:
+    """운영 데이터 목록을 실제 CSV/JSON 바이트로 만든다.
+
+    CSV는 Excel이 UTF-8로 열도록 BOM을 붙인다 — 없으면 한글 컬럼이 깨져서 보인다.
+    """
+    if export_format == "JSON":
+        content = json.dumps(rows, ensure_ascii=False, default=str, indent=2).encode("utf-8")
+        return _artifact(content, f"{stem}.json", "application/json; charset=utf-8")
+    buffer = StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=list(columns), extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({column: "" if row.get(column) is None else str(row.get(column)) for column in columns})
+    return _artifact(b"\xef\xbb\xbf" + buffer.getvalue().encode("utf-8"), f"{stem}.csv", "text/csv; charset=utf-8")
+
+
+def build_report_artifact(report: dict, export_format: str) -> dict[str, Any]:
+    """승인된 ESG 보고서 스냅샷으로 실제 파일 바이트를 만들어 base64로 반환한다.
+
+    PDF는 표준 14폰트(Latin-1)만 써서 한글이 '?'로 깨진다. 조용히 깨진 파일을 주는 대신
+    `textLossWarning`으로 알려 주고, 운영자 화면이 DOCX를 권할 수 있게 한다.
+    """
+    lines = _report_lines(report)
+    if export_format == "DOCX":
+        artifact = _artifact(_minimal_docx(lines), f"esg-report-{report['id']}.docx",
+                             "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        return {**artifact, "textLossWarning": None}
+    dropped = sum(1 for line in lines for char in line if char.encode("latin-1", errors="replace") == b"?" and char != "?")
+    artifact = _artifact(_minimal_pdf(lines), f"esg-report-{report['id']}.pdf", "application/pdf")
+    return {**artifact, "textLossWarning": (
+        f"PDF는 라틴 문자 전용 표준 폰트만 사용해 한글 {dropped}자가 '?'로 표시됩니다. "
+        "한글이 그대로 필요하면 DOCX로 내보내 주세요." if dropped else None)}

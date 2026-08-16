@@ -1,11 +1,8 @@
-import random
 from typing import Annotated
 
 from fastapi import APIRouter, Query, Request
-from psycopg import Connection
 
 from .. import ai
-from ..config import settings
 from ..db import all_rows, jsonb
 from ..deps import Db, Scope
 from ..domain import recommendation_bias, risk_brief, score_business
@@ -102,10 +99,11 @@ def business_recommendations(
         FROM festival_businesses fb JOIN businesses b ON b.id=fb.business_id
         LEFT JOIN booths bo ON bo.festival_business_id=fb.id AND bo.status='ACTIVE'
         LEFT JOIN festival_areas a ON a.id=bo.area_id
-        WHERE fb.festival_id=%s AND fb.participation_status='APPROVED' AND b.status='ACTIVE'
-          AND (%s::text IS NULL OR fb.category=%s)
-          AND (NOT %s OR fb.accessibility @> '{"wheelchair": true}')
-        ORDER BY fb.id,bo.booth_no""", (festival["id"], category, category, accessibility_required))
+        WHERE fb.festival_id=%(festival_id)s AND fb.participation_status='APPROVED' AND b.status='ACTIVE'
+          AND (%(category)s::text IS NULL OR fb.category=%(category)s)
+          AND (NOT %(accessibility_required)s OR fb.accessibility @> '{"wheelchair": true}')
+        ORDER BY fb.id,bo.booth_no""",
+        {"festival_id": festival["id"], "category": category, "accessibility_required": accessibility_required})
     scored = sorted((score_business(row, latitude, longitude, category) for row in rows),
                     key=lambda item: (-item["score"], item["business_id"]))
     result = {
@@ -120,22 +118,10 @@ def business_recommendations(
          jsonb({"latitude": latitude, "longitude": longitude, "category": category, "limit": limit,
                 "accessibility_required": accessibility_required}),
          jsonb(result), RECOMMENDATION_POLICY))
-    prune_recommendation_events(connection, festival["id"])
     # ponytail: 노출 이력을 남겨야 편향 점검이 성립하므로 이 GET은 캐시하지 않는다.
+    # 보존 기간이 지난 행은 잡 워커의 purge_expired가 지운다(예전에는 이 요청 경로에
+    # 1% 확률로 DELETE를 묻어 두어, 방문객 요청 지연이 운에 따라 튀었다).
     return success(request, result)
-
-
-def prune_recommendation_events(connection: Connection, festival_id) -> None:
-    """인증 없는 GET이 행을 계속 쌓으므로 보존 기간이 지난 것은 버린다.
-
-    ponytail: 삽입 경로에 1% 확률로 묻어 크론 없이 굴린다. festival_id로 좁혀
-    recommendation_events_window_idx를 타므로 삭제는 짧다. 스케줄러가 생기면 옮긴다.
-    """
-    if random.random() >= 0.01:
-        return
-    connection.execute("""DELETE FROM business_recommendation_events
-        WHERE festival_id=%s AND created_at<now()-make_interval(days => %s)""",
-        (festival_id, settings.recommendation_event_retention_days))
 
 
 @router.get("/admin/festivals/{festival_id}/recommendation-bias")

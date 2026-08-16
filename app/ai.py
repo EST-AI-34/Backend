@@ -32,16 +32,38 @@ class AIUnavailable(RuntimeError):
     pass
 
 
+# 회로 차단기. briefing()은 DB 커넥션을 쥔 요청 스레드 안에서 동기로 돈다(풀 max_size=10).
+# Alan이 죽으면 대시보드 요청마다 타임아웃 + 재시도만큼 커넥션이 묶여 풀이 마른다.
+# 연속 실패가 쌓이면 한동안 아예 부르지 않고 규칙 기반 문장으로 넘어간다.
+BREAKER_THRESHOLD = 3
+BREAKER_COOLDOWN_SECONDS = 60
+_breaker = {"failures": 0, "open_until": 0.0}
+
+
+def reset_breaker() -> None:
+    """차단 상태를 지운다. 프로세스 전역 상태라 테스트가 서로 간섭하지 않게 필요하다."""
+    _breaker.update(failures=0, open_until=0.0)
+
+
 def briefing(instruction: str, context: list[str]) -> str | None:
-    """한 문장 브리핑. 비활성·미설정·오류·타임아웃이면 None."""
+    """한 문장 브리핑. 비활성·미설정·오류·타임아웃·회로 차단이면 None."""
     if not settings.external_ai_enabled:
         return None
+    if time.monotonic() < _breaker["open_until"]:
+        return None
     try:
-        return one_sentence(ask(prompt(instruction, context)))
+        answer = one_sentence(ask(prompt(instruction, context)))
     # ValueError는 response.json()이 JSON이 아닌 본문(게이트웨이 HTML 등)을 만났을 때다.
     except (AIUnavailable, httpx.HTTPError, ValueError) as error:
+        _breaker["failures"] += 1
+        if _breaker["failures"] >= BREAKER_THRESHOLD:
+            _breaker["open_until"] = time.monotonic() + BREAKER_COOLDOWN_SECONDS
+            _breaker["failures"] = 0
+            logger.warning("외부 AI 연속 실패로 %s초 동안 호출을 건너뜁니다.", BREAKER_COOLDOWN_SECONDS)
         logger.warning("외부 AI 브리핑 실패, 규칙 기반 문장을 사용합니다: %s", error)
         return None
+    _breaker["failures"] = 0
+    return answer
 
 
 def ask(content: str) -> str:
