@@ -8,6 +8,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from psycopg.errors import DataError, ForeignKeyViolation, UniqueViolation
 
+from .config import settings
 from .db import one, pool
 from .errors import AppError
 from .http import meta
@@ -37,6 +38,22 @@ app = FastAPI(
 counts: dict[tuple[str, str, int], int] = defaultdict(int)
 
 
+def client_ip(request: Request) -> str:
+    """레이트 리밋 버킷 키.
+
+    프록시 뒤에서 request.client.host는 프록시 주소라 모든 방문자가 버킷 하나를 공유한다
+    (로그인 10회/분이 서비스 전체 합산 10회/분이 되어 보호도 안 되고 정상 사용자도 막힌다).
+    TRUST_PROXY_HEADERS를 켠 배포에서만 X-Forwarded-For의 첫 항목을 쓴다 — 직결 배포에서
+    무조건 신뢰하면 클라이언트가 헤더를 위조해 한도를 우회할 수 있다.
+    """
+    if settings.trust_proxy_headers:
+        forwarded = request.headers.get("X-Forwarded-For", "")
+        first = forwarded.split(",")[0].strip()
+        if first:
+            return first
+    return request.client.host if request.client else "unknown"
+
+
 def rate_limit(path: str, method: str) -> int | None:
     if "/visitor/ai/" in path:
         return 20
@@ -64,7 +81,7 @@ async def request_context(request: Request, call_next):
     if limit:
         # ponytail: process-local limiter; use Redis when multiple API instances are deployed.
         window = int(time.time() // 60)
-        key = (request.client.host if request.client else "unknown", "/".join(request.url.path.split("/")[:6]), window)
+        key = (client_ip(request), "/".join(request.url.path.split("/")[:6]), window)
         counts[key] += 1
         if counts[key] > limit:
             return error_response(request, AppError(429, "RATE_LIMITED", "호출 한도를 초과했습니다.", retryable=True))

@@ -1,10 +1,8 @@
-import json
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Request, Response
 from psycopg.errors import UniqueViolation
 
-from ..config import settings
 from ..db import all_rows, idempotent, jsonb, one
 from ..deps import Db, IdempotencyKey, Visitor
 from ..domain import select_course, supported_language, validate_booking_transition
@@ -33,26 +31,19 @@ def update_preferences(body: VisitorPreferencesPatch, request: Request, visitor:
     return success(request, row)
 
 
-@router.get("/public/festivals/{festival_code}/crowd")
-def public_crowd(festival_code: str, request: Request, response: Response, connection: Db):
-    festival = published_festival(connection, festival_code)
-    rows = all_rows(connection, """SELECT DISTINCT ON (cs.area_id,coalesce(cs.program_session_id,'00000000-0000-0000-0000-000000000000'::uuid))
-        cs.area_id,a.name AS area_name,cs.program_session_id,cs.crowd_level,cs.estimated_wait_min,cs.captured_at,
-        cs.expires_at,(cs.expires_at<=now()) AS stale
-        FROM crowd_snapshots cs JOIN festival_areas a ON a.id=cs.area_id WHERE cs.festival_id=%s
-        ORDER BY cs.area_id,coalesce(cs.program_session_id,'00000000-0000-0000-0000-000000000000'::uuid),cs.captured_at DESC""", (festival["id"],))
-    cached(response, 15)
-    return success(request, rows)
-
-
 @router.get("/public/festivals/{festival_code}/businesses")
 def public_businesses(festival_code: str, request: Request, response: Response, connection: Db, category: str | None = None):
     festival = published_festival(connection, festival_code)
-    rows = all_rows(connection, """SELECT fb.id,b.name,fb.category,fb.description,fb.menu,fb.operating_hours,fb.accessibility,
-        b.address,bo.booth_no,bo.area_id,a.name AS area_name FROM festival_businesses fb JOIN businesses b ON b.id=fb.business_id
+    # 업체당 부스가 여러 개일 수 있어 그냥 조인하면 같은 업체가 부스 수만큼 중복된다.
+    # 목록은 업체 단위이므로 대표 부스(booth_no 오름차순 첫 번째) 하나만 붙인다.
+    rows = all_rows(connection, """SELECT DISTINCT ON (fb.id) fb.id,b.name,fb.category,fb.description,fb.menu,
+        fb.operating_hours,fb.accessibility,b.address,bo.booth_no,bo.area_id,a.name AS area_name
+        FROM festival_businesses fb JOIN businesses b ON b.id=fb.business_id
         LEFT JOIN booths bo ON bo.festival_business_id=fb.id LEFT JOIN festival_areas a ON a.id=bo.area_id
-        WHERE fb.festival_id=%s AND fb.participation_status='APPROVED' AND b.status='ACTIVE'
-          AND (%s::text IS NULL OR fb.category=%s) ORDER BY b.name""", (festival["id"], category, category))
+        WHERE fb.festival_id=%(festival_id)s AND fb.participation_status='APPROVED' AND b.status='ACTIVE'
+          AND (%(category)s::text IS NULL OR fb.category=%(category)s) ORDER BY fb.id,bo.booth_no""",
+        {"festival_id": festival["id"], "category": category})
+    rows.sort(key=lambda row: row["name"])
     cached(response)
     return success(request, rows)
 
@@ -87,12 +78,16 @@ def create_booking(session_id: str, body: BookingIn, request: Request, response:
             (session_id, visitor["festival_id"])), "예약 가능한 프로그램 회차를 찾을 수 없습니다.")
         confirmed = session["capacity"] is None or reserved_seats(connection, session_id) + body.party_size <= session["capacity"]
         queue_number = None if confirmed else one(connection, "SELECT coalesce(max(queue_number),0)+1 AS next FROM bookings WHERE program_session_id=%s", (session_id,))["next"]
-        contact = json.dumps(body.contact, ensure_ascii=False) if body.contact else None
+        # contact는 더 이상 저장하지 않는다. JWT 서명 키를 pgp_sym_encrypt 키로 재사용하고 있었고
+        # (키 하나가 유출되면 토큰 위조와 개인정보 복호화가 같이 뚫린다), 복호화하는 코드가 저장소
+        # 어디에도 없어 읽을 수도 없는 쓰기 전용 데이터였다. 호출도 대기표 화면으로 하므로 필요 없다.
         try:
-            row = one(connection, """INSERT INTO bookings(festival_id,visitor_session_id,program_session_id,status,party_size,queue_number,contact_encrypted)
-                VALUES(%s,%s,%s,%s,%s,%s,CASE WHEN %s::text IS NULL THEN NULL ELSE pgp_sym_encrypt(%s,%s) END)
+            row = one(connection, """INSERT INTO bookings(festival_id,visitor_session_id,program_session_id,status,party_size,queue_number)
+                VALUES(%(festival_id)s,%(visitor_id)s,%(session_id)s,%(status)s,%(party_size)s,%(queue_number)s)
                 RETURNING id,status,party_size,queue_number,created_at""",
-                (visitor["festival_id"], visitor["id"], session_id, "CONFIRMED" if confirmed else "WAITING", body.party_size, queue_number, contact, contact, settings.jwt_secret))
+                {"festival_id": visitor["festival_id"], "visitor_id": visitor["id"], "session_id": session_id,
+                 "status": "CONFIRMED" if confirmed else "WAITING", "party_size": body.party_size,
+                 "queue_number": queue_number})
         except UniqueViolation as error:
             raise conflict("DUPLICATE_ACTION", "같은 회차의 예약 또는 대기표가 이미 있습니다.") from error
         return 201, {**row, "programTitle": session["title"], "startsAt": session["starts_at"]}
@@ -116,7 +111,11 @@ def cancel_booking(booking_id: str, visitor: Visitor, connection: Db) -> Respons
 def create_course_plan(body: CoursePlanIn, request: Request, visitor: Visitor, connection: Db):
     values: list = [visitor["festival_id"], body.starts_at or datetime.now(UTC), body.excluded_program_ids]
     clauses = ["ps.festival_id=%s", "ps.status='OPEN'", "p.status='PUBLISHED'", "ps.starts_at>=%s", "NOT (p.id=ANY(%s::uuid[]))"]
-    for clause, value in (("p.category=ANY(%s)", body.interests), ("ps.area_id=%s", body.area_id)):
+    # accessibility는 받아서 input_preferences에 적어 두기만 하고 후보 선정에는 쓰이지 않았다.
+    # 휠체어 접근이 필요하다고 답한 방문객에게 접근 불가 프로그램을 추천하면 안 된다.
+    required_accessibility = {key: True for key, value in body.accessibility.items() if value is True}
+    for clause, value in (("p.category=ANY(%s)", body.interests), ("ps.area_id=%s", body.area_id),
+                          ("p.accessibility @> %s", jsonb(required_accessibility) if required_accessibility else None)):
         if value:
             clauses.append(clause)
             values.append(value)
@@ -169,6 +168,27 @@ def issue_coupon(coupon_id: str, request: Request, response: Response, visitor: 
     return idempotent_success(request, response, idempotent(connection, key=idempotency_key, scope=f"coupon:{visitor['id']}:{coupon_id}", body={}, work=work))
 
 
+@router.post("/visitor/coupon-issues/{issue_id}/token")
+def rotate_issue_token(issue_id: str, request: Request, visitor: Visitor, connection: Db):
+    """쿠폰 사용 토큰 재발급.
+
+    서버에는 해시만 남아서 발급 응답을 놓치면(기기 교체, 저장소 삭제) QR을 다시 만들 수 없고,
+    쿠폰은 이미 발급돼 재발급도 막혀 있어 방문객이 영영 쓸 수 없는 상태가 됐다.
+    새 토큰을 발급하고 해시를 교체한다 — 예전 토큰은 그 즉시 무효가 되므로 잃어버린
+    QR 사진이 남의 손에 있어도 쓰이지 않는다.
+    """
+    issue = found(one(connection, """SELECT ci.id,ci.status,(ci.expires_at<=now()) AS expired,c.name
+        FROM coupon_issues ci JOIN coupons c ON c.id=ci.coupon_id
+        WHERE ci.id=%s AND ci.visitor_session_id=%s FOR UPDATE OF ci""", (issue_id, visitor["id"])),
+        "발급받은 쿠폰을 찾을 수 없습니다.")
+    if issue["status"] != "ISSUED" or issue["expired"]:
+        raise conflict("INVALID_COUPON_STATUS", "사용 가능 상태의 쿠폰만 재발급할 수 있습니다.")
+    token = random_token("cp")
+    row = one(connection, """UPDATE coupon_issues SET issue_token_hash=%s WHERE id=%s
+        RETURNING id,status,issued_at,expires_at""", (hash_token(token), issue_id))
+    return success(request, {**row, "issueToken": token, "couponName": issue["name"]})
+
+
 @router.get("/visitor/reward-actions")
 def reward_actions(request: Request, visitor: Visitor, connection: Db):
     rows = all_rows(connection, """SELECT a.id,a.action_type,a.verification_type,a.points,a.per_user_limit,a.rule,
@@ -199,12 +219,20 @@ def create_reward_event(body: RewardEventIn, request: Request, response: Respons
         allowed_keys = (action["rule"] or {}).get("verificationKeys")
         if allowed_keys and body.verification_key not in allowed_keys:
             raise bad_request("INVALID_VERIFICATION", "유효하지 않은 행동 인증 값입니다.")
-        today_points = one(connection, "SELECT coalesce(sum(points_delta),0)::int AS points FROM point_ledger WHERE visitor_session_id=%s AND created_at::date=CURRENT_DATE", (visitor["id"],))["points"]
+        # daily_point_limit은 캠페인별 설정인데 예전에는 point_ledger 전체 합계와 비교해서
+        # 캠페인 A에서 쌓은 포인트가 캠페인 B의 한도를 잡아먹었다. 같은 캠페인 적립분만 센다.
+        today_points = one(connection, """SELECT coalesce(sum(pl.points_delta),0)::int AS points FROM point_ledger pl
+            JOIN reward_events re ON re.id=pl.reward_event_id JOIN reward_actions ra ON ra.id=re.reward_action_id
+            WHERE pl.visitor_session_id=%s AND ra.campaign_id=%s AND pl.created_at::date=CURRENT_DATE""",
+            (visitor["id"], action["campaign_id"]))["points"]
         if today_points + action["points"] > action["daily_point_limit"]:
             raise conflict("DAILY_POINT_LIMIT_EXCEEDED", "일일 포인트 한도를 초과했습니다.")
         try:
-            event = one(connection, """INSERT INTO reward_events(reward_action_id,visitor_session_id,verification_key,evidence)
-                VALUES(%s,%s,%s,%s) RETURNING *""", (body.reward_action_id, visitor["id"], body.verification_key, jsonb(body.evidence)))
+            # occurred_at은 스키마로 받기만 하고 버려지고 있었다 — 현장 인증 시각과 서버 도달
+            # 시각이 다를 수 있으므로 준 값을 그대로 남긴다(없으면 컬럼 기본값 now()).
+            event = one(connection, """INSERT INTO reward_events(reward_action_id,visitor_session_id,verification_key,evidence,occurred_at)
+                VALUES(%s,%s,%s,%s,coalesce(%s,now())) RETURNING *""",
+                (body.reward_action_id, visitor["id"], body.verification_key, jsonb(body.evidence), body.occurred_at))
         except UniqueViolation as error:
             raise conflict("DUPLICATE_ACTION", "이미 인증된 행동입니다.") from error
         ledger = one(connection, "INSERT INTO point_ledger(visitor_session_id,reward_event_id,points_delta,reason) VALUES(%s,%s,%s,%s) RETURNING *",

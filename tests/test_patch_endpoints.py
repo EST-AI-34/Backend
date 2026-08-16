@@ -7,7 +7,7 @@ import pytest
 from app.db import set_clause
 from app.errors import AppError
 
-from conftest import token_for
+from conftest import headers_for
 
 
 def data(response):
@@ -51,7 +51,7 @@ def test_patch_facility_writes_json_columns(client, festival, manager, unique):
     facility = data(client.post(base, headers=manager, json={"areaId": area["id"], "name": unique("화장실"), "facilityType": "TOILET"}))
     updated = data(client.patch(f"{base}/{facility['id']}", headers=manager,
                                 json={"accessibility": {"wheelchair": True}, "operatingHours": {"open": "09:00"}, "version": facility["version"]}))
-    assert updated["accessibility"] == {"wheelchair": True} and updated["operating_hours"] == {"open": "09:00"}
+    assert updated["accessibility"] == {"wheelchair": True} and updated["operatingHours"] == {"open": "09:00"}
 
 
 def test_patch_announcement_requires_draft_and_stores_lists(client, festival, manager, unique):
@@ -67,17 +67,17 @@ def test_patch_announcement_requires_draft_and_stores_lists(client, festival, ma
 
 def test_merchant_patch_resubmits_business(client, connection, festival, manager, unique):
     """시드 업체를 건드리면 뒤 테스트의 승인 상태가 깨지므로 전용 업체를 만든다."""
-    merchant = {"Authorization": f"Bearer {token_for(client, 'merchant@example.com')}"}
+    merchant = headers_for(client, "merchant@example.com")
     membership = connection.execute("SELECT m.id FROM memberships m JOIN users u ON u.id=m.user_id WHERE u.email='merchant@example.com'").fetchone()
     business = data(client.post(f"/api/v1/admin/festivals/{festival['id']}/businesses", headers=manager, json={
         "registrationNo": unique("reg"), "name": "테스트상회", "category": "FOOD", "ownerMembershipId": str(membership["id"]),
     }))
     updated = data(client.patch(f"/api/v1/merchant/businesses/{business['id']}", headers=merchant,
                                 json={"name": "상호변경", "menu": [{"name": "국밥", "price": 9000}], "version": business["version"]}))
-    assert updated["participation_status"] == "SUBMITTED"
+    assert updated["participationStatus"] == "SUBMITTED"
     assert updated["menu"] == [{"name": "국밥", "price": 9000}]
     assert updated["version"] == business["version"] + 1
-    assert connection.execute("SELECT name FROM businesses WHERE id=%s", (business["business_id"],)).fetchone()["name"] == "상호변경"
+    assert connection.execute("SELECT name FROM businesses WHERE id=%s", (business["businessId"],)).fetchone()["name"] == "상호변경"
 
     nothing = client.patch(f"/api/v1/merchant/businesses/{business['id']}", headers=merchant, json={"version": updated["version"]})
     assert nothing.status_code == 400 and nothing.json()["error"]["code"] == "VALIDATION_ERROR"

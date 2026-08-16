@@ -33,6 +33,12 @@ def hash_password(password: str) -> str:
     return f"scrypt$16384$8$1${base64.urlsafe_b64encode(salt).decode()}${base64.urlsafe_b64encode(digest).decode()}"
 
 
+# 존재하지 않는 계정에 대고도 같은 비용의 해시 검증을 한 번 돌리기 위한 더미 해시.
+# 없으면 "계정 없음"은 즉시 401, "비밀번호 틀림"은 scrypt 시간만큼 늦게 401이라
+# 응답 시간만 재도 가입된 이메일인지 알 수 있다.
+DUMMY_PASSWORD_HASH = hash_password(secrets.token_urlsafe(32))
+
+
 def verify_password(password: str, encoded: str) -> bool:
     try:
         algorithm, n, r, p, salt, expected = encoded.split("$")

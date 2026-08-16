@@ -1,12 +1,12 @@
-from fastapi import APIRouter, Request, Response
+from fastapi import APIRouter, Query, Request, Response
 from psycopg.errors import UniqueViolation
 
 from .. import ai
 from ..db import all_rows, audit, idempotent, jsonb, one
 from ..deps import Db, IdempotencyKey, Manager, Operator, Reviewer, Scope
 from ..domain import validate_measurement_review
-from ..errors import bad_request, conflict, found
-from ..http import idempotent_success, success
+from ..errors import bad_request, conflict, found, unprocessable
+from ..http import decode_cursor, idempotent_success, paged, success
 from ..schemas import (EsgReportIn, EvidenceIn, ExportIn, MeasurementIn, MeasurementPatch, MetricIn,
                        MetricVersionIn, ReportPatch, ReviewIn)
 
@@ -16,6 +16,10 @@ router = APIRouter()
 
 @router.get("/admin/festivals/{festival_id}/esg/dashboard")
 def esg_dashboard(festival_id: str, request: Request, _: Scope, connection: Db, category: str | None = None):
+    # 실적은 지표(metric) 전체 버전을 합산한다. 예전에는 최신 지표 버전에 달린 실적만 세어서,
+    # 지표 버전을 새로 만드는 순간 이전 버전으로 등록·승인된 실적이 대시보드에서 통째로
+    # 사라졌다(보고서 스냅샷은 전 버전을 합산해서 두 화면 숫자가 어긋났다).
+    # 산식·단위·목표 같은 정의는 최신 버전 것을 보여준다.
     rows = all_rows(connection, """WITH latest AS (
         SELECT DISTINCT ON (metric_id) * FROM esg_metric_versions ORDER BY metric_id,version_no DESC
       ) SELECT m.id,m.name,m.category,v.id AS metric_version_id,v.version_no,v.formula,v.unit,v.target,
@@ -25,9 +29,12 @@ def esg_dashboard(festival_id: str, request: Request, _: Scope, connection: Db, 
         CASE WHEN v.target IS NULL OR v.target=0 THEN NULL
           ELSE round(coalesce(sum(em.value) FILTER(WHERE em.status='APPROVED'),0)/v.target*100,2) END AS achievement_rate,
         max(em.measured_at) FILTER(WHERE em.status='APPROVED') AS latest_measurement_at
-      FROM esg_metrics m LEFT JOIN latest v ON v.metric_id=m.id LEFT JOIN esg_measurements em ON em.metric_version_id=v.id
-      WHERE m.festival_id=%s AND m.status='ACTIVE' AND (%s::text IS NULL OR m.category=%s)
-      GROUP BY m.id,v.id,v.version_no,v.formula,v.unit,v.target ORDER BY m.category,m.name""", (festival_id, category, category))
+      FROM esg_metrics m LEFT JOIN latest v ON v.metric_id=m.id
+      LEFT JOIN esg_metric_versions mv ON mv.metric_id=m.id
+      LEFT JOIN esg_measurements em ON em.metric_version_id=mv.id
+      WHERE m.festival_id=%(festival_id)s AND m.status='ACTIVE' AND (%(category)s::text IS NULL OR m.category=%(category)s)
+      GROUP BY m.id,v.id,v.version_no,v.formula,v.unit,v.target ORDER BY m.category,m.name""",
+        {"festival_id": festival_id, "category": category})
     warnings = [{"metricId": row["id"], "type": "MISSING_DATA" if row["approved_count"] == 0 else "UNAPPROVED_DATA", "count": row["unapproved_count"]}
                 for row in rows if row["approved_count"] == 0 or row["unapproved_count"] > 0]
     context = [f"{row['name']}({row['category']}) 승인값 {row['approved_value']}{row['unit'] or ''}, 달성률 {row['achievement_rate']}%, 미승인 {row['unapproved_count']}건" for row in rows]
@@ -48,6 +55,8 @@ def metrics(festival_id: str, request: Request, _: Scope, connection: Db):
 def create_metric(festival_id: str, body: MetricIn, request: Request, _: Scope, user: Manager, connection: Db):
     row = one(connection, "INSERT INTO esg_metrics(festival_id,name,category,created_by) VALUES(%s,%s,%s,%s) RETURNING *",
         (festival_id, body.name, body.category, user["id"]))
+    audit(connection, festival_id=festival_id, actor_id=str(user["id"]), action="CREATE", resource_type="ESG_METRIC",
+          resource_id=str(row["id"]), after_data=row, request_id=request.state.request_id)
     return success(request, row)
 
 
@@ -64,16 +73,27 @@ def create_metric_version(festival_id: str, metric_id: str, body: MetricVersionI
     row = one(connection, """INSERT INTO esg_metric_versions(metric_id,version_no,formula,unit,target,source_requirements,evidence_required,created_by)
         SELECT %s,coalesce(max(version_no),0)+1,%s,%s,%s,%s,%s,%s FROM esg_metric_versions WHERE metric_id=%s RETURNING *""",
         (metric_id, body.formula, body.unit, body.target, jsonb(body.source_requirements), body.evidence_required, user["id"], metric_id))
+    audit(connection, festival_id=festival_id, actor_id=str(user["id"]), action="CREATE",
+          resource_type="ESG_METRIC_VERSION", resource_id=str(row["id"]), after_data=row,
+          request_id=request.state.request_id)
     return success(request, row)
 
 
 @router.get("/admin/festivals/{festival_id}/esg/measurements")
-def measurements(festival_id: str, request: Request, _: Scope, connection: Db, status: str | None = None):
+def measurements(festival_id: str, request: Request, _: Scope, connection: Db, status: str | None = None,
+                 limit: int = Query(100, ge=1, le=200), cursor: str | None = None):
+    """실적 목록. 측정 시각(measured_at, id) 키셋 커서로 자른다 — 화면 정렬 키와 같아야 이어진다."""
+    after = decode_cursor(cursor)
     rows = all_rows(connection, """SELECT em.*,m.name AS metric_name,m.category,v.version_no,v.unit,
         (SELECT count(*) FROM esg_evidence e WHERE e.measurement_id=em.id)::int AS evidence_count
         FROM esg_measurements em JOIN esg_metric_versions v ON v.id=em.metric_version_id JOIN esg_metrics m ON m.id=v.metric_id
-        WHERE em.festival_id=%s AND (%s::text IS NULL OR em.status=%s) ORDER BY em.measured_at DESC""", (festival_id, status, status))
-    return success(request, rows)
+        WHERE em.festival_id=%(festival_id)s AND (%(status)s::text IS NULL OR em.status=%(status)s)
+        AND (%(after_at)s::timestamptz IS NULL OR (em.measured_at,em.id) < (%(after_at)s::timestamptz,%(after_id)s::uuid))
+        ORDER BY em.measured_at DESC,em.id DESC LIMIT %(limit)s""",
+        {"festival_id": festival_id, "status": status,
+         "after_at": after[0] if after else None, "after_id": after[1] if after else None, "limit": limit + 1})
+    rows, page = paged(rows, limit, "measured_at")
+    return success(request, rows, page=page)
 
 
 @router.post("/admin/festivals/{festival_id}/esg/measurements", status_code=201)
@@ -106,12 +126,16 @@ def measurement(festival_id: str, measurement_id: str, request: Request, _: Scop
 
 @router.patch("/admin/festivals/{festival_id}/esg/measurements/{measurement_id}")
 def patch_measurement(festival_id: str, measurement_id: str, body: MeasurementPatch, request: Request, _: Scope, user: Operator, connection: Db):
+    before = one(connection, "SELECT * FROM esg_measurements WHERE id=%s AND festival_id=%s", (measurement_id, festival_id))
     row = one(connection, """UPDATE esg_measurements SET value=coalesce(%s,value),source_type=coalesce(%s,source_type),
         source_ref=coalesce(%s,source_ref),measured_at=coalesce(%s,measured_at),updated_at=now()
         WHERE id=%s AND festival_id=%s AND status IN('DRAFT','REJECTED') RETURNING *""",
         (body.value, body.source_type, body.source_ref, body.measured_at, measurement_id, festival_id))
     if not row:
         raise bad_request("IMMUTABLE_APPROVED_MEASUREMENT", "승인 전 실적만 수정할 수 있습니다.")
+    audit(connection, festival_id=festival_id, actor_id=str(user["id"]), action="UPDATE",
+          resource_type="ESG_MEASUREMENT", resource_id=measurement_id, before_data=before, after_data=row,
+          request_id=request.state.request_id)
     return success(request, row)
 
 
@@ -121,6 +145,8 @@ def add_evidence(festival_id: str, measurement_id: str, body: EvidenceIn, reques
         raise bad_request("IMMUTABLE_APPROVED_MEASUREMENT", "승인 전 실적에만 증빙을 추가할 수 있습니다.")
     row = one(connection, "INSERT INTO esg_evidence(measurement_id,file_id,file_hash,evidence_type,issued_at) VALUES(%s,%s,%s,%s,%s) RETURNING *",
         (measurement_id, body.file_id, body.file_hash, body.evidence_type, body.issued_at))
+    audit(connection, festival_id=festival_id, actor_id=str(user["id"]), action="CREATE", resource_type="ESG_EVIDENCE",
+          resource_id=str(row["id"]), after_data=row, request_id=request.state.request_id)
     return success(request, row)
 
 
@@ -175,15 +201,24 @@ def patch_report(festival_id: str, report_id: str, body: ReportPatch, request: R
         (jsonb(body.edit_metadata), report_id, festival_id))
     if not row:
         raise bad_request("INVALID_STATE_TRANSITION", "초안 보고서만 편집할 수 있습니다.")
+    audit(connection, festival_id=festival_id, actor_id=str(user["id"]), action="UPDATE", resource_type="ESG_REPORT",
+          resource_id=report_id, after_data=row, request_id=request.state.request_id)
     return success(request, row)
 
 
 @router.post("/admin/festivals/{festival_id}/esg/reports/{report_id}/approve")
 def approve_report(festival_id: str, report_id: str, request: Request, _: Scope, user: Reviewer, connection: Db):
+    # 콘텐츠 승인에는 작성자≠최종승인자 규칙이 있는데 ESG 보고서에는 없어서, Manager와
+    # Reviewer 조건을 모두 만족하는 SUPER_ADMIN이 자기 보고서를 혼자 승인할 수 있었다.
+    report = found(one(connection, "SELECT created_by,status FROM esg_reports WHERE id=%s AND festival_id=%s", (report_id, festival_id)))
+    if str(report["created_by"]) == str(user["id"]):
+        raise unprocessable("AUTHOR_CANNOT_FINAL_APPROVE", "작성자는 자신이 만든 보고서를 승인할 수 없습니다.")
     row = one(connection, "UPDATE esg_reports SET status='APPROVED',updated_at=now() WHERE id=%s AND festival_id=%s AND status='DRAFT' RETURNING *",
         (report_id, festival_id))
     if not row:
         raise bad_request("INVALID_STATE_TRANSITION", "초안 보고서만 승인할 수 있습니다.")
+    audit(connection, festival_id=festival_id, actor_id=str(user["id"]), action="APPROVED", resource_type="ESG_REPORT",
+          resource_id=report_id, after_data=row, request_id=request.state.request_id)
     return success(request, row)
 
 

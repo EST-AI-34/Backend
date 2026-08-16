@@ -26,9 +26,10 @@ def owned_business(connection: Connection, business_id: str, user: dict, *, appr
 
 @router.get("/merchant/businesses")
 def businesses(request: Request, user: Merchant, connection: Db):
-    rows = all_rows(connection, """SELECT fb.*,b.name,b.registration_no,b.address,bo.booth_no,bo.area_id
+    rows = all_rows(connection, """SELECT DISTINCT ON (fb.id) fb.*,b.name,b.registration_no,b.address,bo.booth_no,bo.area_id
         FROM festival_businesses fb JOIN businesses b ON b.id=fb.business_id LEFT JOIN booths bo ON bo.festival_business_id=fb.id
-        WHERE fb.owner_membership_id=%s ORDER BY fb.updated_at DESC""", (user["membership_id"],))
+        WHERE fb.owner_membership_id=%s ORDER BY fb.id,bo.booth_no""", (user["membership_id"],))
+    rows.sort(key=lambda row: row["updated_at"], reverse=True)
     return success(request, rows)
 
 
@@ -55,14 +56,17 @@ def update_business(business_id: str, body: BusinessPatch, request: Request, use
 
 @router.post("/merchant/businesses/{business_id}/coupons", status_code=201)
 def create_coupon(business_id: str, body: CouponIn, request: Request, user: Merchant, connection: Db):
-    owned_business(connection, business_id, user, approved=True)
-    return success(request, insert_coupon(connection, business_id, body, user["id"]))
+    business = owned_business(connection, business_id, user, approved=True)
+    row = insert_coupon(connection, business_id, body, user["id"])
+    audit(connection, festival_id=str(business["festival_id"]), actor_id=str(user["id"]), action="CREATE",
+          resource_type="COUPON", resource_id=str(row["id"]), after_data=row, request_id=request.state.request_id)
+    return success(request, row)
 
 
 @router.post("/merchant/coupon-issues/{issue_id}/redeem")
 def redeem_coupon(issue_id: str, body: CouponRedeemIn, request: Request, user: Merchant, connection: Db):
-    issue = one(connection, """SELECT ci.*,(ci.expires_at<=now()) AS expired,c.festival_business_id,c.name FROM coupon_issues ci
-        JOIN coupons c ON c.id=ci.coupon_id JOIN festival_businesses fb ON fb.id=c.festival_business_id
+    issue = one(connection, """SELECT ci.*,(ci.expires_at<=now()) AS expired,c.festival_business_id,c.name,fb.festival_id
+        FROM coupon_issues ci JOIN coupons c ON c.id=ci.coupon_id JOIN festival_businesses fb ON fb.id=c.festival_business_id
         WHERE ci.id=%s AND fb.owner_membership_id=%s FOR UPDATE OF ci""", (issue_id, user["membership_id"]))
     if not issue:
         raise forbidden("BUSINESS_SCOPE_DENIED", "본인 업체의 쿠폰만 처리할 수 있습니다.")
@@ -75,12 +79,14 @@ def redeem_coupon(issue_id: str, body: CouponRedeemIn, request: Request, user: M
     connection.execute("UPDATE coupon_issues SET status='REDEEMED' WHERE id=%s", (issue_id,))
     connection.execute("INSERT INTO business_events(festival_business_id,visitor_session_id,event_type,source) VALUES(%s,%s,'COUPON_REDEEM','COUPON')",
         (issue["festival_business_id"], issue["visitor_session_id"]))
+    audit(connection, festival_id=str(issue["festival_id"]), actor_id=str(user["id"]), action="REDEEM",
+          resource_type="COUPON_ISSUE", resource_id=str(issue_id), after_data=redemption, request_id=request.state.request_id)
     return success(request, redemption)
 
 
 @router.post("/merchant/coupon-redemptions/{redemption_id}/reverse")
 def reverse_coupon(redemption_id: str, body: CouponReverseIn, request: Request, user: Merchant, connection: Db):
-    redemption = one(connection, """SELECT cr.* FROM coupon_redemptions cr JOIN festival_businesses fb ON fb.id=cr.festival_business_id
+    redemption = one(connection, """SELECT cr.*,fb.festival_id FROM coupon_redemptions cr JOIN festival_businesses fb ON fb.id=cr.festival_business_id
         WHERE cr.id=%s AND fb.owner_membership_id=%s FOR UPDATE OF cr""", (redemption_id, user["membership_id"]))
     if not redemption:
         raise forbidden("BUSINESS_SCOPE_DENIED", "본인 업체의 쿠폰 사용만 취소할 수 있습니다.")
@@ -88,18 +94,22 @@ def reverse_coupon(redemption_id: str, body: CouponReverseIn, request: Request, 
         raise conflict("INVALID_COUPON_STATUS", "이미 취소된 사용 내역입니다.")
     row = one(connection, "UPDATE coupon_redemptions SET status='REVERSED',reversed_at=now(),reversal_reason=%s WHERE id=%s RETURNING *", (body.reason, redemption_id))
     connection.execute("UPDATE coupon_issues SET status=CASE WHEN expires_at>now() THEN 'ISSUED' ELSE 'EXPIRED' END WHERE id=%s", (redemption["coupon_issue_id"],))
-    audit(connection, festival_id=None, actor_id=str(user["id"]), action="REVERSE", resource_type="COUPON_REDEMPTION",
-          resource_id=redemption_id, before_data=redemption, after_data=row, request_id=request.state.request_id)
+    audit(connection, festival_id=str(redemption["festival_id"]), actor_id=str(user["id"]), action="REVERSE",
+          resource_type="COUPON_REDEMPTION", resource_id=redemption_id, before_data=redemption, after_data=row,
+          request_id=request.state.request_id)
     return success(request, row)
 
 
 @router.post("/merchant/businesses/{business_id}/events", status_code=201)
 def record_business_event(business_id: str, body: BusinessEventIn, request: Request, user: Merchant, connection: Db):
-    owned_business(connection, business_id, user, approved=True)
+    business = owned_business(connection, business_id, user, approved=True)
     if body.event_type == "SALE" and body.sales_amount is None:
         raise bad_request("VALIDATION_ERROR", "매출 이벤트에는 금액이 필요합니다.")
     row = one(connection, "INSERT INTO business_events(festival_business_id,event_type,sales_amount,source) VALUES(%s,%s,%s,%s) RETURNING *",
         (business_id, body.event_type, body.sales_amount, body.source))
+    audit(connection, festival_id=str(business["festival_id"]), actor_id=str(user["id"]), action="CREATE",
+          resource_type="BUSINESS_EVENT", resource_id=str(row["id"]), after_data=row,
+          request_id=request.state.request_id)
     return success(request, row)
 
 

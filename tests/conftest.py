@@ -44,6 +44,21 @@ def client():
     pool.close()
 
 
+@pytest.fixture(autouse=True)
+def reset_rate_limit(client):
+    """레이트 리밋 버킷은 프로세스 전역이라 테스트끼리 새어 나간다.
+
+    버킷 키가 (IP, 경로 앞 5조각, 분)이라 같은 축제의 운영자 쓰기 요청이 전부 한 버킷
+    (분당 60회)을 공유한다. 테스트는 모두 같은 IP라 스위트가 커지면 뒤쪽 테스트가 429로
+    무너진다 — 한도 자체는 운영에서 필요한 값이므로 테스트 사이에서만 비운다.
+    """
+    from app.main import counts
+
+    counts.clear()
+    yield
+    counts.clear()
+
+
 @pytest.fixture(scope="session")
 def connection(client):
     """테스트가 직접 만드는 데이터는 즉시 커밋되어야 API 요청에서 보인다."""
@@ -58,25 +73,50 @@ def festival(connection):
     return connection.execute("SELECT id,code FROM festivals WHERE code='EST34-2026'").fetchone()
 
 
+# 로그인은 IP당 분당 10회로 제한된다. 테스트가 계정마다 새로 로그인하면 스위트가
+# 커질수록 429로 무너지므로, 계정별 토큰을 세션 동안 한 번만 받아 재사용한다.
+_TOKENS: dict[str, dict] = {}
+
+
+def tokens_for(client, email: str) -> dict:
+    if email not in _TOKENS:
+        response = client.post("/api/v1/auth/login", json={"email": email, "password": "ChangeMe123!"})
+        assert response.status_code == 200, response.text
+        _TOKENS[email] = response.json()["data"]
+    return _TOKENS[email]
+
+
 def token_for(client, email: str) -> str:
-    response = client.post("/api/v1/auth/login", json={"email": email, "password": "ChangeMe123!"})
-    assert response.status_code == 200, response.text
-    return response.json()["data"]["accessToken"]
+    return tokens_for(client, email)["accessToken"]
+
+
+def headers_for(client, email: str) -> dict:
+    return {"Authorization": f"Bearer {token_for(client, email)}"}
 
 
 @pytest.fixture(scope="session")
 def manager(client):
-    return {"Authorization": f"Bearer {token_for(client, 'manager@example.com')}"}
+    return headers_for(client, "manager@example.com")
 
 
 @pytest.fixture(scope="session")
 def reviewer(client):
-    return {"Authorization": f"Bearer {token_for(client, 'reviewer@example.com')}"}
+    return headers_for(client, "reviewer@example.com")
 
 
 @pytest.fixture(scope="session")
 def operator(client):
-    return {"Authorization": f"Bearer {token_for(client, 'operator@example.com')}"}
+    return headers_for(client, "operator@example.com")
+
+
+@pytest.fixture(scope="session")
+def admin(client):
+    return headers_for(client, "admin@example.com")
+
+
+@pytest.fixture(scope="session")
+def merchant(client):
+    return headers_for(client, "merchant@example.com")
 
 
 @pytest.fixture
