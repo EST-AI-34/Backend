@@ -3,6 +3,7 @@
 각 테스트는 자기 데이터를 만들고 순서에 의존하지 않는다.
 DB가 없으면 conftest에서 전체를 건너뛴다.
 """
+import time
 
 
 def data(response):
@@ -85,7 +86,7 @@ def test_dashboard_reports_language_usage(client, festival, manager, visitor):
                  json={"language": "en", "accessibilityPreferences": {"languageSource": "AUTO", "visitorMode": "kiosk"}})
     languages = data(client.get(f"/api/v1/admin/festivals/{festival['id']}/dashboard", headers=manager))["languages"]
     english = next(row for row in languages if row["language"] == "en")
-    assert english["auto_switched"] >= 1 and english["kiosk_sessions"] >= 1
+    assert english["autoSwitched"] >= 1 and english["kioskSessions"] >= 1
 
 
 def test_visitor_token_required_for_visitor_routes(client):
@@ -96,15 +97,22 @@ def test_visitor_token_required_for_visitor_routes(client):
 def test_visitor_can_update_accessibility_preferences(client, visitor):
     updated = data(client.patch("/api/v1/visitor-sessions/current", headers=visitor,
                                 json={"language": "ko", "accessibilityPreferences": {"wheelchair": True}}))
-    assert updated["accessibility_preferences"]["wheelchair"] is True
+    assert updated["accessibilityPreferences"]["wheelchair"] is True
 
 
 def test_stamp_action_is_marked_completed_after_collecting(client, visitor, unique):
+    """스탬프는 현장 QR 값으로 인증한다. 인증 키 목록은 방문객에게 노출되지 않는다."""
     actions = data(client.get("/api/v1/visitor/reward-actions", headers=visitor))
-    stamp = next(action for action in actions if action["verification_type"] == "SELF")
+    stamp = next(action for action in actions if action["actionType"].startswith("STAMP_"))
     assert stamp["completed"] is False and "verificationKeys" not in stamp
+    key = f"stamp:{stamp['actionType'].lower().replace('_', '-')}"
+
+    wrong = client.post("/api/v1/visitor/reward-events", headers={**visitor, "Idempotency-Key": unique("stamp")},
+                        json={"rewardActionId": stamp["id"], "verificationKey": "아무 값", "evidence": {}})
+    assert error_code(wrong, 400) == "INVALID_VERIFICATION"
+
     client.post("/api/v1/visitor/reward-events", headers={**visitor, "Idempotency-Key": unique("stamp")},
-                json={"rewardActionId": stamp["id"], "verificationKey": f"stamp:{stamp['id']}", "evidence": {}})
+                json={"rewardActionId": stamp["id"], "verificationKey": key, "evidence": {}})
     after = data(client.get("/api/v1/visitor/reward-actions", headers=visitor))
     assert next(action for action in after if action["id"] == stamp["id"])["completed"] is True
 
@@ -115,7 +123,7 @@ def test_visitor_complaint_becomes_open_ticket(client, festival, manager, visito
     assert created["status"] == "OPEN"
     tickets = data(client.get(f"/api/v1/admin/festivals/{festival['id']}/ops-tickets", headers=manager))
     ticket = next(row for row in tickets if row["id"] == created["id"])
-    assert ticket["ticket_type"] == "COMPLAINT"
+    assert ticket["ticketType"] == "COMPLAINT"
     assert ticket["title"] == "[편의시설] 그늘막이 부족해요"
 
 
@@ -138,7 +146,7 @@ def test_author_cannot_approve_own_content(client, festival, manager, reviewer, 
     assert approved["status"] == "APPROVED"
     published = data(client.post(f"{base}/content-items/{item['id']}/publish", headers=manager,
                                  json={"versionId": version["id"]}))
-    assert published["lifecycle_status"] == "PUBLISHED"
+    assert published["lifecycleStatus"] == "PUBLISHED"
 
 
 def test_unapproved_version_cannot_be_published(client, festival, manager, unique):
@@ -222,14 +230,14 @@ def test_booking_over_capacity_becomes_waitlist(client, festival, visitor, conne
 
     first = data(client.post(f"/api/v1/visitor/program-sessions/{session['id']}/bookings",
                              headers={**visitor, "Idempotency-Key": unique("cap")}, json={"partySize": 1}))
-    assert first["status"] == "CONFIRMED" and first["queue_number"] is None
+    assert first["status"] == "CONFIRMED" and first["queueNumber"] is None
 
     other = client.post(f"/api/v1/public/festivals/{festival['code']}/visitor-sessions",
                         json={"language": "ko", "consents": {"privacy": True}})
     other_headers = {"Authorization": f"Bearer {other.json()['data']['sessionToken']}", "Idempotency-Key": unique("cap")}
     second = data(client.post(f"/api/v1/visitor/program-sessions/{session['id']}/bookings",
                               headers=other_headers, json={"partySize": 1}))
-    assert second["status"] == "WAITING" and second["queue_number"] == 1
+    assert second["status"] == "WAITING" and second["queueNumber"] == 1
 
 
 # --- 쿠폰 한도 ---------------------------------------------------------------
@@ -317,8 +325,8 @@ def test_risk_brief_reports_insufficient_data_without_signals(client, manager, c
         SELECT organization_id,'RISK-EMPTY','신호 없는 축제',starts_at,ends_at,'PUBLISHED' FROM festivals WHERE id=%s
         ON CONFLICT(code) DO UPDATE SET name=excluded.name RETURNING id""", (festival["id"],)).fetchone()
     brief = data(client.get(f"/api/v1/admin/festivals/{empty['id']}/risk-brief", headers=manager))
-    assert brief["risk_level"] == "INSUFFICIENT_DATA" and brief["risk_score"] == 0
-    assert brief["evidence"] == [] and brief["external_ai_used"] is False
+    assert brief["riskLevel"] == "INSUFFICIENT_DATA" and brief["riskScore"] == 0
+    assert brief["evidence"] == [] and brief["externalAiUsed"] is False
 
 
 def test_risk_brief_scores_crowding_from_snapshots(client, festival, manager, operator, connection):
@@ -335,9 +343,9 @@ def test_risk_brief_scores_crowding_from_snapshots(client, festival, manager, op
     brief = data(client.get(f"{base}/risk-brief", headers=manager))
     crowding = [signal for signal in brief["evidence"] if signal["type"] == "crowding"]
     assert crowding and crowding[0]["value"] > 0
-    assert brief["risk_level"] in ("NORMAL", "WARNING", "CRITICAL")
+    assert brief["riskLevel"] in ("NORMAL", "WARNING", "CRITICAL")
     # 외부 AI가 꺼져 있으면 규칙 기반 문장을 그대로 쓴다.
-    assert brief["external_ai_used"] is False and brief["summary"]
+    assert brief["externalAiUsed"] is False and brief["summary"]
 
 
 def test_recommendations_keep_ads_out_of_organic_results(client, festival, connection):
@@ -345,9 +353,9 @@ def test_recommendations_keep_ads_out_of_organic_results(client, festival, conne
         WHERE id=(SELECT id FROM festival_businesses WHERE festival_id=%s AND participation_status='APPROVED' LIMIT 1)""",
         (festival["id"],))
     result = data(client.get(f"/api/v1/public/festivals/{festival['code']}/business-recommendations"))
-    assert all(not item["is_sponsored"] for item in result["items"])
-    assert all(item["is_sponsored"] for item in result["sponsored_items"])
-    assert result["recommendation_policy_version"] == "biz-rec-v1"
+    assert all(not item["isSponsored"] for item in result["items"])
+    assert all(item["isSponsored"] for item in result["sponsoredItems"])
+    assert result["recommendationPolicyVersion"] == "biz-rec-v1"
     # 점수 내림차순으로 정렬된다.
     scores = [item["score"] for item in result["items"]]
     assert scores == sorted(scores, reverse=True)
@@ -362,7 +370,7 @@ def test_business_with_two_booths_appears_once(client, festival, connection):
         connection.execute("""INSERT INTO booths(festival_business_id,area_id,booth_no) VALUES(%s,%s,%s)
             ON CONFLICT DO NOTHING""", (business["id"], business["area_id"], booth_no))
     result = data(client.get(f"/api/v1/public/festivals/{festival['code']}/business-recommendations?limit=50"))
-    ids = [item["business_id"] for item in result["items"] + result["sponsored_items"]]
+    ids = [item["businessId"] for item in result["items"] + result["sponsoredItems"]]
     assert ids.count(str(business["id"])) == 1
     assert len(ids) == len(set(ids))
 
@@ -370,7 +378,7 @@ def test_business_with_two_booths_appears_once(client, festival, connection):
 def test_sponsored_items_have_their_own_cap(client, festival, connection):
     connection.execute("UPDATE festival_businesses SET is_sponsored=true WHERE festival_id=%s", (festival["id"],))
     result = data(client.get(f"/api/v1/public/festivals/{festival['code']}/business-recommendations?limit=50"))
-    assert len(result["sponsored_items"]) <= 3
+    assert len(result["sponsoredItems"]) <= 3
     connection.execute("UPDATE festival_businesses SET is_sponsored=false WHERE festival_id=%s", (festival["id"],))
 
 
@@ -385,10 +393,10 @@ def test_recommendation_bias_counts_logged_exposures(client, festival, manager):
     before = data(client.get(f"/api/v1/admin/festivals/{festival['id']}/recommendation-bias", headers=manager))
     client.get(f"/api/v1/public/festivals/{festival['code']}/business-recommendations")
     after = data(client.get(f"/api/v1/admin/festivals/{festival['id']}/recommendation-bias", headers=manager))
-    assert after["checked_event_count"] == before["checked_event_count"] + 1
+    assert after["checkedEventCount"] == before["checkedEventCount"] + 1
     assert after["status"] in ("PASS", "WARNING", "INSUFFICIENT_DATA")
-    for row in after["business_exposures"]:
-        assert 0 <= row["exposure_share"] <= 1
+    for row in after["businessExposures"]:
+        assert 0 <= row["exposureShare"] <= 1
 
 
 def test_risk_brief_uses_external_ai_when_it_answers(client, festival, manager, monkeypatch):
@@ -396,10 +404,10 @@ def test_risk_brief_uses_external_ai_when_it_answers(client, festival, manager, 
 
     monkeypatch.setattr(ai, "briefing", lambda instruction, context: "혼잡이 심해 안전 인력이 필요합니다.")
     brief = data(client.get(f"/api/v1/admin/festivals/{festival['id']}/risk-brief", headers=manager))
-    assert brief["external_ai_used"] is True
+    assert brief["externalAiUsed"] is True
     assert brief["summary"] == "혼잡이 심해 안전 인력이 필요합니다."
     # AI가 요약만 바꾸고 점수·근거는 규칙 기반 값을 유지한다.
-    assert brief["evidence"] and brief["policy_version"] == "risk-v1"
+    assert brief["evidence"] and brief["policyVersion"] == "risk-v1"
 
 
 def test_esg_dashboard_carries_ai_brief_flag(client, festival, manager):
@@ -418,3 +426,307 @@ def test_malformed_uuid_is_a_client_error(client, manager, festival):
     )
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+def test_announcement_patch_requires_draft_and_current_version(client, festival, manager):
+    """patch_row(require=...)가 초안 조건과 낙관적 잠금을 함께 거는지 확인한다."""
+    base = f"/api/v1/admin/festivals/{festival['id']}"
+    draft = data(client.post(f"{base}/announcements", headers=manager, json={"title": "우천 시 일정 안내"}))
+
+    updated = data(client.patch(f"{base}/announcements/{draft['id']}", headers=manager,
+                                json={"title": "우천 시 일정 변경", "version": draft["version"]}))
+    assert updated["title"] == "우천 시 일정 변경" and updated["version"] == draft["version"] + 1
+
+    # 오래된 버전으로는 덮어쓸 수 없다.
+    stale = client.patch(f"{base}/announcements/{draft['id']}", headers=manager,
+                         json={"title": "다시 변경", "version": draft["version"]})
+    assert error_code(stale, 409) == "RESOURCE_VERSION_CONFLICT"
+
+    # 축제에 없는 공지는 404다(버전 충돌이 아니라).
+    missing = client.patch(f"{base}/announcements/00000000-0000-0000-0000-000000000000",
+                           headers=manager, json={"title": "없음", "version": 1})
+    assert error_code(missing, 404) == "RESOURCE_NOT_FOUND"
+
+
+# --- 감사에서 나온 문제들의 회귀 방지 --------------------------------------
+
+
+def test_password_change_rotates_tokens_and_rejects_wrong_current(client):
+    """운영자 화면이 안내해 온 '로그인 후 비밀번호 변경'이 실제로 가능해야 한다."""
+    login = data(client.post("/api/v1/auth/login", json={"email": "operator@example.com", "password": "ChangeMe123!"}))
+    headers = {"Authorization": f"Bearer {login['accessToken']}"}
+
+    wrong = client.post("/api/v1/me/password", headers=headers,
+                        json={"currentPassword": "WrongPassword1!", "newPassword": "BrandNew123!"})
+    assert error_code(wrong, 401) == "INVALID_CREDENTIALS"
+
+    changed = data(client.post("/api/v1/me/password", headers=headers,
+                               json={"currentPassword": "ChangeMe123!", "newPassword": "BrandNew123!"}))
+    assert changed["accessToken"] and changed["refreshToken"]
+    # 예전 리프레시 토큰은 폐기된다 — 유출된 비밀번호로 열린 세션이 살아남으면 안 된다.
+    assert error_code(client.post("/api/v1/auth/refresh", json={"refreshToken": login["refreshToken"]}), 401) == "TOKEN_EXPIRED"
+    assert client.post("/api/v1/auth/login", json={"email": "operator@example.com", "password": "BrandNew123!"}).status_code == 200
+
+    # 다른 테스트가 쓰는 시드 계정이므로 원래 비밀번호로 되돌린다.
+    restore = {"Authorization": f"Bearer {changed['accessToken']}"}
+    assert client.post("/api/v1/me/password", headers=restore,
+                       json={"currentPassword": "BrandNew123!", "newPassword": "ChangeMe123!"}).status_code == 200
+
+
+def test_expired_lock_restarts_the_failure_count(client, connection):
+    """잠금 창이 지나면 카운터가 처음부터 다시 세어져야 한다.
+
+    되돌리지 않으면 failures가 한도 위에 머물러 이후 실패마다 잠금이 새로 걸리고, 잠긴 동안은
+    비밀번호 검증 전에 429로 끊기므로 정상 사용자가 잠금을 풀 수 없다(= 영구 잠금).
+    """
+    email = "lockout-probe@example.com"
+    attempt = {"email": email, "password": "WrongPassword1!"}
+    connection.execute("""INSERT INTO login_attempts(email,failures,locked_until)
+        VALUES(%s,5,now()-interval '1 second')
+        ON CONFLICT(email) DO UPDATE SET failures=5,locked_until=now()-interval '1 second'""", (email,))
+
+    # 잠금이 끝났으므로 이번 실패는 401이고, 카운터는 1부터 다시 센다.
+    assert client.post("/api/v1/auth/login", json=attempt).status_code == 401
+    row = connection.execute("SELECT failures,locked_until FROM login_attempts WHERE email=%s", (email,)).fetchone()
+    assert row["failures"] == 1 and row["locked_until"] is None
+
+    # 그래도 한도까지 쌓이면 잠긴다 — 되돌림이 보호를 없애지는 않는다.
+    for _ in range(4):
+        assert client.post("/api/v1/auth/login", json=attempt).status_code == 401
+    assert error_code(client.post("/api/v1/auth/login", json=attempt), 429) == "ACCOUNT_LOCKED"
+
+    connection.execute("DELETE FROM login_attempts WHERE email=%s", (email,))
+
+
+def test_refresh_token_reuse_actually_revokes_the_account(client, connection):
+    """재사용 탐지의 폐기가 남아야 한다 — 401이 트랜잭션을 롤백하면 탐지가 아무 일도 안 한 셈이다."""
+    login = data(client.post("/api/v1/auth/login", json={"email": "merchant@example.com", "password": "ChangeMe123!"}))
+    rotated = data(client.post("/api/v1/auth/refresh", json={"refreshToken": login["refreshToken"]}))
+
+    # 회전으로 폐기된 예전 토큰을 다시 쓴다 = 탈취 신호.
+    assert error_code(client.post("/api/v1/auth/refresh", json={"refreshToken": login["refreshToken"]}), 401) == "TOKEN_EXPIRED"
+    # 회전으로 받은 살아 있던 토큰까지 끊겨야 한다.
+    assert error_code(client.post("/api/v1/auth/refresh", json={"refreshToken": rotated["refreshToken"]}), 401) == "TOKEN_EXPIRED"
+    assert connection.execute("""SELECT count(*)::int AS hits FROM audit_logs
+        WHERE action='REFRESH_TOKEN_REUSE'""").fetchone()["hits"] >= 1
+
+
+def test_duplicate_membership_email_is_rejected_not_silently_ignored(client, admin):
+    """예전에는 ON CONFLICT로 비밀번호가 조용히 버려져 못 쓰는 계정이 발급됐다."""
+    headers = admin
+    organization_id = data(client.get("/api/v1/me", headers=headers))["organizationId"]
+    body = {"email": "manager@example.com", "name": "중복 계정", "password": "AnotherPass1!",
+            "role": "FIELD_OPERATOR", "festivalScope": ["*"]}
+    response = client.post(f"/api/v1/admin/organizations/{organization_id}/memberships", headers=headers, json=body)
+    assert error_code(response, 409) == "EMAIL_ALREADY_REGISTERED"
+    # 기존 계정은 그대로 살아 있어야 한다(비밀번호가 덮어써지지 않았다).
+    assert client.get("/api/v1/me", headers=headers).status_code == 200
+
+
+def test_audit_log_cursor_pages_through_results(client, manager, festival):
+    base = f"/api/v1/admin/festivals/{festival['id']}/audit-logs"
+    first = client.get(f"{base}?limit=1", headers=manager)
+    assert first.status_code == 200
+    page = first.json()["page"]
+    assert page["hasNext"] is True and page["nextCursor"]
+    second = client.get(f"{base}?limit=1&cursor={page['nextCursor']}", headers=manager)
+    assert second.status_code == 200
+    assert data(second)[0]["id"] != data(first)[0]["id"]
+    assert error_code(client.get(f"{base}?cursor=not-a-cursor", headers=manager), 400) == "INVALID_CURSOR"
+
+
+def test_export_produces_real_file_bytes(client, manager, festival):
+    """예전에는 안내 문구만 담긴 빈 잡이 COMPLETED로 남고 파일이 없었다."""
+    import base64
+
+    response = client.post(f"/api/v1/admin/festivals/{festival['id']}/exports", headers=manager,
+                           json={"resourceType": "AUDIT_LOG", "format": "CSV"})
+    assert response.status_code == 202, response.text
+    job_id = response.json()["data"]["jobId"]
+    job = data(client.get(f"/api/v1/jobs/{job_id}", headers=manager))
+    artifact = job["result"]["artifacts"][0]
+    assert artifact["fileName"].endswith(".csv") and artifact["byteSize"] > 0
+    content = base64.b64decode(artifact["contentBase64"]).decode("utf-8-sig")
+    # 행위자 이름·이메일까지 나가야 감사 산출물만 보고도 누가 했는지 알 수 있다.
+    assert content.splitlines()[0] == ("created_at,action,resource_type,resource_id,actor_id,"
+                                       "actor_name,actor_email,request_id")
+
+    unsupported = client.post(f"/api/v1/admin/festivals/{festival['id']}/exports", headers=manager,
+                              json={"resourceType": "NOT_A_TABLE", "format": "CSV"})
+    assert error_code(unsupported, 400) == "UNSUPPORTED_EXPORT"
+
+
+def test_status_values_are_constrained(client, manager, festival, unique):
+    program = data(client.post(f"/api/v1/admin/festivals/{festival['id']}/programs", headers=manager,
+                               json={"slug": unique("status-check"), "title": "상태 검증", "category": "체험"}))
+    bogus = client.patch(f"/api/v1/admin/festivals/{festival['id']}/programs/{program['id']}", headers=manager,
+                         json={"status": "NOT_A_STATUS", "version": program["version"]})
+    assert error_code(bogus, 400) == "VALIDATION_ERROR"
+
+
+def test_coupon_issue_token_can_be_rotated(client, visitor, manager, festival, connection, unique):
+    """기기를 바꾸면 사용 토큰을 되찾을 방법이 없어 쿠폰이 영영 죽어 있었다."""
+    offers = data(client.get(f"/api/v1/public/festivals/{festival['code']}/coupons"))
+    if not offers:
+        return
+    issued = data(client.post(f"/api/v1/visitor/coupons/{offers[0]['id']}/issues",
+                              headers={**visitor, "Idempotency-Key": unique("key")}))
+    rotated = data(client.post(f"/api/v1/visitor/coupon-issues/{issued['id']}/token", headers=visitor))
+    assert rotated["issueToken"].startswith("cp_") and rotated["issueToken"] != issued["issueToken"]
+
+    # 예전 토큰은 즉시 무효, 새 토큰으로는 사용 처리된다.
+    stale = client.post(f"/api/v1/admin/festivals/{festival['id']}/coupon-redemptions", headers=manager,
+                        json={"issueToken": issued["issueToken"]})
+    assert error_code(stale, 400) == "INVALID_COUPON_TOKEN"
+    assert client.post(f"/api/v1/admin/festivals/{festival['id']}/coupon-redemptions", headers=manager,
+                       json={"issueToken": rotated["issueToken"]}).status_code == 200
+
+
+def test_internal_document_can_be_edited_and_archived(client, manager, festival):
+    base = f"/api/v1/admin/festivals/{festival['id']}/internal-documents"
+    document = data(client.post(base, headers=manager, json={
+        "title": "우천 대응 절차", "documentType": "SOP", "body": "우천 시 공연을 중단한다.",
+        "allowedRoles": ["SUPER_ADMIN", "FESTIVAL_MANAGER"]}))
+    updated = data(client.patch(f"{base}/{document['id']}", headers=manager, json={"title": "우천 대응 절차 v2"}))
+    assert updated["title"] == "우천 대응 절차 v2"
+    assert client.delete(f"{base}/{document['id']}", headers=manager).status_code == 204
+    assert all(row["id"] != document["id"] for row in data(client.get(base, headers=manager)))
+
+
+def test_clone_copies_facilities_programs_and_sessions(client, manager, festival, unique):
+    """예전에는 구역만 복사해서 사실상 '구역 복사'였다."""
+    cloned = data(client.post(f"/api/v1/admin/festivals/{festival['id']}/clone", headers=manager, json={
+        "code": unique("CLONE"), "name": "복제 축제",
+        "startsAt": "2027-09-12T00:00:00Z", "endsAt": "2027-09-14T00:00:00Z"}))
+    copied = cloned["copied"]
+    assert copied["areas"] > 0 and copied["facilities"] > 0 and copied["programs"] > 0 and copied["sessions"] > 0
+    # 복사본 프로그램은 승인된 콘텐츠가 없으므로 DRAFT여야 한다.
+    programs = data(client.get(f"/api/v1/admin/festivals/{cloned['id']}/programs", headers=manager))
+    assert {program["status"] for program in programs} == {"DRAFT"}
+
+
+def test_report_author_cannot_approve_own_report(client, admin, reviewer, festival, unique):
+    """콘텐츠에만 있던 작성자≠최종승인자 규칙을 ESG 보고서에도 건다.
+
+    실제 위험은 SUPER_ADMIN이다 — 생성(Manager)과 승인(Reviewer) 역할 조건을 모두
+    만족해서 혼자 만들고 혼자 승인할 수 있었다.
+    """
+    base = f"/api/v1/admin/festivals/{festival['id']}/esg/reports"
+    created = client.post(base, headers={**admin, "Idempotency-Key": unique("report-selfapprove")},
+                          json={"title": "자가 승인 검증", "period": {"from": "2026-09-12T00:00:00Z", "to": "2026-09-14T00:00:00Z"},
+                                "format": "DOCX"})
+    assert created.status_code == 202, created.text
+    report_id = created.json()["data"]["reportId"]
+
+    # 잡 워커가 스냅샷을 채워 DRAFT가 될 때까지 기다린다.
+    for _ in range(50):
+        report = data(client.get(f"{base}/{report_id}", headers=admin))
+        if report["status"] != "GENERATING":
+            break
+        time.sleep(0.1)
+    assert report["status"] == "DRAFT", report
+
+    denied = client.post(f"{base}/{report_id}/approve", headers=admin)
+    assert error_code(denied, 422) == "AUTHOR_CANNOT_FINAL_APPROVE"
+    assert data(client.post(f"{base}/{report_id}/approve", headers=reviewer))["status"] == "APPROVED"
+
+
+# --- 2차 감사에서 고친 것들 --------------------------------------------------
+
+def test_visitor_safety_complaint_gets_high_priority(client, festival, manager, visitor):
+    """안전 민원이 NORMAL로 들어가면 위험 브리프(HIGH·EMERGENCY만 집계)에 영영 안 잡힌다."""
+    created = data(client.post("/api/v1/visitor/complaints", headers=visitor,
+                               json={"title": "체험존에서 미끄러짐 사고", "category": "안전",
+                                     "description": "바닥이 젖어 위험합니다."}))
+    assert created["priority"] == "HIGH"
+    normal = data(client.post("/api/v1/visitor/complaints", headers=visitor,
+                              json={"title": "기념품 가격 문의", "description": "가격표가 안 보여요."}))
+    assert normal["priority"] == "NORMAL"
+
+
+def test_reward_action_requires_verification_keys_when_not_self(client, festival, manager, unique):
+    campaign = data(client.post(f"/api/v1/admin/festivals/{festival['id']}/reward-campaigns", headers=manager,
+                                json={"name": unique("캠페인"), "startsAt": "2020-01-01T00:00:00Z",
+                                      "endsAt": "2030-01-01T00:00:00Z", "dailyPointLimit": 100}))
+    response = client.post(f"/api/v1/admin/festivals/{festival['id']}/reward-campaigns/{campaign['id']}/actions",
+                           headers=manager, json={"actionType": unique("ACT"), "verificationType": "QR",
+                                                  "points": 10, "perUserLimit": 1, "rule": {"name": "테스트"}})
+    assert error_code(response, 400) == "VERIFICATION_KEYS_REQUIRED"
+
+
+def test_reward_per_user_limit_allows_repeat_with_same_key(client, festival, manager, visitor, unique):
+    """같은 인증 키로 다시 참여할 수 있어야 perUserLimit>1이 의미를 갖는다."""
+    campaign = data(client.post(f"/api/v1/admin/festivals/{festival['id']}/reward-campaigns", headers=manager,
+                                json={"name": unique("캠페인"), "startsAt": "2020-01-01T00:00:00Z",
+                                      "endsAt": "2030-01-01T00:00:00Z", "dailyPointLimit": 100}))
+    action = data(client.post(f"/api/v1/admin/festivals/{festival['id']}/reward-campaigns/{campaign['id']}/actions",
+                              headers=manager, json={"actionType": unique("ACT"), "verificationType": "QR",
+                                                     "points": 10, "perUserLimit": 2,
+                                                     "rule": {"verificationKeys": ["spot-1"]}}))
+    body = {"rewardActionId": action["id"], "verificationKey": "spot-1", "evidence": {}}
+    for attempt in range(2):
+        response = client.post("/api/v1/visitor/reward-events",
+                               headers={**visitor, "Idempotency-Key": unique(f"reward{attempt}")}, json=body)
+        assert response.status_code == 201, response.text
+    third = client.post("/api/v1/visitor/reward-events",
+                        headers={**visitor, "Idempotency-Key": unique("reward-over")}, json=body)
+    assert error_code(third, 409) == "ACTION_LIMIT_EXCEEDED"
+
+
+def test_announcement_publishes_in_one_request(client, festival, manager):
+    """6단계 클라이언트 흐름은 중간 실패 시 고아 DRAFT를 남겼다. 한 트랜잭션으로 처리한다."""
+    published = data(client.post(f"/api/v1/admin/festivals/{festival['id']}/announcements/publish", headers=manager,
+                                 json={"title": "우천 시 일정 안내", "body": "소나기 예보로 야외 공연이 지연됩니다.",
+                                       "severity": "WARNING", "audience": ["VISITOR"],
+                                       "startsAt": "2020-01-01T00:00:00Z"}))
+    assert published["status"] in ("ACTIVE", "SCHEDULED") and published["contentVersionId"]
+    public = data(client.get(f"/api/v1/public/festivals/{festival['code']}/announcements"))
+    assert any(row["id"] == published["id"] for row in public)
+
+
+def test_survey_can_be_created_and_summarized(client, festival, manager, unique):
+    """설문 등록 API가 없어 시드로만 만들 수 있었다."""
+    survey = data(client.post(f"/api/v1/admin/festivals/{festival['id']}/surveys", headers=manager, json={
+        "title": unique("설문"), "status": "ACTIVE", "preventDuplicates": True,
+        "questions": [{"prompt": "만족하셨나요?", "questionType": "RATING", "required": True},
+                      {"prompt": "가장 좋았던 곳은?", "questionType": "SINGLE_CHOICE",
+                       "options": ["메인 광장", "체험존"], "required": False}],
+    }))
+    listed = data(client.get(f"/api/v1/admin/festivals/{festival['id']}/surveys", headers=manager))
+    assert len(next(row for row in listed if row["id"] == survey["id"])["questions"]) == 2
+    summary = data(client.get(f"/api/v1/admin/festivals/{festival['id']}/surveys/{survey['id']}/summary", headers=manager))
+    assert summary["responseCount"] == 0
+
+
+def test_survey_rejects_choice_question_without_options(client, festival, manager, unique):
+    response = client.post(f"/api/v1/admin/festivals/{festival['id']}/surveys", headers=manager, json={
+        "title": unique("설문"), "questions": [{"prompt": "어디가 좋았나요?", "questionType": "SINGLE_CHOICE"}]})
+    assert error_code(response, 400) == "VALIDATION_ERROR"
+
+
+def test_business_sponsored_flag_is_settable(client, festival, manager, unique):
+    """광고 노출·ESG 참여는 추천 점수의 입력값인데 설정할 API가 없었다."""
+    created = data(client.post(f"/api/v1/admin/festivals/{festival['id']}/businesses", headers=manager, json={
+        "registrationNo": unique("REG"), "name": unique("업체"), "category": "CAFE"}))
+    updated = data(client.patch(f"/api/v1/admin/festivals/{festival['id']}/businesses/{created['id']}",
+                                headers={**manager, "If-Match": str(created["version"])},
+                                json={"isSponsored": True, "esgParticipating": True}))
+    assert updated["isSponsored"] is True and updated["esgParticipating"] is True
+
+
+def test_audit_log_includes_actor_name(client, festival, manager):
+    """actor_id(UUID)만 내려주면 감사 화면에서 누가 했는지 알 수 없었다."""
+    logs = data(client.get(f"/api/v1/admin/festivals/{festival['id']}/audit-logs?limit=5", headers=manager))
+    assert any(row.get("actorName") for row in logs)
+
+
+def test_ticket_list_is_paginated(client, festival, manager):
+    response = client.get(f"/api/v1/admin/festivals/{festival['id']}/ops-tickets?limit=1", headers=manager)
+    body = response.json()
+    assert response.status_code == 200 and len(body["data"]) <= 1
+    assert body["page"]["limit"] == 1 and "hasNext" in body["page"]
+    if body["page"]["hasNext"]:
+        following = data(client.get(
+            f"/api/v1/admin/festivals/{festival['id']}/ops-tickets?limit=1&cursor={body['page']['nextCursor']}",
+            headers=manager))
+        assert following and following[0]["id"] != body["data"][0]["id"]

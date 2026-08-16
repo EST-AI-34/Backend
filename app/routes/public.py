@@ -16,12 +16,15 @@ from ..security import hash_token, random_token
 
 router = APIRouter()
 
+# 공개 프로그램 목록 한 번에 내려주는 최대 건수.
+PUBLIC_PROGRAM_LIMIT = 200
+
 
 def published_festival(connection: Connection, code: str) -> dict:
     return found(one(
         connection,
         """SELECT id,code,name,description,timezone,starts_at,ends_at,status,default_language,
-                  supported_languages,visitor_menus,updated_at FROM festivals
+                  supported_languages,visitor_menus,transport,updated_at FROM festivals
            WHERE code=%s AND status IN ('PUBLISHED','ONGOING','ENDED')""",
         (code,),
     ), "게시된 축제를 찾을 수 없습니다.")
@@ -73,11 +76,17 @@ def programs(
              JOIN festival_areas a ON a.id=ps.area_id
              JOIN content_items ci ON ci.festival_id=p.festival_id AND ci.resource_type='PROGRAM' AND ci.resource_id=p.id
              JOIN content_versions cv ON cv.id=ci.published_version_id
-             WHERE {' AND '.join(clauses)} GROUP BY p.id,cv.language,ci.updated_at ORDER BY min(ps.starts_at),p.title""",
-        values,
+             WHERE {' AND '.join(clauses)} GROUP BY p.id,cv.language,ci.updated_at
+             ORDER BY min(ps.starts_at),p.title LIMIT %s""",
+        [*values, PUBLIC_PROGRAM_LIMIT + 1],
     )
+    # 전량 반환에 hasNext=false가 하드코딩돼 있어, 프로그램이 상한을 넘겨도 잘렸다는 사실이
+    # 드러나지 않았다. 상한을 두고 넘치면 잘렸다고 알린다(공개 목록은 커서 없이 날짜·구역
+    # 필터로 좁혀 쓰는 화면이라 커서까지는 두지 않는다).
+    has_next = len(rows) > PUBLIC_PROGRAM_LIMIT
+    rows = rows[:PUBLIC_PROGRAM_LIMIT]
     cached(response)
-    return success(request, rows, page={"nextCursor": None, "hasNext": False, "limit": len(rows)})
+    return success(request, rows, page={"nextCursor": None, "hasNext": has_next, "limit": PUBLIC_PROGRAM_LIMIT})
 
 
 @router.get("/public/festivals/{festival_code}/programs/{program_slug}")
@@ -116,8 +125,9 @@ def facilities(festival_code: str, request: Request, response: Response, connect
     festival = published_festival(connection, festival_code)
     rows = all_rows(connection, f"""SELECT f.id,f.name,f.facility_type,f.accessibility,f.operating_hours,f.status,f.updated_at,
         jsonb_build_object('id',a.id,'name',a.name,'latitude',a.latitude,'longitude',a.longitude) AS area
-        FROM facilities f JOIN festival_areas a ON a.id=f.area_id WHERE f.festival_id=%s AND f.status='ACTIVE'
-        AND (%s::text IS NULL OR f.facility_type=%s) ORDER BY {safety_facility_order('f.facility_type')},f.name""", (festival["id"], type_, type_))
+        FROM facilities f JOIN festival_areas a ON a.id=f.area_id WHERE f.festival_id=%(festival_id)s AND f.status='ACTIVE'
+        AND (%(type)s::text IS NULL OR f.facility_type=%(type)s)
+        ORDER BY {safety_facility_order('f.facility_type')},f.name""", {"festival_id": festival["id"], "type": type_})
     cached(response)
     return success(request, rows)
 
