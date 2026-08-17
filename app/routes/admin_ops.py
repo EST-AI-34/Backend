@@ -10,10 +10,11 @@ from ..domain import validate_ticket_transition
 from ..errors import bad_request, conflict, forbidden, found
 from ..esg_export import build_table_artifact
 from ..http import Raw, decode_cursor, paged, success
+from ..privacy import CONSENT_ITEMS, RETENTION_POLICY, purge_personal_data, purge_sessions
 from .admin_core import patch_row
 from ..schemas import (AnnouncementDraftIn, AnnouncementIn, AnnouncementPatch, GenericExportIn, MembershipIn,
-                       MembershipPatch, PublishAnnouncementIn, SurveyIn, SurveyPatch, TicketIn, TicketPatch,
-                       TicketTransitionIn)
+                       MembershipPatch, PrivacyRequestPatch, PublishAnnouncementIn, SurveyIn, SurveyPatch,
+                       TicketIn, TicketPatch, TicketTransitionIn)
 from ..security import hash_password
 
 
@@ -296,9 +297,13 @@ def patch_membership(organization_id: str, membership_id: str, body: MembershipP
     if membership_id == str(user["membership_id"]) and (body.role is not None or body.status is not None):
         raise bad_request("SELF_ROLE_CHANGE_DENIED", "본인 소속의 역할과 상태는 다른 최고 관리자가 변경해야 합니다.")
     before = found(one(connection, "SELECT * FROM memberships WHERE id=%s AND organization_id=%s", (membership_id, organization_id)))
-    row = found(one(connection, """UPDATE memberships SET role=coalesce(%s,role),festival_scope=coalesce(%s,festival_scope),status=coalesce(%s,status)
-        WHERE id=%s AND organization_id=%s RETURNING *""",
-        (body.role, jsonb(body.festival_scope) if body.festival_scope is not None else None, body.status, membership_id, organization_id)))
+    # deactivated_at은 상인 계정 보유기간(비활성화 후 1년, OPS-11)의 기준점이라 상태와 함께 남긴다.
+    row = found(one(connection, """UPDATE memberships SET role=coalesce(%(role)s,role),
+        festival_scope=coalesce(%(scope)s,festival_scope),status=coalesce(%(status)s,status),
+        deactivated_at=CASE WHEN coalesce(%(status)s,status)='INACTIVE' THEN coalesce(deactivated_at,now()) END
+        WHERE id=%(membership_id)s AND organization_id=%(organization_id)s RETURNING *""",
+        {"role": body.role, "scope": jsonb(body.festival_scope) if body.festival_scope is not None else None,
+         "status": body.status, "membership_id": membership_id, "organization_id": organization_id}))
     audit(connection, festival_id=None, actor_id=str(user["id"]), action="UPDATE", resource_type="MEMBERSHIP",
           resource_id=membership_id, before_data=before, after_data=row, request_id=request.state.request_id)
     return success(request, row)
@@ -310,7 +315,8 @@ def deactivate_membership(organization_id: str, membership_id: str, request: Req
     if membership_id == str(user["membership_id"]):
         raise bad_request("SELF_DEACTIVATION_DENIED", "현재 소속은 비활성화할 수 없습니다.")
     before = found(one(connection, "SELECT * FROM memberships WHERE id=%s AND organization_id=%s", (membership_id, organization_id)))
-    connection.execute("UPDATE memberships SET status='INACTIVE' WHERE id=%s AND organization_id=%s", (membership_id, organization_id))
+    connection.execute("UPDATE memberships SET status='INACTIVE',deactivated_at=coalesce(deactivated_at,now()) WHERE id=%s AND organization_id=%s",
+                       (membership_id, organization_id))
     # 계정 권한을 끊는 일이 감사 로그에 안 남아서, 누가 누구를 언제 비활성화했는지 추적되지 않았다.
     audit(connection, festival_id=None, actor_id=str(user["id"]), action="DEACTIVATE", resource_type="MEMBERSHIP",
           resource_id=membership_id, before_data=before, after_data={"status": "INACTIVE"},
@@ -379,6 +385,127 @@ def create_export(festival_id: str, body: GenericExportIn, request: Request, _: 
     audit(connection, festival_id=festival_id, actor_id=str(user["id"]), action="EXPORT", resource_type=body.resource_type,
           resource_id=str(row["id"]), after_data={"format": body.format, "rowCount": len(rows)}, request_id=request.state.request_id)
     return success(request, {"jobId": row["id"], "status": row["status"], "rowCount": len(rows)})
+
+
+SESSION_DATA_SUMMARY = """SELECT
+    (SELECT count(*) FROM bookings WHERE visitor_session_id=%(session_id)s)::int AS bookings,
+    (SELECT count(*) FROM coupon_issues WHERE visitor_session_id=%(session_id)s)::int AS coupon_issues,
+    (SELECT count(*) FROM reward_events WHERE visitor_session_id=%(session_id)s)::int AS reward_events,
+    (SELECT coalesce(sum(points_delta),0)::int FROM point_ledger WHERE visitor_session_id=%(session_id)s) AS points,
+    (SELECT count(*) FROM course_plans WHERE visitor_session_id=%(session_id)s)::int AS course_plans,
+    (SELECT count(*) FROM ai_messages m JOIN ai_conversations c ON c.id=m.conversation_id
+       WHERE c.visitor_session_id=%(session_id)s)::int AS ai_messages"""
+
+# 익명 처리되어 정보주체를 특정할 수 없는 항목. 열람·삭제 요구 대상에서 제외하고 그 사실을 함께 알린다.
+PRIVACY_EXCLUDED = ["설문 응답(VIS-10) — 제출 이후 응답자를 특정할 수 없어 보유기간 경과 시 일괄 파기만 적용합니다."]
+
+
+@router.get("/admin/festivals/{festival_id}/privacy/policy")
+def privacy_policy(festival_id: str, request: Request, _: Scope, user: Manager, connection: Db):
+    """OPS-11 항목별 보유기간 정책표와 동의 항목. 방문객 화면과 같은 정의를 쓴다."""
+    last_purge = one(connection, """SELECT created_at,after_data FROM audit_logs
+        WHERE action='PURGE' AND resource_type='PERSONAL_DATA' ORDER BY created_at DESC LIMIT 1""")
+    return success(request, {"retentionPolicy": RETENTION_POLICY, "consentItems": CONSENT_ITEMS,
+                             "purgeSchedule": "매일 1회 배치", "lastPurge": last_purge})
+
+
+@router.get("/admin/festivals/{festival_id}/privacy/requests")
+def privacy_requests(festival_id: str, request: Request, _: Scope, user: Manager, connection: Db, status: str | None = None):
+    return success(request, all_rows(connection, """SELECT pr.*,u.name AS handler_name FROM privacy_requests pr
+        LEFT JOIN users u ON u.id=pr.handled_by WHERE pr.festival_id=%(festival_id)s
+        AND (%(status)s::text IS NULL OR pr.status=%(status)s) ORDER BY pr.created_at DESC LIMIT 200""",
+        {"festival_id": festival_id, "status": status}))
+
+
+@router.post("/admin/festivals/{festival_id}/privacy/requests/{privacy_request_id}/handle")
+def handle_privacy_request(festival_id: str, privacy_request_id: str, body: PrivacyRequestPatch, request: Request,
+                           _: Scope, user: Manager, connection: Db):
+    """열람·삭제 요구 처리.
+
+    삭제를 완료하면 해당 방문 세션의 데이터를 참조 데이터까지 연쇄 파기한다. 요구 자체는
+    이력으로 남아야 하므로, 세션을 지우기 전에 요구와의 연결을 끊고 결과 요약만 남긴다.
+    """
+    before = found(one(connection, "SELECT * FROM privacy_requests WHERE id=%s AND festival_id=%s FOR UPDATE",
+                       (privacy_request_id, festival_id)))
+    if before["status"] in ("COMPLETED", "REJECTED"):
+        raise bad_request("INVALID_STATE_TRANSITION", "이미 종결된 요구입니다.")
+    result = None
+    if body.status == "COMPLETED":
+        if not before["visitor_session_id"]:
+            raise bad_request("SUBJECT_NOT_IDENTIFIABLE", "식별자가 없어 대상 데이터를 특정할 수 없습니다.")
+        summary = one(connection, SESSION_DATA_SUMMARY, {"session_id": before["visitor_session_id"]})
+        result = {"collected": summary, "excluded": PRIVACY_EXCLUDED}
+        if before["request_type"] == "DELETE":
+            # 요구 자체는 이력으로 남아야 하므로 연결을 먼저 끊는다(privacy_requests도 세션의 자식이다).
+            connection.execute("UPDATE privacy_requests SET visitor_session_id=NULL WHERE id=%s", (privacy_request_id,))
+            result["deletedRows"] = purge_sessions(connection, "id=%s", (before["visitor_session_id"],))
+    row = one(connection, """UPDATE privacy_requests SET status=%s,detail=coalesce(%s,detail),result=%s,
+        handled_by=%s,handled_at=now(),updated_at=now() WHERE id=%s RETURNING *""",
+        (body.status, body.note, jsonb(result) if result else None, user["id"], privacy_request_id))
+    audit(connection, festival_id=festival_id, actor_id=str(user["id"]), action=body.status,
+          resource_type="PRIVACY_REQUEST", resource_id=privacy_request_id, before_data=before, after_data=row,
+          request_id=request.state.request_id)
+    return success(request, row)
+
+
+@router.post("/admin/festivals/{festival_id}/privacy/purge")
+def run_privacy_purge(festival_id: str, request: Request, _: Scope, user: SuperAdmin, connection: Db):
+    """정책표에 따른 파기를 즉시 실행한다. 평상시에는 잡 워커가 매일 1회 같은 함수를 돌린다."""
+    counts = purge_personal_data(connection)
+    audit(connection, festival_id=festival_id, actor_id=str(user["id"]), action="PURGE_MANUAL",
+          resource_type="PERSONAL_DATA", resource_id=None, after_data=counts, request_id=request.state.request_id)
+    return success(request, {"purged": counts, "policy": RETENTION_POLICY})
+
+
+@router.get("/admin/festivals/{festival_id}/visitor-identity")
+def visitor_identity(festival_id: str, request: Request, _: Scope, user: Manager, connection: Db):
+    """VIS-11 식별자 재발급과 한도 우회 의심 패턴.
+
+    같은 기기 버킷에서 식별자가 두 번 이상 발급되면 저장소 초기화·기기 변경으로 1인당
+    한도가 초기화됐을 수 있다. 발급 횟수와 그 세션들의 쿠폰·리워드·예약 건수를 함께 보여
+    운영자가 부정 패턴을 판단할 수 있게 한다.
+    """
+    rows = all_rows(connection, """WITH buckets AS (
+          SELECT device_key,array_agg(visitor_session_id) AS session_ids,count(*)::int AS session_count,
+                 min(created_at) AS first_at,max(created_at) AS last_at
+          FROM visitor_identity_events WHERE festival_id=%s GROUP BY device_key HAVING count(*)>1
+        )
+        SELECT left(b.device_key,8) AS device_key,b.session_count,b.first_at,b.last_at,
+          (SELECT count(*) FROM coupon_issues ci WHERE ci.visitor_session_id=ANY(b.session_ids))::int AS coupon_issues,
+          (SELECT count(*) FROM reward_events re WHERE re.visitor_session_id=ANY(b.session_ids))::int AS reward_events,
+          (SELECT count(*) FROM bookings bk WHERE bk.visitor_session_id=ANY(b.session_ids))::int AS bookings
+        FROM buckets b ORDER BY b.session_count DESC,b.last_at DESC LIMIT 100""", (festival_id,))
+    totals = one(connection, """SELECT count(*)::int AS issuances,
+        count(*) FILTER(WHERE event_type='REISSUED')::int AS reissues,
+        count(DISTINCT device_key)::int AS devices FROM visitor_identity_events WHERE festival_id=%s""", (festival_id,))
+    return success(request, {"totals": totals, "suspects": rows})
+
+
+@router.get("/admin/festivals/{festival_id}/notification-deliveries")
+def notification_deliveries(festival_id: str, request: Request, _: Scope, user: Operator, connection: Db):
+    """OPS-10 발송 이력과 세션별 노출 확인 결과.
+
+    웹 폴링이 유일한 채널이라 '도달'은 해당 화면을 열어 둔 세션의 폴링 응답에 실렸는지로만
+    확인된다. 백그라운드·종료 세션은 도달 보장 범위 밖이므로 노출 세션 수만 사실대로 센다.
+    """
+    announcements = all_rows(connection, """SELECT a.id,a.title,a.severity,a.target_area_ids,a.starts_at,a.status,
+        count(nd.id)::int AS delivered_sessions,min(nd.delivered_at) AS first_delivered_at,max(nd.delivered_at) AS last_delivered_at,
+        round(extract(epoch FROM min(nd.delivered_at)-a.starts_at))::int AS first_delivery_lag_seconds
+        FROM announcements a LEFT JOIN notification_deliveries nd
+          ON nd.resource_type='ANNOUNCEMENT' AND nd.resource_id=a.id
+        WHERE a.festival_id=%s AND a.status<>'DRAFT' GROUP BY a.id ORDER BY a.starts_at DESC NULLS LAST LIMIT 100""",
+        (festival_id,))
+    calls = one(connection, """SELECT count(*) FILTER(WHERE b.status='CALLED')::int AS called,
+        count(nd.id)::int AS delivered,
+        round(avg(extract(epoch FROM nd.delivered_at-b.called_at)))::int AS avg_lag_seconds
+        FROM bookings b LEFT JOIN notification_deliveries nd
+          ON nd.resource_type='BOOKING_CALL' AND nd.resource_id=b.id
+        WHERE b.festival_id=%s AND b.called_at IS NOT NULL""", (festival_id,))
+    return success(request, {
+        "announcements": announcements, "bookingCalls": calls,
+        "channel": {"type": "WEB_POLL", "announcementPollSeconds": 30, "bookingPollSeconds": 10,
+                    "limitation": "웹 폴링은 화면이 열려 있는 세션에만 도달합니다. 백그라운드·종료 세션은 도달 보장 범위에서 제외되므로 긴급 상황은 현장 방송 등 오프라인 수단을 병행해야 합니다."},
+    })
 
 
 @router.get("/jobs/{job_id}")

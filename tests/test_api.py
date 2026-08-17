@@ -730,3 +730,232 @@ def test_ticket_list_is_paginated(client, festival, manager):
             f"/api/v1/admin/festivals/{festival['id']}/ops-tickets?limit=1&cursor={body['page']['nextCursor']}",
             headers=manager))
         assert following and following[0]["id"] != body["data"][0]["id"]
+
+
+# --- 기능 명세서 잔여 항목(VIS-11·VIS-12·OPS-10·OPS-11·BIZ-04·BIZ-05) -----------
+
+def active_areas(connection, festival, limit: int = 1):
+    return connection.execute("""SELECT id FROM festival_areas WHERE festival_id=%s AND status='ACTIVE'
+        ORDER BY created_at LIMIT %s""", (festival["id"], limit)).fetchall()
+
+
+def area_id(connection, festival):
+    return str(active_areas(connection, festival)[0]["id"])
+
+
+def test_visitor_area_is_set_by_qr_and_manual_choice(client, festival, visitor, connection):
+    """VIS-12: 구역 판정은 진입 QR 지점과 수동 선택만 쓴다."""
+    target = area_id(connection, festival)
+    assert data(client.get("/api/v1/visitor-sessions/current/area", headers=visitor))["areaId"] is None
+    updated = data(client.put("/api/v1/visitor-sessions/current/area", headers=visitor,
+                              json={"areaId": target, "source": "MANUAL"}))
+    assert str(updated["areaId"]) == target and updated["areaSource"] == "MANUAL" and updated["areaName"]
+    cleared = data(client.put("/api/v1/visitor-sessions/current/area", headers=visitor, json={"areaId": None}))
+    assert cleared["areaId"] is None
+
+
+def test_visitor_session_takes_area_from_entry_qr(client, festival, connection):
+    target = area_id(connection, festival)
+    created = data(client.post(f"/api/v1/public/festivals/{festival['code']}/visitor-sessions",
+                               json={"language": "ko", "areaId": target}))
+    assert str(created["areaId"]) == target
+    area = data(client.get("/api/v1/visitor-sessions/current/area",
+                           headers={"Authorization": f"Bearer {created['sessionToken']}"}))
+    assert area["areaSource"] == "QR"
+
+
+def test_area_targeted_announcement_reaches_only_that_area(client, festival, manager, visitor, connection):
+    """VIS-07: 구역 대상 공지는 해당 구역 세션에만, 미판정 세션에는 전체 공지만 노출된다."""
+    areas = active_areas(connection, festival, 2)
+    targeted = data(client.post(f"/api/v1/admin/festivals/{festival['id']}/announcements/publish", headers=manager,
+                                json={"title": "체험존 대기 안내", "body": "대기가 길어지고 있습니다.", "severity": "INFO",
+                                      "audience": ["VISITOR"], "targetAreaIds": [str(areas[0]["id"])],
+                                      "startsAt": "2020-01-01T00:00:00Z"}))
+    # 미판정 세션에는 구역 대상 공지가 보이지 않는다.
+    unassigned = data(client.get("/api/v1/visitor/announcements", headers=visitor))
+    assert not any(row["id"] == targeted["id"] for row in unassigned["items"])
+
+    client.put("/api/v1/visitor-sessions/current/area", headers=visitor,
+               json={"areaId": str(areas[0]["id"]), "source": "MANUAL"})
+    assigned = data(client.get("/api/v1/visitor/announcements", headers=visitor))
+    assert any(row["id"] == targeted["id"] for row in assigned["items"])
+
+    if len(areas) > 1:
+        client.put("/api/v1/visitor-sessions/current/area", headers=visitor,
+                   json={"areaId": str(areas[1]["id"]), "source": "MANUAL"})
+        other = data(client.get("/api/v1/visitor/announcements", headers=visitor))
+        assert not any(row["id"] == targeted["id"] for row in other["items"])
+
+
+def test_emergency_announcement_reaches_undetermined_area(client, festival, manager, visitor, connection):
+    """안전 공지는 구역 판정 여부와 무관하게 전달한다(VIS-12 규칙)."""
+    target = area_id(connection, festival)
+    urgent = data(client.post(f"/api/v1/admin/festivals/{festival['id']}/announcements/publish", headers=manager,
+                              json={"title": "긴급 대피 안내", "body": "강풍으로 야외 구역을 폐쇄합니다.", "severity": "EMERGENCY",
+                                    "audience": ["VISITOR"], "targetAreaIds": [target],
+                                    "startsAt": "2020-01-01T00:00:00Z"}))
+    items = data(client.get("/api/v1/visitor/announcements", headers=visitor))["items"]
+    assert items[0]["severity"] == "EMERGENCY" and any(row["id"] == urgent["id"] for row in items)
+
+
+def test_announcement_delivery_is_recorded_per_session(client, festival, manager, visitor):
+    """OPS-10: 웹 폴링 응답에 실린 공지를 세션별로 남겨 도달 결과를 운영자가 조회한다."""
+    published = data(client.post(f"/api/v1/admin/festivals/{festival['id']}/announcements/publish", headers=manager,
+                                 json={"title": "도달 확인용 공지", "body": "본문", "severity": "INFO",
+                                       "audience": ["VISITOR"], "startsAt": "2020-01-01T00:00:00Z"}))
+    body = data(client.get("/api/v1/visitor/announcements", headers=visitor))
+    assert body["channel"]["type"] == "WEB_POLL" and body["channel"]["limitation"]
+    # 같은 세션이 여러 번 폴링해도 노출 세션 수는 한 번만 센다.
+    client.get("/api/v1/visitor/announcements", headers=visitor)
+    report = data(client.get(f"/api/v1/admin/festivals/{festival['id']}/notification-deliveries", headers=manager))
+    row = next(item for item in report["announcements"] if item["id"] == published["id"])
+    assert row["deliveredSessions"] == 1 and row["firstDeliveredAt"]
+
+
+def test_identifier_reissue_is_recorded_for_operator_review(client, festival, manager):
+    """VIS-11: 저장소 초기화·기기 변경으로 식별자가 다시 발급되면 재발급으로 기록된다."""
+    first = data(client.post(f"/api/v1/public/festivals/{festival['code']}/visitor-sessions", json={"language": "ko"}))
+    second = data(client.post(f"/api/v1/public/festivals/{festival['code']}/visitor-sessions", json={"language": "ko"}))
+    assert second["identity"]["eventType"] == "REISSUED"
+    assert second["identity"]["priorSessionCount"] >= first["identity"]["priorSessionCount"] + 1
+    review = data(client.get(f"/api/v1/admin/festivals/{festival['id']}/visitor-identity", headers=manager))
+    assert review["totals"]["reissues"] >= 1 and review["suspects"]
+    assert all(len(row["deviceKey"]) == 8 for row in review["suspects"])
+
+
+def test_visitor_privacy_consent_withdrawal_purges_ai_log(client, festival, visitor):
+    """OPS-11: 철회가 저장만 되고 기록이 남으면 철회가 아니다."""
+    notice = data(client.get("/api/v1/visitor/privacy", headers=visitor))
+    assert {item["key"] for item in notice["items"]} >= {"identifier", "location", "aiLog", "survey"}
+    assert any(item["retention"] for item in notice["retentionPolicy"])
+
+    conversation = data(client.post("/api/v1/visitor/ai/conversations", headers=visitor, json={"language": "ko"}))
+    client.post(f"/api/v1/visitor/ai/conversations/{conversation['id']}/messages", headers=visitor,
+                json={"message": "행사 일정 알려줘"})
+    withdrawn = data(client.patch("/api/v1/visitor/privacy/consents", headers=visitor, json={"consents": {"aiLog": False}}))
+    assert withdrawn["consents"]["aiLog"] is False and withdrawn["purged"]["aiLog"] == 1
+    assert error_code(client.get(f"/api/v1/visitor/ai/conversations/{conversation['id']}/messages", headers=visitor), 404) == "RESOURCE_NOT_FOUND"
+
+
+def test_essential_consent_cannot_be_withdrawn(client, visitor):
+    response = client.patch("/api/v1/visitor/privacy/consents", headers=visitor, json={"consents": {"identifier": False}})
+    assert error_code(response, 400) == "CONSENT_REQUIRED"
+    unknown = client.patch("/api/v1/visitor/privacy/consents", headers=visitor, json={"consents": {"nope": True}})
+    assert error_code(unknown, 400) == "UNKNOWN_CONSENT_ITEM"
+
+
+def test_privacy_delete_request_is_tracked_and_cascades(client, festival, manager, visitor, session_id, unique):
+    """OPS-11: 접수부터 완료까지 이력이 남고, 완료 시 참조 데이터까지 연쇄 파기된다."""
+    booking = client.post(f"/api/v1/visitor/program-sessions/{session_id}/bookings",
+                          headers={**visitor, "Idempotency-Key": unique("privacy-booking")}, json={"partySize": 1})
+    assert booking.status_code == 201, booking.text
+
+    created = data(client.post("/api/v1/visitor/privacy/requests", headers=visitor,
+                               json={"requestType": "DELETE", "detail": "모든 기록을 지워 주세요."}))
+    assert created["status"] == "RECEIVED" and created["excluded"]
+    assert error_code(client.post("/api/v1/visitor/privacy/requests", headers=visitor,
+                                  json={"requestType": "DELETE"}), 409) == "DUPLICATE_ACTION"
+
+    listed = data(client.get(f"/api/v1/admin/festivals/{festival['id']}/privacy/requests", headers=manager))
+    assert any(row["id"] == created["id"] for row in listed)
+    handled = data(client.post(f"/api/v1/admin/festivals/{festival['id']}/privacy/requests/{created['id']}/handle",
+                               headers=manager, json={"status": "COMPLETED", "note": "파기 완료"}))
+    assert handled["status"] == "COMPLETED" and handled["result"]["collected"]["bookings"] == 1
+    assert handled["result"]["deletedRows"] == 1 and handled["handledAt"]
+    # 세션이 파기됐으므로 같은 토큰은 더 이상 쓸 수 없다.
+    assert client.get("/api/v1/visitor/bookings", headers=visitor).status_code == 401
+
+
+def test_privacy_policy_exposes_retention_table(client, festival, manager):
+    policy = data(client.get(f"/api/v1/admin/festivals/{festival['id']}/privacy/policy", headers=manager))
+    keys = {row["key"] for row in policy["retentionPolicy"]}
+    assert {"VISITOR_SESSION", "AI_LOG", "SURVEY_RESPONSE", "AUDIT_LOG"} <= keys
+    assert policy["purgeSchedule"]
+
+
+def test_manual_purge_is_super_admin_only(client, festival, manager, admin):
+    assert error_code(client.post(f"/api/v1/admin/festivals/{festival['id']}/privacy/purge", headers=manager), 403) == "FORBIDDEN"
+    result = data(client.post(f"/api/v1/admin/festivals/{festival['id']}/privacy/purge", headers=admin))
+    assert "VISITOR_SESSION" in result["purged"] and result["policy"]
+
+
+def test_merchant_invitation_issues_account_scoped_to_one_business(client, festival, manager, unique):
+    """BIZ-05: 계정은 업체를 지정한 초대 링크로만 발급되고, 본인 업체에만 접근한다."""
+    business = data(client.post(f"/api/v1/admin/festivals/{festival['id']}/businesses", headers=manager, json={
+        "registrationNo": unique("REG"), "name": unique("초대업체"), "category": "FOOD"}))
+    base = f"/api/v1/admin/festivals/{festival['id']}/businesses/{business['id']}/invitations"
+    invitation = data(client.post(base, headers=manager, json={"email": f"{unique('merchant')}@example.com", "name": "김상인"}))
+    assert invitation["inviteToken"].startswith("mi_") and invitation["expiresInHours"] == 72
+
+    preview = data(client.post("/api/v1/auth/merchant-invitations/lookup", json={"token": invitation["inviteToken"]}))
+    assert preview["email"] == invitation["email"] and preview["hasAccount"] is False
+
+    accepted = data(client.post("/api/v1/auth/merchant-invitations/accept",
+                                json={"token": invitation["inviteToken"], "password": "ChangeMe123!", "name": "김상인"}))
+    assert accepted["user"]["role"] == "MERCHANT"
+    headers = {"Authorization": f"Bearer {accepted['accessToken']}"}
+    mine = data(client.get("/api/v1/merchant/businesses", headers=headers))
+    assert [row["id"] for row in mine] == [business["id"]]
+    # 같은 링크는 두 번 쓸 수 없다.
+    assert error_code(client.post("/api/v1/auth/merchant-invitations/accept",
+                                  json={"token": invitation["inviteToken"], "password": "ChangeMe123!"}), 410) == "INVITATION_INVALID"
+
+    listed = data(client.get(base, headers=manager))
+    assert listed["owner"]["email"] == invitation["email"]
+    assert next(row for row in listed["invitations"] if row["id"] == invitation["id"])["status"] == "ACCEPTED"
+
+
+def test_revoked_and_expired_invitations_are_rejected(client, festival, manager, connection, unique):
+    business = data(client.post(f"/api/v1/admin/festivals/{festival['id']}/businesses", headers=manager, json={
+        "registrationNo": unique("REG"), "name": unique("회수업체"), "category": "FOOD"}))
+    base = f"/api/v1/admin/festivals/{festival['id']}/businesses/{business['id']}/invitations"
+    revoked = data(client.post(base, headers=manager, json={"email": f"{unique('m')}@example.com", "name": "회수"}))
+    data(client.post(f"{base}/{revoked['id']}/revoke", headers=manager))
+    assert error_code(client.post("/api/v1/auth/merchant-invitations/accept",
+                                  json={"token": revoked["inviteToken"], "password": "ChangeMe123!"}), 410) == "INVITATION_INVALID"
+
+    expired = data(client.post(base, headers=manager, json={"email": f"{unique('m')}@example.com", "name": "만료"}))
+    connection.execute("UPDATE merchant_invitations SET expires_at=now()-interval '1 hour' WHERE id=%s", (expired["id"],))
+    assert error_code(client.post("/api/v1/auth/merchant-invitations/accept",
+                                  json={"token": expired["inviteToken"], "password": "ChangeMe123!"}), 410) == "INVITATION_INVALID"
+
+
+def test_merchant_deactivation_unlinks_business(client, festival, manager, admin, unique):
+    business = data(client.post(f"/api/v1/admin/festivals/{festival['id']}/businesses", headers=manager, json={
+        "registrationNo": unique("REG"), "name": unique("해지업체"), "category": "FOOD"}))
+    base = f"/api/v1/admin/festivals/{festival['id']}/businesses/{business['id']}/invitations"
+    invitation = data(client.post(base, headers=manager, json={"email": f"{unique('m')}@example.com", "name": "해지"}))
+    accepted = data(client.post("/api/v1/auth/merchant-invitations/accept",
+                                json={"token": invitation["inviteToken"], "password": "ChangeMe123!"}))
+    headers = {"Authorization": f"Bearer {accepted['accessToken']}"}
+    assert client.get("/api/v1/merchant/businesses", headers=headers).status_code == 200
+
+    dropped = client.delete(f"/api/v1/admin/festivals/{festival['id']}/businesses/{business['id']}/merchant", headers=manager)
+    assert dropped.status_code == 204, dropped.text
+    # 비활성화된 소속으로는 더 이상 인증되지 않는다.
+    assert client.get("/api/v1/merchant/businesses", headers=headers).status_code == 401
+    assert error_code(client.post("/api/v1/auth/login", json={"email": invitation["email"], "password": "ChangeMe123!"}), 401)
+
+
+def test_business_performance_hides_comparison_for_small_samples(client, festival, manager):
+    """BIZ-04: 표본이 5곳 미만이면 비교 통계로 개별 업체 실적이 역산된다."""
+    report = data(client.get(f"/api/v1/admin/festivals/{festival['id']}/business-performance", headers=manager))
+    assert report["minComparisonSample"] == 5
+    if report["totals"]["businesses"] < 5:
+        assert report["comparison"] is None and report["comparisonSuppressed"] is True
+    else:
+        assert report["comparison"] and report["comparisonSuppressed"] is False
+    assert all(row["salesAmount"] is None for row in report["items"] if not row["salesConsent"])
+
+
+def test_sales_are_only_aggregated_with_business_consent(client, festival, manager, reviewer, unique):
+    business = data(client.post(f"/api/v1/admin/festivals/{festival['id']}/businesses", headers=manager, json={
+        "registrationNo": unique("REG"), "name": unique("매출업체"), "category": "FOOD"}))
+    business = data(client.post(f"/api/v1/admin/festivals/{festival['id']}/businesses/{business['id']}/review",
+                                headers=reviewer, json={"decision": "APPROVED"}))
+    updated = data(client.patch(f"/api/v1/admin/festivals/{festival['id']}/businesses/{business['id']}",
+                                headers={**manager, "If-Match": str(business["version"])}, json={"salesConsent": True}))
+    assert updated["salesConsent"] is True
+    report = data(client.get(f"/api/v1/admin/festivals/{festival['id']}/business-performance", headers=manager))
+    row = next(item for item in report["items"] if item["id"] == business["id"])
+    assert row["salesAmount"] is not None

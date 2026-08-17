@@ -10,6 +10,7 @@ from ..deps import Db
 from ..domain import safety_facility_order, supported_language
 from ..errors import found
 from ..http import success
+from ..privacy import record_identity
 from ..schemas import VisitorSessionIn
 from ..security import hash_token, random_token
 
@@ -206,10 +207,20 @@ def create_visitor_session(festival_code: str, body: VisitorSessionIn, request: 
     token = random_token("vs")
     expires_at = datetime.now(UTC) + timedelta(hours=settings.visitor_session_hours)
     language = visitor_language(festival, body.language, request)
-    row = one(connection, """INSERT INTO visitor_sessions(festival_id,anonymous_token_hash,language,accessibility_preferences,consents,expires_at)
-        VALUES(%s,%s,%s,%s,%s,%s) RETURNING id""", (festival["id"], hash_token(token), language, jsonb(body.accessibility_preferences), jsonb(body.consents), expires_at))
+    # VIS-12: 진입 QR에 실린 구역만 자동 설정한다. 다른 축제의 구역이면 미판정으로 둔다.
+    area_id = body.area_id if body.area_id and one(
+        connection, "SELECT 1 FROM festival_areas WHERE id=%s AND festival_id=%s AND status='ACTIVE'",
+        (body.area_id, festival["id"])) else None
+    row = one(connection, """INSERT INTO visitor_sessions(festival_id,anonymous_token_hash,language,accessibility_preferences,
+        consents,expires_at,current_area_id,area_source,area_assigned_at)
+        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,CASE WHEN %s::uuid IS NULL THEN NULL ELSE now() END) RETURNING id""",
+        (festival["id"], hash_token(token), language, jsonb(body.accessibility_preferences), jsonb(body.consents),
+         expires_at, area_id, "QR" if area_id else None, area_id))
+    # VIS-11: 같은 기기 버킷에서 식별자가 다시 발급되면 1인당 한도가 초기화되므로 이력을 남긴다.
+    identity = record_identity(connection, festival["id"], row["id"], request)
     return success(request, {"id": row["id"], "sessionToken": token, "expiresAt": expires_at, "language": language,
-                             "accessibilityPreferences": body.accessibility_preferences,
+                             "accessibilityPreferences": body.accessibility_preferences, "areaId": area_id,
+                             "identity": identity,
                              "festival": {"code": festival["code"], "timezone": festival["timezone"], "supportedLanguages": festival["supported_languages"]}})
 
 

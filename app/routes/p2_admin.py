@@ -11,9 +11,9 @@ from ..errors import bad_request, conflict, found
 from ..http import decode_cursor, paged, success
 from .admin_core import patch_row
 from ..schemas import (BookingStatusIn, BusinessIn, CouponIn, CouponRedeemIn, CrowdSnapshotIn, FestivalBusinessPatch,
-                       InternalDocumentIn, InternalDocumentPatch, InternalSearchIn, IssueAnalysisPatch, ReviewIn,
-                       RewardActionIn, RewardCampaignIn, StaffAssignmentIn)
-from ..security import hash_token
+                       InternalDocumentIn, InternalDocumentPatch, InternalSearchIn, IssueAnalysisPatch,
+                       MerchantInviteIn, ReviewIn, RewardActionIn, RewardCampaignIn, StaffAssignmentIn)
+from ..security import hash_token, random_token
 
 
 router = APIRouter()
@@ -179,6 +179,125 @@ def review_business(festival_id: str, business_id: str, body: ReviewIn, request:
     audit(connection, festival_id=festival_id, actor_id=str(user["id"]), action=body.decision, resource_type="FESTIVAL_BUSINESS",
           resource_id=business_id, after_data=row, request_id=request.state.request_id)
     return success(request, row)
+
+
+# BIZ-05 초대 링크 만료. 기획에서 72시간으로 확정했다.
+INVITATION_HOURS = 72
+
+
+@router.get("/admin/festivals/{festival_id}/businesses/{business_id}/invitations")
+def merchant_invitations(festival_id: str, business_id: str, request: Request, _: Scope, user: Manager, connection: Db):
+    """업체에 발급한 상인 계정 초대와 현재 연결된 계정."""
+    found(one(connection, "SELECT 1 FROM festival_businesses WHERE id=%s AND festival_id=%s", (business_id, festival_id)))
+    rows = all_rows(connection, """SELECT mi.id,mi.email,mi.status,mi.expires_at,mi.accepted_at,mi.created_at,
+        (mi.status='PENDING' AND mi.expires_at<=now()) AS expired,u.name AS accepted_name
+        FROM merchant_invitations mi LEFT JOIN memberships m ON m.id=mi.membership_id LEFT JOIN users u ON u.id=m.user_id
+        WHERE mi.festival_business_id=%s ORDER BY mi.created_at DESC""", (business_id,))
+    owner = one(connection, """SELECT m.id AS membership_id,m.status,u.name,u.email FROM festival_businesses fb
+        JOIN memberships m ON m.id=fb.owner_membership_id JOIN users u ON u.id=m.user_id WHERE fb.id=%s""", (business_id,))
+    return success(request, {"invitations": rows, "owner": owner})
+
+
+@router.post("/admin/festivals/{festival_id}/businesses/{business_id}/invitations", status_code=201)
+def create_merchant_invitation(festival_id: str, business_id: str, body: MerchantInviteIn, request: Request,
+                               _: Scope, user: Manager, connection: Db):
+    """상인 계정 초대 발급.
+
+    계정은 이 링크로만 만들어진다(자율 가입 없음). 사업자 증빙은 BIZ-01 업체 승인 절차에서
+    이미 확인하므로 여기서 다시 검증하지 않는다. 토큰 원문은 응답으로 한 번만 나가고
+    서버에는 해시만 남는다 — 유출된 DB로 초대를 수락할 수 없게.
+    """
+    found(one(connection, "SELECT 1 FROM festival_businesses WHERE id=%s AND festival_id=%s", (business_id, festival_id)),
+          "참여업체를 찾을 수 없습니다.")
+    token = random_token("mi")
+    row = one(connection, """INSERT INTO merchant_invitations(festival_business_id,email,token_hash,invited_by,expires_at)
+        VALUES(%s,%s,%s,%s,now()+make_interval(hours => %s)) RETURNING id,email,status,expires_at,created_at""",
+        (business_id, str(body.email).lower(), hash_token(token), user["id"], INVITATION_HOURS))
+    # 초대받는 사람의 표시 이름은 수락 시점에 계정이 없을 때만 쓰이므로 초대 행에 두지 않고 링크에 싣는다.
+    audit(connection, festival_id=festival_id, actor_id=str(user["id"]), action="INVITE", resource_type="MERCHANT_ACCOUNT",
+          resource_id=str(row["id"]), after_data={"email": row["email"], "businessId": business_id},
+          request_id=request.state.request_id)
+    return success(request, {**row, "inviteToken": token, "name": body.name, "expiresInHours": INVITATION_HOURS})
+
+
+@router.post("/admin/festivals/{festival_id}/businesses/{business_id}/invitations/{invitation_id}/revoke")
+def revoke_merchant_invitation(festival_id: str, business_id: str, invitation_id: str, request: Request,
+                               _: Scope, user: Manager, connection: Db):
+    row = one(connection, """UPDATE merchant_invitations mi SET status='REVOKED' FROM festival_businesses fb
+        WHERE mi.id=%s AND mi.festival_business_id=fb.id AND fb.id=%s AND fb.festival_id=%s AND mi.status='PENDING'
+        RETURNING mi.id,mi.email,mi.status""", (invitation_id, business_id, festival_id))
+    if not row:
+        raise bad_request("INVALID_STATE_TRANSITION", "대기 중인 초대만 회수할 수 있습니다.")
+    audit(connection, festival_id=festival_id, actor_id=str(user["id"]), action="REVOKE", resource_type="MERCHANT_ACCOUNT",
+          resource_id=invitation_id, after_data=row, request_id=request.state.request_id)
+    return success(request, row)
+
+
+@router.delete("/admin/festivals/{festival_id}/businesses/{business_id}/merchant", status_code=204)
+def deactivate_business_merchant(festival_id: str, business_id: str, request: Request, _: Scope, user: Manager,
+                                 connection: Db) -> Response:
+    """업체와 연결된 상인 계정을 비활성화한다(축제 종료 후 정리).
+
+    계정을 지우지 않고 비활성화만 한다 — 보유기간(비활성화 후 1년)이 지나면 OPS-11 파기
+    배치가 개인정보를 지운다. 업체 연결도 끊어 이후 본인 확인이 성립하지 않게 한다.
+    """
+    business = found(one(connection, """SELECT owner_membership_id FROM festival_businesses
+        WHERE id=%s AND festival_id=%s""", (business_id, festival_id)))
+    if not business["owner_membership_id"]:
+        raise bad_request("MERCHANT_NOT_LINKED", "이 업체에 연결된 상인 계정이 없습니다.")
+    connection.execute("""UPDATE memberships SET status='INACTIVE',deactivated_at=coalesce(deactivated_at,now())
+        WHERE id=%s AND role='MERCHANT'""", (business["owner_membership_id"],))
+    connection.execute("UPDATE festival_businesses SET owner_membership_id=NULL,updated_at=now() WHERE id=%s", (business_id,))
+    audit(connection, festival_id=festival_id, actor_id=str(user["id"]), action="DEACTIVATE", resource_type="MERCHANT_ACCOUNT",
+          resource_id=str(business["owner_membership_id"]), after_data={"businessId": business_id},
+          request_id=request.state.request_id)
+    return Response(status_code=204)
+
+
+# BIZ-04 소규모 표본 보호. 표본 업체가 이보다 적으면 비교 통계에서 개별 업체 실적이 역산된다.
+MIN_COMPARISON_SAMPLE = 5
+
+
+@router.get("/admin/festivals/{festival_id}/business-performance")
+def business_performance(festival_id: str, request: Request, _: Scope, user: Manager, connection: Db):
+    """BIZ-04 운영자용 업체별 전환 지표와 전체 참여 성과.
+
+    매출은 수집 동의(sales_consent)가 있는 업체만 집계·표시한다. 비교 통계는 표본이
+    MIN_COMPARISON_SAMPLE 미만이면 개별 업체 실적이 역산되므로 내려주지 않는다.
+    """
+    rows = all_rows(connection, """SELECT fb.id,b.name,fb.category,fb.is_sponsored,fb.esg_participating,fb.sales_consent,
+        count(*) FILTER(WHERE be.event_type='IMPRESSION')::int AS impressions,
+        count(*) FILTER(WHERE be.event_type='VISIT')::int AS visits,
+        count(DISTINCT ci.id)::int AS coupons_issued,
+        count(DISTINCT cr.id) FILTER(WHERE cr.status='REDEEMED')::int AS coupons_redeemed,
+        CASE WHEN fb.sales_consent THEN coalesce(sum(be.sales_amount),0) END AS sales_amount
+        FROM festival_businesses fb JOIN businesses b ON b.id=fb.business_id
+        LEFT JOIN business_events be ON be.festival_business_id=fb.id
+        LEFT JOIN coupons c ON c.festival_business_id=fb.id
+        LEFT JOIN coupon_issues ci ON ci.coupon_id=c.id
+        LEFT JOIN coupon_redemptions cr ON cr.coupon_issue_id=ci.id
+        WHERE fb.festival_id=%s AND fb.participation_status='APPROVED'
+        GROUP BY fb.id,b.name ORDER BY b.name""", (festival_id,))
+    for row in rows:
+        row["redemption_rate"] = round(row["coupons_redeemed"] / row["coupons_issued"] * 100, 1) if row["coupons_issued"] else None
+        row["visit_rate"] = round(row["visits"] / row["impressions"] * 100, 1) if row["impressions"] else None
+    totals = {key: sum(row[key] for row in rows) for key in ("impressions", "visits", "coupons_issued", "coupons_redeemed")}
+    totals["businesses"] = len(rows)
+    totals["salesConsented"] = sum(1 for row in rows if row["sales_consent"])
+    comparison = None
+    if len(rows) >= MIN_COMPARISON_SAMPLE:
+        rates = sorted(row["redemption_rate"] for row in rows if row["redemption_rate"] is not None)
+        comparison = {
+            "averageRedemptionRate": round(sum(rates) / len(rates), 1) if rates else None,
+            "medianRedemptionRate": rates[len(rates) // 2] if rates else None,
+            "averageCouponsIssued": round(totals["coupons_issued"] / len(rows), 1),
+        }
+    return success(request, {
+        "items": rows, "totals": totals, "comparison": comparison,
+        "comparisonSuppressed": comparison is None,
+        "minComparisonSample": MIN_COMPARISON_SAMPLE,
+        "salesNotice": "매출은 수집 동의를 받은 업체만 집계합니다.",
+    })
 
 
 @router.get("/admin/festivals/{festival_id}/businesses/{business_id}/coupons")

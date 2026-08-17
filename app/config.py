@@ -31,7 +31,8 @@ class Settings:
     # 대시보드 응답이 Alan 지연에 묶이지 않도록 짧게 잡는다. 브리핑 한 문장은 이 안에 온다.
     alan_read_timeout: float = float(os.getenv("ALAN_READ_TIMEOUT_SECONDS", "8"))
     alan_max_retries: int = int(os.getenv("ALAN_MAX_RETRIES", "1"))
-    recommendation_event_retention_days: int = int(os.getenv("RECOMMENDATION_EVENT_RETENTION_DAYS", "90"))
+    # 추천 노출 이력은 위치정보법 제16조의 수집·이용·제공사실 확인자료에 해당한다(OPS-11 정책표: 6개월).
+    recommendation_event_retention_days: int = int(os.getenv("RECOMMENDATION_EVENT_RETENTION_DAYS", "180"))
 
     def validate(self) -> None:
         # development 외의 환경(staging 포함)은 코드에 박힌 기본 키로 뜨면 안 된다.

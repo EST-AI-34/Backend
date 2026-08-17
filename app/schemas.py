@@ -37,6 +37,44 @@ class VisitorSessionIn(APIModel):
     language: str = Field(default="ko", max_length=10)
     accessibility_preferences: dict[str, Any] = Field(default_factory=dict)
     consents: dict[str, bool] = Field(default_factory=dict)
+    # VIS-12 진입 QR이 설치된 구역. 위치정보는 쓰지 않고 이 값과 수동 선택만으로 구역을 판정한다.
+    area_id: str | None = None
+
+
+class VisitorAreaIn(APIModel):
+    """VIS-12 구역 판정. source는 진입 QR(QR)과 방문객 수동 선택(MANUAL)만 허용한다."""
+    area_id: str | None = None
+    source: Literal["QR", "MANUAL"] = "MANUAL"
+
+
+class ConsentPatch(APIModel):
+    consents: dict[str, bool] = Field(min_length=1)
+
+
+class PrivacyRequestIn(APIModel):
+    request_type: Literal["ACCESS", "DELETE"]
+    detail: str | None = Field(default=None, max_length=1000)
+
+
+class PrivacyRequestPatch(APIModel):
+    status: Literal["IN_PROGRESS", "COMPLETED", "REJECTED"]
+    note: str | None = Field(default=None, max_length=1000)
+
+
+class MerchantInviteIn(APIModel):
+    email: EmailStr
+    name: str = Field(min_length=1, max_length=100)
+
+
+class MerchantInviteLookupIn(APIModel):
+    token: str = Field(pattern=r"^mi_")
+
+
+class MerchantInviteAcceptIn(APIModel):
+    """초대 수락. 이미 상인 계정이 있는 이메일이면 비밀번호 없이 업체 연결만 늘린다."""
+    token: str = Field(pattern=r"^mi_")
+    password: str | None = Field(default=None, min_length=8, max_length=200)
+    name: str | None = Field(default=None, min_length=1, max_length=100)
 
 
 class ConversationIn(APIModel):
@@ -475,6 +513,8 @@ class FestivalBusinessPatch(APIModel):
     description: str | None = Field(default=None, max_length=4000)
     is_sponsored: bool | None = None
     esg_participating: bool | None = None
+    # BIZ-04 매출 데이터 수집 동의. 철회하면 파기 배치가 해당 업체의 매출 이벤트를 즉시 지운다.
+    sales_consent: bool | None = None
     version: int | None = None
 
 
