@@ -6,7 +6,8 @@ from ..db import all_rows, audit, idempotent, jsonb, one
 from ..deps import Db, IdempotencyKey, Manager, Operator, Reviewer, Scope
 from ..domain import validate_measurement_review
 from ..errors import bad_request, conflict, found, unprocessable
-from ..http import decode_cursor, idempotent_success, paged, success
+from ..http import cursor_params, idempotent_success, keyset, paged, success
+from .admin_core import created, scoped
 from ..schemas import (EsgReportIn, EvidenceIn, ExportIn, MeasurementIn, MeasurementPatch, MetricIn,
                        MetricVersionIn, ReportPatch, ReviewIn)
 
@@ -55,8 +56,7 @@ def metrics(festival_id: str, request: Request, _: Scope, connection: Db):
 def create_metric(festival_id: str, body: MetricIn, request: Request, _: Scope, user: Manager, connection: Db):
     row = one(connection, "INSERT INTO esg_metrics(festival_id,name,category,created_by) VALUES(%s,%s,%s,%s) RETURNING *",
         (festival_id, body.name, body.category, user["id"]))
-    audit(connection, festival_id=festival_id, actor_id=str(user["id"]), action="CREATE", resource_type="ESG_METRIC",
-          resource_id=str(row["id"]), after_data=row, request_id=request.state.request_id)
+    created(connection, request, user, festival_id, "ESG_METRIC", row)
     return success(request, row)
 
 
@@ -69,13 +69,11 @@ def metric(festival_id: str, metric_id: str, request: Request, _: Scope, connect
 
 @router.post("/admin/festivals/{festival_id}/esg/metrics/{metric_id}/versions", status_code=201)
 def create_metric_version(festival_id: str, metric_id: str, body: MetricVersionIn, request: Request, _: Scope, user: Manager, connection: Db):
-    found(one(connection, "SELECT 1 FROM esg_metrics WHERE id=%s AND festival_id=%s", (metric_id, festival_id)))
+    scoped(connection, "esg_metrics", metric_id, festival_id)
     row = one(connection, """INSERT INTO esg_metric_versions(metric_id,version_no,formula,unit,target,source_requirements,evidence_required,created_by)
         SELECT %s,coalesce(max(version_no),0)+1,%s,%s,%s,%s,%s,%s FROM esg_metric_versions WHERE metric_id=%s RETURNING *""",
         (metric_id, body.formula, body.unit, body.target, jsonb(body.source_requirements), body.evidence_required, user["id"], metric_id))
-    audit(connection, festival_id=festival_id, actor_id=str(user["id"]), action="CREATE",
-          resource_type="ESG_METRIC_VERSION", resource_id=str(row["id"]), after_data=row,
-          request_id=request.state.request_id)
+    created(connection, request, user, festival_id, "ESG_METRIC_VERSION", row)
     return success(request, row)
 
 
@@ -83,15 +81,13 @@ def create_metric_version(festival_id: str, metric_id: str, body: MetricVersionI
 def measurements(festival_id: str, request: Request, _: Scope, connection: Db, status: str | None = None,
                  limit: int = Query(100, ge=1, le=200), cursor: str | None = None):
     """실적 목록. 측정 시각(measured_at, id) 키셋 커서로 자른다 — 화면 정렬 키와 같아야 이어진다."""
-    after = decode_cursor(cursor)
-    rows = all_rows(connection, """SELECT em.*,m.name AS metric_name,m.category,v.version_no,v.unit,
+    rows = all_rows(connection, f"""SELECT em.*,m.name AS metric_name,m.category,v.version_no,v.unit,
         (SELECT count(*) FROM esg_evidence e WHERE e.measurement_id=em.id)::int AS evidence_count
         FROM esg_measurements em JOIN esg_metric_versions v ON v.id=em.metric_version_id JOIN esg_metrics m ON m.id=v.metric_id
         WHERE em.festival_id=%(festival_id)s AND (%(status)s::text IS NULL OR em.status=%(status)s)
-        AND (%(after_at)s::timestamptz IS NULL OR (em.measured_at,em.id) < (%(after_at)s::timestamptz,%(after_id)s::uuid))
+        AND {keyset("measured_at", "em")}
         ORDER BY em.measured_at DESC,em.id DESC LIMIT %(limit)s""",
-        {"festival_id": festival_id, "status": status,
-         "after_at": after[0] if after else None, "after_id": after[1] if after else None, "limit": limit + 1})
+        {"festival_id": festival_id, "status": status, **cursor_params(cursor, limit)})
     rows, page = paged(rows, limit, "measured_at")
     return success(request, rows, page=page)
 
@@ -109,8 +105,7 @@ def create_measurement(festival_id: str, body: MeasurementIn, request: Request, 
                 (festival_id, body.metric_version_id, body.value, body.source_type, body.source_ref, body.dedupe_key, body.measured_at, body.supersedes_id, user["id"]))
         except UniqueViolation as error:
             raise conflict("DUPLICATE_MEASUREMENT", "같은 지표 버전과 중복 키의 실적이 이미 존재합니다.") from error
-        audit(connection, festival_id=festival_id, actor_id=str(user["id"]), action="CREATE", resource_type="ESG_MEASUREMENT",
-              resource_id=str(row["id"]), after_data=row, request_id=request.state.request_id)
+        created(connection, request, user, festival_id, "ESG_MEASUREMENT", row)
         return 201, row
     return idempotent_success(request, response, idempotent(connection, key=idempotency_key, scope=f"esg-measurement:{festival_id}", body=body.model_dump(), work=work))
 
@@ -145,8 +140,7 @@ def add_evidence(festival_id: str, measurement_id: str, body: EvidenceIn, reques
         raise bad_request("IMMUTABLE_APPROVED_MEASUREMENT", "승인 전 실적에만 증빙을 추가할 수 있습니다.")
     row = one(connection, "INSERT INTO esg_evidence(measurement_id,file_id,file_hash,evidence_type,issued_at) VALUES(%s,%s,%s,%s,%s) RETURNING *",
         (measurement_id, body.file_id, body.file_hash, body.evidence_type, body.issued_at))
-    audit(connection, festival_id=festival_id, actor_id=str(user["id"]), action="CREATE", resource_type="ESG_EVIDENCE",
-          resource_id=str(row["id"]), after_data=row, request_id=request.state.request_id)
+    created(connection, request, user, festival_id, "ESG_EVIDENCE", row)
     return success(request, row)
 
 

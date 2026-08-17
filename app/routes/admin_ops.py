@@ -9,9 +9,9 @@ from ..deps import Db, IfMatch, Manager, Operator, Scope, SuperAdmin, User
 from ..domain import validate_ticket_transition
 from ..errors import bad_request, conflict, forbidden, found
 from ..esg_export import build_table_artifact
-from ..http import Raw, decode_cursor, paged, success
+from ..http import Raw, cursor_params, keyset, paged, success
 from ..privacy import CONSENT_ITEMS, RETENTION_POLICY, purge_personal_data, purge_sessions
-from .admin_core import patch_row
+from .admin_core import created, patch_row
 from ..schemas import (AnnouncementDraftIn, AnnouncementIn, AnnouncementPatch, GenericExportIn, MembershipIn,
                        MembershipPatch, PrivacyRequestPatch, PublishAnnouncementIn, SurveyIn, SurveyPatch,
                        TicketIn, TicketPatch, TicketTransitionIn)
@@ -19,6 +19,27 @@ from ..security import hash_password
 
 
 router = APIRouter()
+
+
+def publish_announcement_row(connection, request: Request, user: dict, festival_id: str, announcement_id: str,
+                             content_version_id: str, body, *, only_draft: bool) -> dict | None:
+    """공지에 게시 값을 반영하고 감사 로그를 남긴다. 시작 시각이 미래면 SCHEDULED.
+
+    새로 만들어 바로 게시하는 경로와 초안을 게시하는 경로가 같은 UPDATE를 쓴다.
+    only_draft는 초안만 게시하도록 막는다 — 조건에 걸리면 None을 돌려주고 호출부가 처리한다.
+    """
+    status = "SCHEDULED" if body.starts_at > datetime.now(UTC) else "ACTIVE"
+    row = one(connection, f"""UPDATE announcements SET content_version_id=%s,severity=%s,audience=%s,target_area_ids=%s,
+        starts_at=%s,ends_at=%s,status=%s,version=version+1,updated_at=now()
+        WHERE id=%s AND festival_id=%s{" AND status='DRAFT'" if only_draft else ""} RETURNING *""",
+        (content_version_id, body.severity, jsonb(body.audience), jsonb(body.target_area_ids),
+         body.starts_at, body.ends_at, status, announcement_id, festival_id))
+    if row:
+        audit(connection, festival_id=festival_id, actor_id=str(user["id"]),
+              action="PUBLISH_EMERGENCY" if body.severity == "EMERGENCY" else "PUBLISH",
+              resource_type="ANNOUNCEMENT", resource_id=str(announcement_id), after_data=row,
+              request_id=request.state.request_id)
+    return row
 
 
 @router.get("/admin/festivals/{festival_id}/announcements")
@@ -31,8 +52,7 @@ def announcements(festival_id: str, request: Request, _: Scope, connection: Db):
 @router.post("/admin/festivals/{festival_id}/announcements", status_code=201)
 def create_announcement(festival_id: str, body: AnnouncementIn, request: Request, _: Scope, user: Operator, connection: Db):
     row = one(connection, "INSERT INTO announcements(festival_id,title,created_by) VALUES(%s,%s,%s) RETURNING *", (festival_id, body.title, user["id"]))
-    audit(connection, festival_id=festival_id, actor_id=str(user["id"]), action="CREATE", resource_type="ANNOUNCEMENT",
-          resource_id=str(row["id"]), after_data=row, request_id=request.state.request_id)
+    created(connection, request, user, festival_id, "ANNOUNCEMENT", row)
     return success(request, row)
 
 
@@ -57,15 +77,8 @@ def create_and_publish_announcement(festival_id: str, body: AnnouncementDraftIn,
         (version["id"], user["id"], "현장 공지 즉시 승인"))
     connection.execute("UPDATE content_items SET published_version_id=%s,lifecycle_status='PUBLISHED',updated_at=now() WHERE id=%s",
         (version["id"], item["id"]))
-    status = "SCHEDULED" if body.starts_at > datetime.now(UTC) else "ACTIVE"
-    row = one(connection, """UPDATE announcements SET content_version_id=%s,severity=%s,audience=%s,target_area_ids=%s,
-        starts_at=%s,ends_at=%s,status=%s,version=version+1,updated_at=now() WHERE id=%s RETURNING *""",
-        (version["id"], body.severity, jsonb(body.audience), jsonb(body.target_area_ids),
-         body.starts_at, body.ends_at, status, announcement["id"]))
-    audit(connection, festival_id=festival_id, actor_id=str(user["id"]),
-          action="PUBLISH_EMERGENCY" if body.severity == "EMERGENCY" else "PUBLISH",
-          resource_type="ANNOUNCEMENT", resource_id=str(announcement["id"]), after_data=row,
-          request_id=request.state.request_id)
+    row = publish_announcement_row(connection, request, user, festival_id, str(announcement["id"]), str(version["id"]),
+                                   body, only_draft=False)
     return success(request, row)
 
 
@@ -87,16 +100,10 @@ def publish_announcement(festival_id: str, announcement_id: str, body: PublishAn
     if not one(connection, """SELECT cv.id FROM content_versions cv JOIN content_items ci ON ci.id=cv.content_item_id
         WHERE cv.id=%s AND ci.festival_id=%s AND cv.status='APPROVED'""", (body.content_version_id, festival_id)):
         raise bad_request("CONTENT_NOT_APPROVED", "승인된 공지 콘텐츠만 게시할 수 있습니다.")
-    status = "SCHEDULED" if body.starts_at > datetime.now(UTC) else "ACTIVE"
-    row = one(connection, """UPDATE announcements SET content_version_id=%s,severity=%s,audience=%s,target_area_ids=%s,
-        starts_at=%s,ends_at=%s,status=%s,version=version+1,updated_at=now()
-        WHERE id=%s AND festival_id=%s AND status='DRAFT' RETURNING *""",
-        (body.content_version_id, body.severity, jsonb(body.audience), jsonb(body.target_area_ids), body.starts_at, body.ends_at, status, announcement_id, festival_id))
+    row = publish_announcement_row(connection, request, user, festival_id, announcement_id, body.content_version_id,
+                                   body, only_draft=True)
     if not row:
         raise bad_request("INVALID_STATE_TRANSITION", "초안 공지만 게시할 수 있습니다.")
-    audit(connection, festival_id=festival_id, actor_id=str(user["id"]),
-          action="PUBLISH_EMERGENCY" if body.severity == "EMERGENCY" else "PUBLISH",
-          resource_type="ANNOUNCEMENT", resource_id=announcement_id, after_data=row, request_id=request.state.request_id)
     return success(request, row)
 
 
@@ -130,13 +137,12 @@ def tickets(festival_id: str, request: Request, _: Scope, user: Operator, connec
     축제 기간 내내 쌓이는 목록이라 전량 반환은 응답이 무한정 커진다. 감사 로그와 같은
     (created_at, id) 키셋 커서를 쓴다 — 우선순위 정렬은 페이지 안에서 다시 적용한다.
     """
-    after = decode_cursor(cursor)
     rows = all_rows(connection, f"""SELECT * FROM ops_tickets WHERE festival_id=%(festival_id)s AND {VISIBLE_TICKET}
         AND (%(status)s::text IS NULL OR status=%(status)s)
-        AND (%(after_at)s::timestamptz IS NULL OR (created_at,id) < (%(after_at)s::timestamptz,%(after_id)s::uuid))
+        AND {keyset()}
         ORDER BY created_at DESC,id DESC LIMIT %(limit)s""",
         {"festival_id": festival_id, "role": user["role"], "user_id": user["id"], "status": status,
-         "after_at": after[0] if after else None, "after_id": after[1] if after else None, "limit": limit + 1})
+         **cursor_params(cursor, limit)})
     rows, page = paged(rows, limit)
     priority_rank = {"EMERGENCY": 1, "HIGH": 2, "NORMAL": 3}
     rows.sort(key=lambda row: (priority_rank.get(row["priority"], 4), row["created_at"]))
@@ -149,8 +155,7 @@ def create_ticket(festival_id: str, body: TicketIn, request: Request, _: Scope, 
         VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
         (festival_id, body.ticket_type, body.title, body.description, body.area_id, body.priority, body.assignee_id, user["id"]))
     connection.execute("INSERT INTO ops_ticket_events(ticket_id,actor_id,to_status,note) VALUES(%s,%s,'OPEN','티켓 생성')", (row["id"], user["id"]))
-    audit(connection, festival_id=festival_id, actor_id=str(user["id"]), action="CREATE", resource_type="OPS_TICKET",
-          resource_id=str(row["id"]), after_data=row, request_id=request.state.request_id)
+    created(connection, request, user, festival_id, "OPS_TICKET", row)
     return success(request, row)
 
 
@@ -212,8 +217,7 @@ def create_survey(festival_id: str, body: SurveyIn, request: Request, _: Scope, 
         connection.execute("""INSERT INTO survey_questions(survey_id,prompt,question_type,options,required,position)
             VALUES(%s,%s,%s,%s,%s,%s)""",
             (row["id"], question.prompt, question.question_type, jsonb(question.options), question.required, position))
-    audit(connection, festival_id=festival_id, actor_id=str(user["id"]), action="CREATE", resource_type="SURVEY",
-          resource_id=str(row["id"]), after_data=row, request_id=request.state.request_id)
+    created(connection, request, user, festival_id, "SURVEY", row)
     return success(request, row)
 
 
@@ -285,8 +289,7 @@ def create_membership(organization_id: str, body: MembershipIn, request: Request
     row = one(connection, "INSERT INTO memberships(organization_id,user_id,role,festival_scope) VALUES(%s,%s,%s,%s) RETURNING *",
         (organization_id, account["id"], body.role, jsonb(body.festival_scope)))
     row["user"] = account
-    audit(connection, festival_id=None, actor_id=str(user["id"]), action="CREATE", resource_type="MEMBERSHIP",
-          resource_id=str(row["id"]), after_data={"email": account["email"], "role": body.role}, request_id=request.state.request_id)
+    created(connection, request, user, None, "MEMBERSHIP", row, {"email": account["email"], "role": body.role})
     return success(request, row)
 
 
@@ -337,16 +340,15 @@ def audit_logs(festival_id: str, request: Request, _: Scope, user: Manager, conn
     행위자는 users를 조인해 이름·이메일까지 준다. actor_id(UUID)만 내려주면 감사 화면이
     "3f2a1b0c…" 같은 값밖에 못 보여줘서 누가 무엇을 했는지 추적이 되지 않는다.
     """
-    after = decode_cursor(cursor)
-    rows = all_rows(connection, """SELECT al.*,u.name AS actor_name,u.email AS actor_email
+    rows = all_rows(connection, f"""SELECT al.*,u.name AS actor_name,u.email AS actor_email
         FROM audit_logs al LEFT JOIN users u ON u.id=al.actor_id
         WHERE al.festival_id=%(festival_id)s
         AND (%(action)s::text IS NULL OR al.action=%(action)s)
         AND (%(resource_type)s::text IS NULL OR al.resource_type=%(resource_type)s)
-        AND (%(after_at)s::timestamptz IS NULL OR (al.created_at,al.id) < (%(after_at)s::timestamptz,%(after_id)s::uuid))
+        AND {keyset(alias="al")}
         ORDER BY al.created_at DESC,al.id DESC LIMIT %(limit)s""",
         {"festival_id": festival_id, "action": action, "resource_type": resource_type,
-         "after_at": after[0] if after else None, "after_id": after[1] if after else None, "limit": limit + 1})
+         **cursor_params(cursor, limit)})
     rows, page = paged(rows, limit)
     return success(request, rows, page=page)
 

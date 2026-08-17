@@ -81,6 +81,22 @@ def decode_cursor(cursor: str | None) -> tuple[str, str] | None:
         raise bad_request("INVALID_CURSOR", "커서 값을 확인해 주세요.") from error
 
 
+def keyset(column: str = "created_at", alias: str = "") -> str:
+    """`(정렬 컬럼, id)` 키셋 조건. cursor_params가 채우는 이름 파라미터를 참조한다.
+
+    f-string으로 SQL에 그대로 들어가므로 컬럼·별칭은 상수여야 한다(사용자 입력 금지).
+    """
+    prefix = f"{alias}." if alias else ""
+    return (f"(%(after_at)s::timestamptz IS NULL OR ({prefix}{column},{prefix}id) < "
+            f"(%(after_at)s::timestamptz,%(after_id)s::uuid))")
+
+
+def cursor_params(cursor: str | None, limit: int) -> dict:
+    """keyset()이 참조하는 파라미터. limit는 한 건 더 읽어 paged()가 다음 페이지를 판단하게 한다."""
+    after = decode_cursor(cursor)
+    return {"after_at": after[0] if after else None, "after_id": after[1] if after else None, "limit": limit + 1}
+
+
 def paged(rows: list[dict], limit: int, column: str = "created_at") -> tuple[list[dict], dict]:
     """`limit+1`건을 읽어 온 목록을 (행, page) 로 자른다.
 
