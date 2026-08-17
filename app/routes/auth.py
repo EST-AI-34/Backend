@@ -3,11 +3,11 @@ from datetime import UTC, datetime, timedelta
 from fastapi import APIRouter, Request, Response
 
 from ..config import settings
-from ..db import audit, one
+from ..db import audit, jsonb, one
 from ..deps import Db, User
-from ..errors import AppError, unauthorized
+from ..errors import AppError, bad_request, conflict, unauthorized
 from ..http import success
-from ..schemas import LoginIn, PasswordChangeIn, TokenIn
+from ..schemas import (LoginIn, MerchantInviteAcceptIn, MerchantInviteLookupIn, PasswordChangeIn, TokenIn)
 from ..security import (DUMMY_PASSWORD_HASH, access_token, hash_password, hash_token, random_token,
                         verify_password)
 
@@ -114,6 +114,75 @@ def refresh(body: TokenIn, request: Request, connection: Db):
 def logout(body: TokenIn, connection: Db) -> Response:
     connection.execute("UPDATE refresh_tokens SET revoked_at=now() WHERE token_hash=%s AND revoked_at IS NULL", (hash_token(body.refresh_token),))
     return Response(status_code=204)
+
+
+INVITATION_SQL = """SELECT mi.*,fb.festival_id,fb.owner_membership_id,b.name AS business_name,f.name AS festival_name,
+        f.organization_id FROM merchant_invitations mi
+    JOIN festival_businesses fb ON fb.id=mi.festival_business_id JOIN businesses b ON b.id=fb.business_id
+    JOIN festivals f ON f.id=fb.festival_id WHERE mi.token_hash=%s"""
+
+
+def valid_invitation(connection, token: str, *, lock: bool = False) -> dict:
+    """유효한 초대만 통과시킨다. 만료·회수·이미 수락된 링크는 모두 같은 오류로 막는다."""
+    row = one(connection, INVITATION_SQL + (" FOR UPDATE OF mi" if lock else ""), (hash_token(token),))
+    if not row or row["status"] != "PENDING" or row["expires_at"] <= datetime.now(UTC):
+        raise AppError(410, "INVITATION_INVALID", "초대 링크가 만료되었거나 사용할 수 없습니다. 운영자에게 재발급을 요청해 주세요.")
+    return row
+
+
+@router.post("/auth/merchant-invitations/lookup")
+def lookup_invitation(body: MerchantInviteLookupIn, request: Request, connection: Db):
+    """수락 화면이 어떤 업체·이메일의 초대인지 보여주기 위한 조회.
+
+    토큰은 본문으로 받는다 — 쿼리스트링에 실으면 접속 로그·리퍼러에 그대로 남는다.
+    """
+    row = valid_invitation(connection, body.token)
+    return success(request, {"email": row["email"], "businessName": row["business_name"],
+                             "festivalName": row["festival_name"], "expiresAt": row["expires_at"],
+                             "hasAccount": bool(one(connection, "SELECT 1 FROM users WHERE lower(email)=lower(%s)", (row["email"],)))})
+
+
+@router.post("/auth/merchant-invitations/accept")
+def accept_invitation(body: MerchantInviteAcceptIn, request: Request, connection: Db):
+    """초대 수락 = 상인 계정 발급과 업체 연결.
+
+    이미 다른 업체로 계정을 받은 상인은 같은 소속을 재사용하고 축제 범위와 업체 연결만
+    늘린다(비밀번호를 다시 받지 않는다). 새 계정일 때만 비밀번호가 필요하다.
+    """
+    invitation = valid_invitation(connection, body.token, lock=True)
+    account = one(connection, "SELECT id,email,name,status FROM users WHERE lower(email)=lower(%s)", (invitation["email"],))
+    membership = one(connection, """SELECT id,festival_scope FROM memberships WHERE user_id=%s AND organization_id=%s
+        AND role='MERCHANT' AND status='ACTIVE'""", (account["id"], invitation["organization_id"])) if account else None
+    if account and not membership:
+        # 같은 이메일이 이미 운영자 계정이면 상인 권한을 덧붙이지 않는다 — 역할 경계가 흐려진다.
+        raise conflict("EMAIL_ALREADY_REGISTERED",
+                       "이미 다른 용도로 등록된 이메일입니다. 운영자에게 다른 이메일로 재발급을 요청해 주세요.")
+    if not account:
+        if not body.password:
+            raise bad_request("PASSWORD_REQUIRED", "새 계정에는 비밀번호가 필요합니다.")
+        account = one(connection, "INSERT INTO users(email,password_hash,name) VALUES(%s,%s,%s) RETURNING id,email,name",
+                      (invitation["email"], hash_password(body.password), body.name or invitation["email"].split("@")[0]))
+        membership = one(connection, """INSERT INTO memberships(organization_id,user_id,role,festival_scope)
+            VALUES(%s,%s,'MERCHANT',%s) RETURNING id,festival_scope""",
+            (invitation["organization_id"], account["id"], jsonb([str(invitation["festival_id"])])))
+    else:
+        scope = sorted({*(membership["festival_scope"] or []), str(invitation["festival_id"])})
+        connection.execute("UPDATE memberships SET festival_scope=%s WHERE id=%s", (jsonb(scope), membership["id"]))
+    connection.execute("UPDATE festival_businesses SET owner_membership_id=%s,updated_at=now() WHERE id=%s",
+                       (membership["id"], invitation["festival_business_id"]))
+    connection.execute("UPDATE merchant_invitations SET status='ACCEPTED',membership_id=%s,accepted_at=now() WHERE id=%s",
+                       (membership["id"], invitation["id"]))
+    audit(connection, festival_id=str(invitation["festival_id"]), actor_id=str(account["id"]), action="ACCEPT_INVITATION",
+          resource_type="MERCHANT_ACCOUNT", resource_id=str(membership["id"]),
+          after_data={"businessId": str(invitation["festival_business_id"]), "email": invitation["email"]},
+          request_id=request.state.request_id)
+    return success(request, {
+        "accessToken": access_token(str(account["id"]), str(membership["id"])),
+        "refreshToken": issue_refresh_token(connection, account["id"]),
+        "tokenType": "Bearer",
+        "user": {"id": account["id"], "email": account["email"], "name": account["name"], "role": "MERCHANT"},
+        "businessName": invitation["business_name"],
+    })
 
 
 @router.get("/me")

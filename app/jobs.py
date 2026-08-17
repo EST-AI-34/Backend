@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from .config import settings
 from .db import all_rows, jsonb, one, pool
 from .esg_export import build_report_artifact
+from .privacy import purge_personal_data, purge_sessions
 
 
 logger = logging.getLogger(__name__)
@@ -119,34 +120,23 @@ def process_one_job() -> bool:
 
 
 def purge_expired() -> None:
-    """만료·폐기 데이터 정리.
+    """만료·폐기 데이터 정리와 OPS-11 개인정보 파기.
 
-    idempotency_records·refresh_tokens·visitor_sessions에 정리 로직이 없어 무한히 쌓이고
-    있었다. 방문 세션은 익명이라도 흔적이 남으므로 보존 기간이 지나면 지운다 — 자식 행이
-    많아 참조가 남아 있으면 지우지 않고(FK) 다음 순회로 넘긴다.
+    운영 부산물(멱등성 레코드·리프레시 토큰)은 여기서 지우고, 개인정보 항목은 보유기간
+    정책표를 단일 기준으로 쓰는 privacy.purge_personal_data가 참조 데이터까지 연쇄로
+    지운다. 파기 결과는 감사 로그(OPS-09)에 남는다.
 
-    자식 테이블 목록을 손으로 적으면 새 테이블이 생길 때마다 빠뜨린다(실제로 설문 응답·
-    리워드·코스·AI 신고 네 개가 빠져 있어 FK 위반으로 정리 전체가 롤백되고 있었다).
-    visitor_sessions를 참조하는 FK를 카탈로그에서 읽어 조건을 만든다.
+    끝나지 않은 축제의 세션은 정책표 대상이 아니므로, 만료된 지 오래된 세션은 기존
+    보존 기간으로 함께 정리한다(축제가 ENDED로 넘어가지 않은 채 방치되는 경우 대비).
     """
     with pool.connection() as connection:
         connection.execute("DELETE FROM idempotency_records WHERE created_at<now()-make_interval(days => %s)",
                            (settings.idempotency_retention_days,))
         connection.execute("DELETE FROM refresh_tokens WHERE expires_at<now()-interval '30 days' OR revoked_at<now()-interval '30 days'")
-        children = all_rows(connection, """SELECT c.conrelid::regclass::text AS table_name,
-                   a.attname AS column_name
-            FROM pg_constraint c
-            JOIN pg_attribute a ON a.attrelid=c.conrelid AND a.attnum=c.conkey[1]
-            WHERE c.contype='f' AND c.confrelid='visitor_sessions'::regclass""")
-        guards = "".join(
-            f" AND NOT EXISTS(SELECT 1 FROM {row['table_name']} child WHERE child.{row['column_name']}=vs.id)"
-            for row in children)
-        connection.execute(f"""DELETE FROM visitor_sessions vs
-            WHERE vs.expires_at<now()-make_interval(days => %s){guards}""",
-            (settings.visitor_session_retention_days,))
-        connection.execute("""DELETE FROM business_recommendation_events
-            WHERE created_at<now()-make_interval(days => %s)""",
-            (settings.recommendation_event_retention_days,))
+        counts = purge_personal_data(connection)
+        stale = purge_sessions(connection, "expires_at<now()-make_interval(days => %s)",
+                               (settings.visitor_session_retention_days,))
+        logger.info("개인정보 파기: %s, 만료 세션 %s건", counts, stale)
 
 
 # 정리는 매 순회마다 돌릴 필요가 없다. 워커가 1초마다 깨어나므로 1시간에 한 번꼴.

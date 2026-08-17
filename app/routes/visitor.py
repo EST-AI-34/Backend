@@ -6,20 +6,130 @@ from ..deps import Db, Visitor
 from ..domain import classify_issue, is_safe_question, search_terms
 from ..errors import bad_request, conflict, found
 from ..http import success
-from ..schemas import ComplaintIn, ConversationIn, MessageIn, ReportMessageIn, SurveyResponseIn
+from ..privacy import CONSENT_ITEMS, RETENTION_POLICY, WITHDRAWABLE, delete_where
+from ..schemas import (ComplaintIn, ConsentPatch, ConversationIn, MessageIn, PrivacyRequestIn,
+                       ReportMessageIn, SurveyResponseIn, VisitorAreaIn)
 
 
 router = APIRouter()
+
+# VIS-12 구역 판정 유효시간. 지나면 미판정으로 되돌려 재진입 QR 스캔이나 수동 선택을 유도한다.
+AREA_VALID_HOURS = 2
+# 유효한 구역만 남기는 표현식. 공지 선별과 세션 조회가 같은 기준을 써야 화면과 전달이 어긋나지 않는다.
+CURRENT_AREA = f"CASE WHEN area_assigned_at>now()-interval '{AREA_VALID_HOURS} hours' THEN current_area_id END"
 
 
 def owned_conversation(connection, conversation_id: str, visitor_id) -> None:
     found(one(connection, "SELECT 1 FROM ai_conversations WHERE id=%s AND visitor_session_id=%s", (conversation_id, visitor_id)), "대화를 찾을 수 없습니다.")
 
 
+def session_area(connection, visitor_id) -> dict:
+    return one(connection, f"""SELECT {CURRENT_AREA} AS area_id,area_source,area_assigned_at,
+        (SELECT name FROM festival_areas fa WHERE fa.id={CURRENT_AREA}) AS area_name
+        FROM visitor_sessions WHERE id=%s""", (visitor_id,))
+
+
 @router.delete("/visitor-sessions/current", status_code=204)
 def end_session(visitor: Visitor, connection: Db) -> Response:
-    connection.execute("UPDATE visitor_sessions SET ended_at=now(),accessibility_preferences='{}',consents='{}' WHERE id=%s", (visitor["id"],))
+    connection.execute("""UPDATE visitor_sessions SET ended_at=now(),accessibility_preferences='{}',consents='{}',
+        current_area_id=NULL,area_source=NULL,area_assigned_at=NULL WHERE id=%s""", (visitor["id"],))
     return Response(status_code=204)
+
+
+@router.get("/visitor-sessions/current/area")
+def current_area(request: Request, visitor: Visitor, connection: Db):
+    """VIS-12 현재 구역. 판정하지 못한 상태를 정상으로 보고 전체 대상 콘텐츠로 폴백한다."""
+    return success(request, {**session_area(connection, visitor["id"]), "validHours": AREA_VALID_HOURS})
+
+
+@router.put("/visitor-sessions/current/area")
+def set_area(body: VisitorAreaIn, request: Request, visitor: Visitor, connection: Db):
+    """진입 QR 지점 또는 방문객의 수동 선택으로 구역을 판정한다. 브라우저 위치정보는 쓰지 않는다."""
+    if body.area_id and not one(connection, "SELECT 1 FROM festival_areas WHERE id=%s AND festival_id=%s AND status='ACTIVE'",
+                                (body.area_id, visitor["festival_id"])):
+        raise bad_request("AREA_SCOPE_MISMATCH", "이 축제의 구역이 아닙니다.")
+    connection.execute("""UPDATE visitor_sessions SET current_area_id=%s,area_source=%s,
+        area_assigned_at=CASE WHEN %s::uuid IS NULL THEN NULL ELSE now() END WHERE id=%s""",
+        (body.area_id, body.source if body.area_id else None, body.area_id, visitor["id"]))
+    return success(request, {**session_area(connection, visitor["id"]), "validHours": AREA_VALID_HOURS})
+
+
+@router.get("/visitor/announcements")
+def visitor_announcements(request: Request, visitor: Visitor, connection: Db):
+    """VIS-07 구역 대상 공지 선별 + OPS-10 세션별 노출 기록.
+
+    공개 목록(`/public/.../announcements`)은 세션이 없어 구역을 알 수 없으므로 전체 공지만
+    낼 수 있다. 여기서는 VIS-12 판정 결과로 targetAreaIds를 선별하고, 응답에 실제로 실린
+    공지를 세션별로 남겨 운영자가 도달 결과를 확인할 수 있게 한다.
+
+    구역을 판정하지 못한 세션에는 전체 대상 공지만 노출한다. 다만 안전 관련 긴급 공지는
+    구역 판정 여부와 무관하게 전달한다(VIS-12 규칙).
+    """
+    area = session_area(connection, visitor["id"])
+    rows = all_rows(connection, """SELECT a.id,a.title,a.severity,a.audience,a.target_area_ids,a.starts_at,a.ends_at,
+        cv.body,cv.language,a.updated_at FROM announcements a JOIN content_versions cv ON cv.id=a.content_version_id
+        WHERE a.festival_id=%(festival_id)s AND a.status IN ('ACTIVE','SCHEDULED') AND a.starts_at<=now()
+          AND (a.ends_at IS NULL OR a.ends_at>now()) AND a.audience ? 'VISITOR' AND cv.status='APPROVED'
+          AND (a.target_area_ids='[]'::jsonb OR a.severity='EMERGENCY'
+               OR (%(area_id)s::uuid IS NOT NULL AND a.target_area_ids ? %(area_id)s::text))
+        ORDER BY CASE a.severity WHEN 'EMERGENCY' THEN 1 WHEN 'WARNING' THEN 2 ELSE 3 END,a.starts_at DESC""",
+        {"festival_id": visitor["festival_id"], "area_id": str(area["area_id"]) if area["area_id"] else None})
+    for row in rows:
+        connection.execute("""INSERT INTO notification_deliveries(festival_id,resource_type,resource_id,visitor_session_id)
+            VALUES(%s,'ANNOUNCEMENT',%s,%s) ON CONFLICT DO NOTHING""", (visitor["festival_id"], row["id"], visitor["id"]))
+    return success(request, {
+        "items": rows, "area": area,
+        # 웹 폴링은 화면을 열어 둔 세션에만 닿는다. 이 한계를 방문객 화면이 그대로 고지한다(OPS-10).
+        "channel": {"type": "WEB_POLL", "pollSeconds": 30,
+                    "limitation": "이 화면을 열어 둔 동안에만 새 공지가 도착합니다. 화면을 닫거나 다른 앱을 쓰는 동안에는 알림이 도달하지 않으므로, 긴급 상황은 현장 방송과 안내 인력 안내를 함께 확인해 주세요."},
+    })
+
+
+@router.get("/visitor/privacy")
+def privacy_notice(request: Request, visitor: Visitor, connection: Db):
+    """OPS-11 항목별 수집 근거·보유기간과 현재 동의 상태."""
+    session = one(connection, "SELECT consents FROM visitor_sessions WHERE id=%s", (visitor["id"],))
+    return success(request, {"items": CONSENT_ITEMS, "consents": session["consents"], "retentionPolicy": RETENTION_POLICY})
+
+
+@router.patch("/visitor/privacy/consents")
+def update_consents(body: ConsentPatch, request: Request, visitor: Visitor, connection: Db):
+    """항목별 동의·철회. 필수 항목은 철회 대상이 아니고, 철회는 즉시 해당 데이터에 반영된다."""
+    unknown = set(body.consents) - {item["key"] for item in CONSENT_ITEMS}
+    if unknown:
+        raise bad_request("UNKNOWN_CONSENT_ITEM", f"정의되지 않은 수집 항목입니다: {', '.join(sorted(unknown))}")
+    locked = {key for key, granted in body.consents.items() if not granted and key not in WITHDRAWABLE}
+    if locked:
+        raise bad_request("CONSENT_REQUIRED", "서비스 제공에 필요한 항목은 철회할 수 없습니다. 이용을 중단하려면 방문 세션을 종료해 주세요.")
+    row = one(connection, "UPDATE visitor_sessions SET consents=consents||%s WHERE id=%s RETURNING consents",
+              (jsonb(body.consents), visitor["id"]))
+    purged = {}
+    if body.consents.get("aiLog") is False:
+        # 철회가 저장만 되고 이미 쌓인 기록이 남으면 철회가 아니다. 이 세션의 대화를 연쇄 파기한다.
+        purged["aiLog"] = delete_where(connection, "ai_conversations", "visitor_session_id=%s", (visitor["id"],))
+    return success(request, {"consents": row["consents"], "purged": purged})
+
+
+@router.get("/visitor/privacy/requests")
+def my_privacy_requests(request: Request, visitor: Visitor, connection: Db):
+    return success(request, all_rows(connection, """SELECT id,request_type,status,detail,result,created_at,handled_at
+        FROM privacy_requests WHERE visitor_session_id=%s ORDER BY created_at DESC""", (visitor["id"],)))
+
+
+@router.post("/visitor/privacy/requests", status_code=201)
+def create_privacy_request(body: PrivacyRequestIn, request: Request, visitor: Visitor, connection: Db):
+    """열람·삭제 요구 접수.
+
+    로그인 수단이 없으므로 본인확인은 요청에 실린 VIS-11 식별자(방문 세션 토큰)로 갈음한다.
+    익명 설문 응답은 제출 이후 응답자를 특정할 수 없어 대상에서 제외된다(수집 화면에 사전 고지).
+    """
+    if one(connection, """SELECT 1 FROM privacy_requests WHERE visitor_session_id=%s AND request_type=%s
+        AND status IN ('RECEIVED','IN_PROGRESS')""", (visitor["id"], body.request_type)):
+        raise conflict("DUPLICATE_ACTION", "같은 유형의 요구가 이미 처리 중입니다.")
+    row = one(connection, """INSERT INTO privacy_requests(festival_id,visitor_session_id,request_type,detail)
+        VALUES(%s,%s,%s,%s) RETURNING id,request_type,status,detail,created_at""",
+        (visitor["festival_id"], visitor["id"], body.request_type, body.detail))
+    return success(request, {**row, "excluded": ["설문 응답(익명 처리되어 응답자를 특정할 수 없습니다)"]})
 
 
 @router.post("/visitor/surveys/{survey_id}/responses", status_code=201)

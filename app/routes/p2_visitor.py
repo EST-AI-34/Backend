@@ -66,6 +66,12 @@ def my_bookings(request: Request, visitor: Visitor, connection: Db):
         ps.starts_at,ps.ends_at,p.title AS program_title,p.slug AS program_slug,a.name AS area_name
         FROM bookings b JOIN program_sessions ps ON ps.id=b.program_session_id JOIN programs p ON p.id=ps.program_id
         JOIN festival_areas a ON a.id=ps.area_id WHERE b.visitor_session_id=%s ORDER BY ps.starts_at""", (visitor["id"],))
+    # OPS-10: 호출은 이 폴링 응답에 실릴 때 비로소 방문객에게 닿는다. 도달 결과를 운영자가
+    # 확인할 수 있도록 응답에 실제로 실린 호출을 세션별로 남긴다.
+    for row in rows:
+        if row["status"] == "CALLED":
+            connection.execute("""INSERT INTO notification_deliveries(festival_id,resource_type,resource_id,visitor_session_id)
+                VALUES(%s,'BOOKING_CALL',%s,%s) ON CONFLICT DO NOTHING""", (visitor["festival_id"], row["id"], visitor["id"]))
     return success(request, rows)
 
 
@@ -109,6 +115,11 @@ def cancel_booking(booking_id: str, visitor: Visitor, connection: Db) -> Respons
 
 @router.post("/visitor/course-plans", status_code=201)
 def create_course_plan(body: CoursePlanIn, request: Request, visitor: Visitor, connection: Db):
+    # OPS-11: 위치 항목 동의를 철회한 세션에는 위치 기반 좁히기를 적용하지 않는다.
+    # 철회가 저장만 되고 서버가 계속 위치를 쓰면 철회한 것이 아니다.
+    consents = one(connection, "SELECT consents FROM visitor_sessions WHERE id=%s", (visitor["id"],))["consents"]
+    if consents.get("location") is False:
+        body = body.model_copy(update={"area_id": None})
     values: list = [visitor["festival_id"], body.starts_at or datetime.now(UTC), body.excluded_program_ids]
     clauses = ["ps.festival_id=%s", "ps.status='OPEN'", "p.status='PUBLISHED'", "ps.starts_at>=%s", "NOT (p.id=ANY(%s::uuid[]))"]
     # accessibility는 받아서 input_preferences에 적어 두기만 하고 후보 선정에는 쓰이지 않았다.
