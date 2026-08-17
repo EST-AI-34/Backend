@@ -8,8 +8,8 @@ from ..db import all_rows, audit, jsonb, one, set_clause
 from ..deps import Db, IfMatch, Manager, ManagerOrReviewer, Operator, Scope, User
 from ..domain import classify_issue, is_safe_question, mask_sensitive, search_terms, validate_booking_transition
 from ..errors import bad_request, conflict, found
-from ..http import decode_cursor, paged, success
-from .admin_core import patch_row
+from ..http import cursor_params, keyset, paged, success
+from .admin_core import created, in_festival, patch_row, scoped
 from ..schemas import (BookingStatusIn, BusinessIn, CouponIn, CouponRedeemIn, CrowdSnapshotIn, FestivalBusinessPatch,
                        InternalDocumentIn, InternalDocumentPatch, InternalSearchIn, IssueAnalysisPatch,
                        MerchantInviteIn, ReviewIn, RewardActionIn, RewardCampaignIn, StaffAssignmentIn)
@@ -19,8 +19,26 @@ from ..security import hash_token, random_token
 router = APIRouter()
 
 
-def in_festival(connection, table: str, resource_id: str, festival_id: str) -> bool:
-    return bool(one(connection, f"SELECT 1 FROM {table} WHERE id=%s AND festival_id=%s", (resource_id, festival_id)))
+def redeem_issue(connection, request: Request, issue: dict, actor_id, festival_id: str) -> dict:
+    """발급된 쿠폰을 사용 처리한다.
+
+    운영자 경로(현장 QR 스캔)와 상인 경로가 같은 처리를 한다 — 발급 건을 어떻게 찾고
+    누구 것인지 확인하는 부분만 각 라우트에 있다.
+    """
+    if issue["status"] != "ISSUED" or issue["expired"]:
+        raise conflict("INVALID_COUPON_STATUS", "사용 가능 상태의 쿠폰이 아닙니다.")
+    try:
+        redemption = one(connection, """INSERT INTO coupon_redemptions(coupon_issue_id,festival_business_id,processed_by)
+            VALUES(%s,%s,%s) RETURNING *""", (issue["id"], issue["festival_business_id"], actor_id))
+    except UniqueViolation as error:
+        # 사용 취소된 발급 건은 상태가 ISSUED로 돌아오지만 사용 이력 행은 남아 있다.
+        raise conflict("DUPLICATE_ACTION", "이미 사용 처리된 쿠폰입니다.") from error
+    connection.execute("UPDATE coupon_issues SET status='REDEEMED' WHERE id=%s", (issue["id"],))
+    connection.execute("INSERT INTO business_events(festival_business_id,visitor_session_id,event_type,source) VALUES(%s,%s,'COUPON_REDEEM','COUPON')",
+        (issue["festival_business_id"], issue["visitor_session_id"]))
+    audit(connection, festival_id=festival_id, actor_id=str(actor_id), action="REDEEM", resource_type="COUPON_ISSUE",
+          resource_id=str(issue["id"]), after_data=redemption, request_id=request.state.request_id)
+    return redemption
 
 
 def insert_coupon(connection, business_id: str, body: CouponIn, created_by) -> dict:
@@ -81,8 +99,7 @@ def create_crowd_snapshot(festival_id: str, body: CrowdSnapshotIn, request: Requ
     row = one(connection, """INSERT INTO crowd_snapshots(festival_id,area_id,program_session_id,source_type,crowd_level,
         people_count,estimated_wait_min,captured_at,expires_at,created_by) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
         (festival_id, body.area_id, body.program_session_id, body.source_type, body.crowd_level, body.people_count, body.estimated_wait_min, body.captured_at, body.expires_at, user["id"]))
-    audit(connection, festival_id=festival_id, actor_id=str(user["id"]), action="CREATE", resource_type="CROWD_SNAPSHOT",
-          resource_id=str(row["id"]), after_data=row, request_id=request.state.request_id)
+    created(connection, request, user, festival_id, "CROWD_SNAPSHOT", row)
     return success(request, row)
 
 
@@ -90,15 +107,13 @@ def create_crowd_snapshot(festival_id: str, body: CrowdSnapshotIn, request: Requ
 def bookings(festival_id: str, request: Request, _: Scope, connection: Db, status: str | None = None,
              limit: int = Query(100, ge=1, le=200), cursor: str | None = None):
     """예약·대기표 목록. 티켓과 같은 (created_at, id) 키셋 커서로 자른다."""
-    after = decode_cursor(cursor)
-    rows = all_rows(connection, """SELECT b.id,b.status,b.party_size,b.queue_number,b.called_at,b.created_at,b.updated_at,
+    rows = all_rows(connection, f"""SELECT b.id,b.status,b.party_size,b.queue_number,b.called_at,b.created_at,b.updated_at,
         ps.starts_at,ps.ends_at,p.id AS program_id,p.title AS program_title
         FROM bookings b JOIN program_sessions ps ON ps.id=b.program_session_id JOIN programs p ON p.id=ps.program_id
         WHERE b.festival_id=%(festival_id)s AND (%(status)s::text IS NULL OR b.status=%(status)s)
-        AND (%(after_at)s::timestamptz IS NULL OR (b.created_at,b.id) < (%(after_at)s::timestamptz,%(after_id)s::uuid))
+        AND {keyset(alias="b")}
         ORDER BY b.created_at DESC,b.id DESC LIMIT %(limit)s""",
-        {"festival_id": festival_id, "status": status,
-         "after_at": after[0] if after else None, "after_id": after[1] if after else None, "limit": limit + 1})
+        {"festival_id": festival_id, "status": status, **cursor_params(cursor, limit)})
     rows, page = paged(rows, limit)
     rows.sort(key=lambda row: (row["starts_at"], row["queue_number"] is not None, row["queue_number"] or 0, row["created_at"]))
     return success(request, rows, page=page)
@@ -148,8 +163,7 @@ def create_business(festival_id: str, body: BusinessIn, request: Request, _: Sco
         if not in_festival(connection, "festival_areas", body.area_id, festival_id):
             raise bad_request("AREA_SCOPE_MISMATCH", "부스 구역이 같은 축제에 속하지 않습니다.")
         connection.execute("INSERT INTO booths(festival_business_id,area_id,booth_no) VALUES(%s,%s,%s)", (row["id"], body.area_id, body.booth_no))
-    audit(connection, festival_id=festival_id, actor_id=str(user["id"]), action="CREATE", resource_type="FESTIVAL_BUSINESS",
-          resource_id=str(row["id"]), after_data=row, request_id=request.state.request_id)
+    created(connection, request, user, festival_id, "FESTIVAL_BUSINESS", row)
     return success(request, {**row, "name": business["name"], "registrationNo": business["registration_no"]})
 
 
@@ -188,7 +202,7 @@ INVITATION_HOURS = 72
 @router.get("/admin/festivals/{festival_id}/businesses/{business_id}/invitations")
 def merchant_invitations(festival_id: str, business_id: str, request: Request, _: Scope, user: Manager, connection: Db):
     """업체에 발급한 상인 계정 초대와 현재 연결된 계정."""
-    found(one(connection, "SELECT 1 FROM festival_businesses WHERE id=%s AND festival_id=%s", (business_id, festival_id)))
+    scoped(connection, "festival_businesses", business_id, festival_id)
     rows = all_rows(connection, """SELECT mi.id,mi.email,mi.status,mi.expires_at,mi.accepted_at,mi.created_at,
         (mi.status='PENDING' AND mi.expires_at<=now()) AS expired,u.name AS accepted_name
         FROM merchant_invitations mi LEFT JOIN memberships m ON m.id=mi.membership_id LEFT JOIN users u ON u.id=m.user_id
@@ -207,8 +221,7 @@ def create_merchant_invitation(festival_id: str, business_id: str, body: Merchan
     이미 확인하므로 여기서 다시 검증하지 않는다. 토큰 원문은 응답으로 한 번만 나가고
     서버에는 해시만 남는다 — 유출된 DB로 초대를 수락할 수 없게.
     """
-    found(one(connection, "SELECT 1 FROM festival_businesses WHERE id=%s AND festival_id=%s", (business_id, festival_id)),
-          "참여업체를 찾을 수 없습니다.")
+    scoped(connection, "festival_businesses", business_id, festival_id, "참여업체를 찾을 수 없습니다.")
     token = random_token("mi")
     row = one(connection, """INSERT INTO merchant_invitations(festival_business_id,email,token_hash,invited_by,expires_at)
         VALUES(%s,%s,%s,%s,now()+make_interval(hours => %s)) RETURNING id,email,status,expires_at,created_at""",
@@ -312,8 +325,7 @@ def create_coupon(festival_id: str, business_id: str, body: CouponIn, request: R
     if not one(connection, "SELECT 1 FROM festival_businesses WHERE id=%s AND festival_id=%s AND participation_status='APPROVED'", (business_id, festival_id)):
         raise bad_request("BUSINESS_NOT_APPROVED", "승인된 참여업체만 쿠폰을 발행할 수 있습니다.")
     row = insert_coupon(connection, business_id, body, user["id"])
-    audit(connection, festival_id=festival_id, actor_id=str(user["id"]), action="CREATE", resource_type="COUPON",
-          resource_id=str(row["id"]), after_data=row, request_id=request.state.request_id)
+    created(connection, request, user, festival_id, "COUPON", row)
     return success(request, row)
 
 
@@ -344,19 +356,7 @@ def redeem_coupon_on_site(festival_id: str, body: CouponRedeemIn, request: Reque
         (hash_token(body.issue_token), festival_id))
     if not issue:
         raise bad_request("INVALID_COUPON_TOKEN", "이 축제에서 발급된 쿠폰을 찾을 수 없습니다.")
-    if issue["status"] != "ISSUED" or issue["expired"]:
-        raise conflict("INVALID_COUPON_STATUS", "사용 가능 상태의 쿠폰이 아닙니다.")
-    try:
-        redemption = one(connection, """INSERT INTO coupon_redemptions(coupon_issue_id,festival_business_id,processed_by)
-            VALUES(%s,%s,%s) RETURNING *""", (issue["id"], issue["festival_business_id"], user["id"]))
-    except UniqueViolation as error:
-        # 사용 취소된 발급 건은 상태가 ISSUED로 돌아오지만 사용 이력 행은 남아 있다.
-        raise conflict("DUPLICATE_ACTION", "이미 사용 처리된 쿠폰입니다.") from error
-    connection.execute("UPDATE coupon_issues SET status='REDEEMED' WHERE id=%s", (issue["id"],))
-    connection.execute("INSERT INTO business_events(festival_business_id,visitor_session_id,event_type,source) VALUES(%s,%s,'COUPON_REDEEM','COUPON')",
-        (issue["festival_business_id"], issue["visitor_session_id"]))
-    audit(connection, festival_id=festival_id, actor_id=str(user["id"]), action="REDEEM", resource_type="COUPON_ISSUE",
-          resource_id=str(issue["id"]), after_data=redemption, request_id=request.state.request_id)
+    redemption = redeem_issue(connection, request, issue, user["id"], festival_id)
     return success(request, {**redemption, "couponName": issue["name"]})
 
 
@@ -364,8 +364,7 @@ def redeem_coupon_on_site(festival_id: str, body: CouponRedeemIn, request: Reque
 def create_reward_campaign(festival_id: str, body: RewardCampaignIn, request: Request, _: Scope, user: Manager, connection: Db):
     row = one(connection, """INSERT INTO reward_campaigns(festival_id,name,starts_at,ends_at,daily_point_limit,created_by)
         VALUES(%s,%s,%s,%s,%s,%s) RETURNING *""", (festival_id, body.name, body.starts_at, body.ends_at, body.daily_point_limit, user["id"]))
-    audit(connection, festival_id=festival_id, actor_id=str(user["id"]), action="CREATE", resource_type="REWARD_CAMPAIGN",
-          resource_id=str(row["id"]), after_data=row, request_id=request.state.request_id)
+    created(connection, request, user, festival_id, "REWARD_CAMPAIGN", row)
     return success(request, row)
 
 
@@ -379,8 +378,7 @@ def create_reward_action(festival_id: str, campaign_id: str, body: RewardActionI
     row = found(one(connection, """INSERT INTO reward_actions(campaign_id,action_type,verification_type,points,per_user_limit,rule)
         SELECT %s,%s,%s,%s,%s,%s WHERE EXISTS(SELECT 1 FROM reward_campaigns WHERE id=%s AND festival_id=%s) RETURNING *""",
         (campaign_id, body.action_type, body.verification_type, body.points, body.per_user_limit, jsonb(body.rule), campaign_id, festival_id)))
-    audit(connection, festival_id=festival_id, actor_id=str(user["id"]), action="CREATE", resource_type="REWARD_ACTION",
-          resource_id=str(row["id"]), after_data=row, request_id=request.state.request_id)
+    created(connection, request, user, festival_id, "REWARD_ACTION", row)
     return success(request, row)
 
 
@@ -398,8 +396,7 @@ def create_internal_document(festival_id: str, body: InternalDocumentIn, request
     row = one(connection, """INSERT INTO internal_documents(festival_id,title,document_type,body,source_url,allowed_roles,created_by)
         VALUES(%s,%s,%s,%s,%s,%s,%s) RETURNING id,title,document_type,source_url,allowed_roles,status,created_at""",
         (festival_id, body.title, body.document_type, body.body, body.source_url, jsonb(body.allowed_roles), user["id"]))
-    audit(connection, festival_id=festival_id, actor_id=str(user["id"]), action="CREATE", resource_type="INTERNAL_DOCUMENT",
-          resource_id=str(row["id"]), after_data=row, request_id=request.state.request_id)
+    created(connection, request, user, festival_id, "INTERNAL_DOCUMENT", row)
     return success(request, row)
 
 
@@ -461,7 +458,7 @@ def issue_analysis(festival_id: str, request: Request, _: Scope, connection: Db)
 
 @router.patch("/admin/festivals/{festival_id}/issue-analysis/{ticket_id}")
 def override_issue_analysis(festival_id: str, ticket_id: str, body: IssueAnalysisPatch, request: Request, _: Scope, user: Operator, connection: Db):
-    found(one(connection, "SELECT 1 FROM ops_tickets WHERE id=%s AND festival_id=%s", (ticket_id, festival_id)))
+    scoped(connection, "ops_tickets", ticket_id, festival_id)
     row = one(connection, """INSERT INTO issue_analysis_overrides(ticket_id,topic,sentiment,urgent,note,updated_by)
         VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT(ticket_id) DO UPDATE SET topic=excluded.topic,sentiment=excluded.sentiment,
         urgent=excluded.urgent,note=excluded.note,updated_by=excluded.updated_by,updated_at=now() RETURNING *""",

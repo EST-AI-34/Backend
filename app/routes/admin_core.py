@@ -1,4 +1,5 @@
 import re
+from typing import Any
 
 from fastapi import APIRouter, Request, Response
 from pydantic import BaseModel
@@ -6,7 +7,7 @@ from pydantic import BaseModel
 from ..db import all_rows, audit, jsonb, one, set_clause
 from ..deps import Db, IfMatch, Manager, Scope, User
 from ..domain import safety_facility_order
-from ..errors import bad_request, conflict, forbidden, found
+from ..errors import AppError, bad_request, conflict, forbidden, found
 from ..http import success
 from ..schemas import (AreaIn, AreaPatch, CloneFestivalIn, FacilityIn, FacilityPatch, FestivalIn,
                        FestivalPatch, ProgramIn, ProgramPatch, ProgramSessionIn, ProgramSessionPatch)
@@ -54,15 +55,27 @@ def patch_row(connection, request: Request, user: dict, table: str, resource_id:
     return row
 
 
-def created(connection, request: Request, user: dict, festival_id: str, resource_type: str, row: dict) -> None:
-    """CREATE 감사 로그.
+def created(connection, request: Request, user: dict, festival_id: str | None, resource_type: str, row: dict,
+            after_data: Any = None) -> None:
+    """CREATE 감사 로그. 생성 라우트가 같은 audit(...) 8줄을 반복하던 자리.
 
-    patch_row/archive는 감사 로그를 남기는데 생성 라우트는 남기지 않아서, 무엇이 언제
-    만들어졌는지가 추적에서 통째로 빠져 있었다.
+    after_data를 주면 행 전체 대신 그 값만 남긴다(계정 생성처럼 비밀번호 해시가 섞인 행).
     """
     audit(connection, festival_id=festival_id, actor_id=str(user["id"]), action="CREATE",
-          resource_type=resource_type, resource_id=str(row["id"]), after_data=row,
+          resource_type=resource_type, resource_id=str(row["id"]),
+          after_data=row if after_data is None else after_data,
           request_id=request.state.request_id)
+
+
+def in_festival(connection, table: str, resource_id: str, festival_id: str) -> bool:
+    """resource_id가 이 축제에 속하는지. 테이블명은 SQL 상수여야 한다(사용자 입력 금지)."""
+    return bool(one(connection, f"SELECT 1 FROM {table} WHERE id=%s AND festival_id=%s", (resource_id, festival_id)))
+
+
+def scoped(connection, table: str, resource_id: str, festival_id: str, message: str = "리소스를 찾을 수 없습니다.") -> None:
+    """축제 범위 밖이면 404. 범위 확인만 하고 행은 쓰지 않는 라우트가 쓴다."""
+    if not in_festival(connection, table, resource_id, festival_id):
+        raise AppError(404, "RESOURCE_NOT_FOUND", message)
 
 
 def archive(connection, request: Request, user: dict, table: str, resource_id: str, festival_id: str,
@@ -87,8 +100,7 @@ def create_festival(body: FestivalIn, request: Request, user: Manager, connectio
         raise forbidden("FESTIVAL_SCOPE_DENIED", "새 축제를 만들 권한이 없습니다.")
     row = one(connection, FESTIVAL_INSERT,
         (user["organization_id"], body.code, body.name, body.description, body.timezone, body.starts_at, body.ends_at, body.default_language, jsonb(body.supported_languages)))
-    audit(connection, festival_id=str(row["id"]), actor_id=str(user["id"]), action="CREATE", resource_type="FESTIVAL",
-          resource_id=str(row["id"]), after_data=row, request_id=request.state.request_id)
+    created(connection, request, user, str(row["id"]), "FESTIVAL", row)
     return success(request, row)
 
 

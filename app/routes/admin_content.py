@@ -6,6 +6,7 @@ from ..deps import Db, Manager, ManagerOrReviewer, Operator, Scope
 from ..domain import validate_content_review
 from ..errors import bad_request, found, unprocessable
 from ..http import success
+from .admin_core import created, scoped
 from ..schemas import AIDecisionIn, ContentItemIn, ContentVersionIn, PublishContentIn, ReviewIn
 
 
@@ -44,8 +45,7 @@ def create_item(festival_id: str, body: ContentItemIn, request: Request, _: Scop
         raise bad_request("FESTIVAL_SCOPE_MISMATCH", "프로그램이 같은 축제에 속하지 않습니다.")
     row = one(connection, "INSERT INTO content_items(festival_id,content_type,resource_type,resource_id,slug) VALUES(%s,%s,%s,%s,%s) RETURNING *",
         (festival_id, body.content_type, body.resource_type, body.resource_id, body.slug))
-    audit(connection, festival_id=festival_id, actor_id=str(user["id"]), action="CREATE", resource_type="CONTENT_ITEM",
-          resource_id=str(row["id"]), after_data=row, request_id=request.state.request_id)
+    created(connection, request, user, festival_id, "CONTENT_ITEM", row)
     return success(request, row)
 
 
@@ -58,14 +58,12 @@ def item_detail(festival_id: str, item_id: str, request: Request, _: Scope, conn
 
 @router.post("/admin/festivals/{festival_id}/content-items/{item_id}/versions", status_code=201)
 def create_version(festival_id: str, item_id: str, body: ContentVersionIn, request: Request, _: Scope, user: Operator, connection: Db):
-    found(one(connection, "SELECT 1 FROM content_items WHERE id=%s AND festival_id=%s", (item_id, festival_id)))
+    scoped(connection, "content_items", item_id, festival_id)
     row = one(connection, """INSERT INTO content_versions(content_item_id,author_id,version_no,language,body,change_note)
         SELECT %s,%s,coalesce(max(version_no),0)+1,%s,%s,%s FROM content_versions
         WHERE content_item_id=%s AND language=%s RETURNING *""",
         (item_id, user["id"], body.language, jsonb(body.body), body.change_note, item_id, body.language))
-    audit(connection, festival_id=festival_id, actor_id=str(user["id"]), action="CREATE",
-          resource_type="CONTENT_VERSION", resource_id=str(row["id"]), after_data=row,
-          request_id=request.state.request_id)
+    created(connection, request, user, festival_id, "CONTENT_VERSION", row)
     return success(request, row)
 
 

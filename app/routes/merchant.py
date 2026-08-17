@@ -7,7 +7,8 @@ from ..errors import bad_request, conflict, forbidden
 from ..http import success
 from ..schemas import BusinessEventIn, BusinessPatch, CouponIn, CouponRedeemIn, CouponReverseIn
 from ..security import hash_token
-from .p2_admin import insert_coupon
+from .admin_core import created
+from .p2_admin import insert_coupon, redeem_issue
 
 
 router = APIRouter()
@@ -58,8 +59,7 @@ def update_business(business_id: str, body: BusinessPatch, request: Request, use
 def create_coupon(business_id: str, body: CouponIn, request: Request, user: Merchant, connection: Db):
     business = owned_business(connection, business_id, user, approved=True)
     row = insert_coupon(connection, business_id, body, user["id"])
-    audit(connection, festival_id=str(business["festival_id"]), actor_id=str(user["id"]), action="CREATE",
-          resource_type="COUPON", resource_id=str(row["id"]), after_data=row, request_id=request.state.request_id)
+    created(connection, request, user, str(business["festival_id"]), "COUPON", row)
     return success(request, row)
 
 
@@ -72,16 +72,7 @@ def redeem_coupon(issue_id: str, body: CouponRedeemIn, request: Request, user: M
         raise forbidden("BUSINESS_SCOPE_DENIED", "본인 업체의 쿠폰만 처리할 수 있습니다.")
     if issue["issue_token_hash"] != hash_token(body.issue_token):
         raise bad_request("INVALID_COUPON_TOKEN", "쿠폰 토큰이 일치하지 않습니다.")
-    if issue["status"] != "ISSUED" or issue["expired"]:
-        raise conflict("INVALID_COUPON_STATUS", "사용 가능 상태의 쿠폰이 아닙니다.")
-    redemption = one(connection, """INSERT INTO coupon_redemptions(coupon_issue_id,festival_business_id,processed_by)
-        VALUES(%s,%s,%s) RETURNING *""", (issue_id, issue["festival_business_id"], user["id"]))
-    connection.execute("UPDATE coupon_issues SET status='REDEEMED' WHERE id=%s", (issue_id,))
-    connection.execute("INSERT INTO business_events(festival_business_id,visitor_session_id,event_type,source) VALUES(%s,%s,'COUPON_REDEEM','COUPON')",
-        (issue["festival_business_id"], issue["visitor_session_id"]))
-    audit(connection, festival_id=str(issue["festival_id"]), actor_id=str(user["id"]), action="REDEEM",
-          resource_type="COUPON_ISSUE", resource_id=str(issue_id), after_data=redemption, request_id=request.state.request_id)
-    return success(request, redemption)
+    return success(request, redeem_issue(connection, request, issue, user["id"], str(issue["festival_id"])))
 
 
 @router.post("/merchant/coupon-redemptions/{redemption_id}/reverse")
@@ -107,9 +98,7 @@ def record_business_event(business_id: str, body: BusinessEventIn, request: Requ
         raise bad_request("VALIDATION_ERROR", "매출 이벤트에는 금액이 필요합니다.")
     row = one(connection, "INSERT INTO business_events(festival_business_id,event_type,sales_amount,source) VALUES(%s,%s,%s,%s) RETURNING *",
         (business_id, body.event_type, body.sales_amount, body.source))
-    audit(connection, festival_id=str(business["festival_id"]), actor_id=str(user["id"]), action="CREATE",
-          resource_type="BUSINESS_EVENT", resource_id=str(row["id"]), after_data=row,
-          request_id=request.state.request_id)
+    created(connection, request, user, str(business["festival_id"]), "BUSINESS_EVENT", row)
     return success(request, row)
 
 
