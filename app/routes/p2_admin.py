@@ -10,6 +10,7 @@ from ..domain import classify_issue, is_safe_question, mask_sensitive, search_te
 from ..errors import bad_request, conflict, found
 from ..http import cursor_params, keyset, paged, success
 from .admin_core import created, in_festival, patch_row, scoped
+from .p2_visitor import promote_waiting
 from ..schemas import (BookingStatusIn, BusinessIn, CouponIn, CouponRedeemIn, CrowdSnapshotIn, FestivalBusinessPatch,
                        InternalDocumentIn, InternalDocumentPatch, InternalSearchIn, IssueAnalysisPatch,
                        MerchantInviteIn, ReviewIn, RewardActionIn, RewardCampaignIn, StaffAssignmentIn)
@@ -129,6 +130,9 @@ def update_booking_status(festival_id: str, booking_id: str, body: BookingStatus
         completed_at=CASE WHEN %(status)s='COMPLETED' THEN now() ELSE completed_at END,
         version=version+1,updated_at=now() WHERE id=%(booking_id)s RETURNING *""",
         {"status": body.status, "booking_id": booking_id})
+    # 노쇼로 빠진 자리는 대기가 채워야 한다 — 안 그러면 정원이 남은 채로 회차가 끝난다.
+    if body.status == "NO_SHOW":
+        promote_waiting(connection, booking["program_session_id"])
     audit(connection, festival_id=festival_id, actor_id=str(user["id"]), action=body.status, resource_type="BOOKING",
           resource_id=booking_id, before_data=booking, after_data={**row, "note": body.note}, request_id=request.state.request_id)
     return success(request, row)
@@ -278,19 +282,24 @@ def business_performance(festival_id: str, request: Request, _: Scope, user: Man
     매출은 수집 동의(sales_consent)가 있는 업체만 집계·표시한다. 비교 통계는 표본이
     MIN_COMPARISON_SAMPLE 미만이면 개별 업체 실적이 역산되므로 내려주지 않는다.
     """
+    # 이벤트와 쿠폰을 한 쿼리에서 조인하면 곱집합이 된다 — 노출 1건이 발급 쿠폰 수만큼
+    # 불어나 전환율과 매출이 통째로 틀렸다. 서로 무관한 집계라 각각 서브쿼리로 센다.
     rows = all_rows(connection, """SELECT fb.id,b.name,fb.category,fb.is_sponsored,fb.esg_participating,fb.sales_consent,
-        count(*) FILTER(WHERE be.event_type='IMPRESSION')::int AS impressions,
-        count(*) FILTER(WHERE be.event_type='VISIT')::int AS visits,
-        count(DISTINCT ci.id)::int AS coupons_issued,
-        count(DISTINCT cr.id) FILTER(WHERE cr.status='REDEEMED')::int AS coupons_redeemed,
-        CASE WHEN fb.sales_consent THEN coalesce(sum(be.sales_amount),0) END AS sales_amount
+        coalesce(e.impressions,0)::int AS impressions,coalesce(e.visits,0)::int AS visits,
+        coalesce(k.coupons_issued,0)::int AS coupons_issued,coalesce(k.coupons_redeemed,0)::int AS coupons_redeemed,
+        CASE WHEN fb.sales_consent THEN coalesce(e.sales_amount,0) END AS sales_amount
         FROM festival_businesses fb JOIN businesses b ON b.id=fb.business_id
-        LEFT JOIN business_events be ON be.festival_business_id=fb.id
-        LEFT JOIN coupons c ON c.festival_business_id=fb.id
-        LEFT JOIN coupon_issues ci ON ci.coupon_id=c.id
-        LEFT JOIN coupon_redemptions cr ON cr.coupon_issue_id=ci.id
+        LEFT JOIN LATERAL (SELECT count(*) FILTER(WHERE be.event_type='IMPRESSION') AS impressions,
+                                  count(*) FILTER(WHERE be.event_type='VISIT') AS visits,
+                                  coalesce(sum(be.sales_amount),0) AS sales_amount
+                           FROM business_events be WHERE be.festival_business_id=fb.id) e ON true
+        LEFT JOIN LATERAL (SELECT count(ci.id) AS coupons_issued,
+                                  count(cr.id) FILTER(WHERE cr.status='REDEEMED') AS coupons_redeemed
+                           FROM coupons c JOIN coupon_issues ci ON ci.coupon_id=c.id
+                           LEFT JOIN coupon_redemptions cr ON cr.coupon_issue_id=ci.id
+                           WHERE c.festival_business_id=fb.id) k ON true
         WHERE fb.festival_id=%s AND fb.participation_status='APPROVED'
-        GROUP BY fb.id,b.name ORDER BY b.name""", (festival_id,))
+        ORDER BY b.name""", (festival_id,))
     for row in rows:
         row["redemption_rate"] = round(row["coupons_redeemed"] / row["coupons_issued"] * 100, 1) if row["coupons_issued"] else None
         row["visit_rate"] = round(row["visits"] / row["impressions"] * 100, 1) if row["impressions"] else None

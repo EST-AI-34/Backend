@@ -7,7 +7,7 @@ from app import ai
 
 from app.domain import (classify_issue, is_safe_question, mask_sensitive, recommendation_bias,
                         risk_brief, score_business, search_terms, select_course, supported_language,
-                        validate_booking_transition, validate_content_review,
+                        validate_booking_cancel_window, validate_booking_transition, validate_content_review,
                         validate_measurement_review, validate_ticket_transition)
 from app.errors import AppError
 from app.security import hash_password, verify_password
@@ -254,3 +254,14 @@ def test_client_errors_are_not_retried(monkeypatch):
 
 def test_server_errors_are_retried(monkeypatch):
     assert count_calls(monkeypatch, 503) == 3
+
+
+def test_self_cancel_closes_before_start():
+    """화면이 "시작 30분 전까지"라고 고지해 온 규칙. 서버가 같은 시각에 닫아야 말이 맞는다."""
+    now = datetime(2026, 9, 12, 9, 0, tzinfo=UTC)
+    validate_booking_cancel_window(now + timedelta(minutes=31), now)
+    with pytest.raises(AppError) as error:
+        validate_booking_cancel_window(now + timedelta(minutes=29), now)
+    assert error.value.code == "CANCEL_WINDOW_CLOSED"
+    with pytest.raises(AppError):
+        validate_booking_cancel_window(now - timedelta(minutes=1), now)

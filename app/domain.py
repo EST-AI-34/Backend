@@ -1,7 +1,7 @@
 import math
 import re
 from collections import Counter
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 from .errors import bad_request, unprocessable
 
@@ -45,6 +45,18 @@ def validate_ticket_transition(current: str, target: str, note: str | None = Non
 def validate_booking_transition(current: str, target: str) -> None:
     if target not in BOOKING_TRANSITIONS.get(current, set()):
         raise bad_request("INVALID_STATE_TRANSITION", f"{current}에서 {target}(으)로 전이할 수 없습니다.")
+
+
+# 방문객 셀프 취소 마감. 화면(방문객·운영자)이 "시작 30분 전까지"라고 고지해 왔는데 서버에는
+# 검사가 없어서 시작 직전은 물론 시작 뒤에도 취소가 됐다. 고지한 규칙을 여기서 강제한다.
+BOOKING_CANCEL_DEADLINE_MINUTES = 30
+
+
+def validate_booking_cancel_window(starts_at, now=None) -> None:
+    now = now or datetime.now(UTC)
+    if starts_at - timedelta(minutes=BOOKING_CANCEL_DEADLINE_MINUTES) <= now:
+        raise bad_request("CANCEL_WINDOW_CLOSED",
+                          f"시작 {BOOKING_CANCEL_DEADLINE_MINUTES}분 전까지만 직접 취소할 수 있습니다. 현장 운영자에게 문의해 주세요.")
 
 
 def validate_content_review(version: dict, reviewer_id: str, decision: str) -> None:

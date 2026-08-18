@@ -9,6 +9,7 @@ from ..deps import Db, IfMatch, Manager, Operator, Scope, SuperAdmin, User
 from ..domain import validate_ticket_transition
 from ..errors import bad_request, conflict, forbidden, found
 from ..esg_export import build_table_artifact
+from ..jobs import PURGE_EVERY_TICKS
 from ..http import Raw, cursor_params, keyset, paged, success
 from ..privacy import CONSENT_ITEMS, RETENTION_POLICY, purge_personal_data, purge_sessions
 from .admin_core import created, patch_row
@@ -408,7 +409,7 @@ def privacy_policy(festival_id: str, request: Request, _: Scope, user: Manager, 
     last_purge = one(connection, """SELECT created_at,after_data FROM audit_logs
         WHERE action='PURGE' AND resource_type='PERSONAL_DATA' ORDER BY created_at DESC LIMIT 1""")
     return success(request, {"retentionPolicy": RETENTION_POLICY, "consentItems": CONSENT_ITEMS,
-                             "purgeSchedule": "매일 1회 배치", "lastPurge": last_purge})
+                             "purgeSchedule": f"{PURGE_EVERY_TICKS // 3600 or 1}시간마다 자동 실행", "lastPurge": last_purge})
 
 
 @router.get("/admin/festivals/{festival_id}/privacy/requests")
@@ -452,7 +453,7 @@ def handle_privacy_request(festival_id: str, privacy_request_id: str, body: Priv
 
 @router.post("/admin/festivals/{festival_id}/privacy/purge")
 def run_privacy_purge(festival_id: str, request: Request, _: Scope, user: SuperAdmin, connection: Db):
-    """정책표에 따른 파기를 즉시 실행한다. 평상시에는 잡 워커가 매일 1회 같은 함수를 돌린다."""
+    """정책표에 따른 파기를 즉시 실행한다. 평상시에는 잡 워커가 주기적으로 같은 함수를 돌린다."""
     counts = purge_personal_data(connection)
     audit(connection, festival_id=festival_id, actor_id=str(user["id"]), action="PURGE_MANUAL",
           resource_type="PERSONAL_DATA", resource_id=None, after_data=counts, request_id=request.state.request_id)
