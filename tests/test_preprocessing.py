@@ -1,7 +1,13 @@
+import json
 from datetime import UTC, datetime, timedelta
 
 from app.domain import recommendation_bias
-from app.preprocessing import build_festival_context, recommendation_exposure_items
+from app.preprocessing import (
+    build_festival_context,
+    cap_context_size,
+    recommendation_exposure_items,
+    select_context_for_question,
+)
 
 
 def test_recommendation_exposure_items_flattens_response_groups():
@@ -150,3 +156,76 @@ def test_build_festival_context_handles_empty_results():
     assert {issue["source"] for issue in context["data_quality"]} >= {
         "congestion", "visitor_count", "ops_tickets", "announcements", "esg_measurements", "facilities",
     }
+
+
+FULL_CONTEXT = {
+    "version": 1,
+    "festival": {"code": "EST34"},
+    "congestion": [{"area_name": "A구역", "crowd_level": "FULL"}],
+    "ops_tickets": [{"title": "안전 이슈"}],
+    "announcements": [{"title": "공지"}],
+    "programs": [{"title": "메인 퍼레이드"}],
+    "esg_measurements": [{"metric_name": "다회용기 사용률"}],
+    "facilities": [{"name": "화장실"}],
+}
+
+
+def test_select_context_for_question_narrows_to_matching_category():
+    """Alan GET 쿼리스트링 크기 문제(414) 대응 — 질문과 무관한 카테고리는 비운다."""
+    congestion = select_context_for_question("지금 어디가 제일 혼잡해?", FULL_CONTEXT)
+    assert congestion["congestion"] == FULL_CONTEXT["congestion"]
+    assert congestion["ops_tickets"] == [] and congestion["esg_measurements"] == []
+
+    esg = select_context_for_question("다회용기 사용률 어때?", FULL_CONTEXT)
+    assert esg["esg_measurements"] == FULL_CONTEXT["esg_measurements"]
+    assert esg["congestion"] == [] and esg["facilities"] == []
+
+    programs = select_context_for_question("퍼레이드 몇 시야?", FULL_CONTEXT)
+    assert programs["programs"] == FULL_CONTEXT["programs"]
+    assert programs["esg_measurements"] == []
+
+    # 메타 필드(스키마 골격)는 카테고리 선택과 무관하게 항상 유지된다.
+    assert congestion["version"] == 1 and congestion["festival"] == {"code": "EST34"}
+
+
+def test_select_context_for_question_falls_back_to_safe_core_when_unmatched():
+    result = select_context_for_question("오늘 날씨 어때?", FULL_CONTEXT)
+    assert result["congestion"] == FULL_CONTEXT["congestion"]
+    assert result["ops_tickets"] == FULL_CONTEXT["ops_tickets"]
+    assert result["announcements"] == FULL_CONTEXT["announcements"]
+    assert result["programs"] == [] and result["esg_measurements"] == [] and result["facilities"] == []
+
+
+def test_cap_context_size_trims_lists_without_breaking_json():
+    big_context = {
+        "version": 1,
+        "congestion": [{"area_name": f"구역-{i}", "note": "x" * 50} for i in range(20)],
+        "ops_tickets": [],
+        "announcements": [],
+        "programs": [],
+        "esg_measurements": [],
+        "facilities": [],
+    }
+    capped = cap_context_size(big_context, max_chars=500)
+
+    content = json.dumps(capped, ensure_ascii=False, default=str, sort_keys=True)
+    assert len(content) <= 500
+    assert len(capped["congestion"]) < len(big_context["congestion"])
+    # 앞쪽(=더 우선순위 높은, DB 조회 단계에서 이미 정렬된) 항목이 남아야 한다.
+    assert capped["congestion"][0] == big_context["congestion"][0]
+
+
+def test_cap_context_size_is_noop_when_already_small():
+    small = {"version": 1, "congestion": [{"area_name": "A구역"}], "ops_tickets": [],
+             "announcements": [], "programs": [], "esg_measurements": [], "facilities": []}
+    assert cap_context_size(small, max_chars=2000) == small
+
+
+def test_cap_context_size_gives_up_cleanly_when_lists_are_already_empty():
+    """모든 리스트 카테고리가 이미 비어 있어 더 줄일 게 없으면(메타 필드 자체가 큰 경우
+    포함) 무한루프 없이 그 상태 그대로 반환해야 한다."""
+    oversized_meta = {"version": 1, "generated_at": "x" * 5000,
+                       "congestion": [], "ops_tickets": [], "announcements": [],
+                       "programs": [], "esg_measurements": [], "facilities": []}
+    result = cap_context_size(oversized_meta, max_chars=500)
+    assert result == oversized_meta
