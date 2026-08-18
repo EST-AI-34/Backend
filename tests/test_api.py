@@ -1041,3 +1041,36 @@ def test_completed_bookings_still_occupy_capacity(client, festival, manager, con
                      headers=manager, json={"status": "COMPLETED"}))
     later, _ = book(client, festival, unique, session_id, 1)
     assert later["status"] == "WAITING"
+
+
+def test_kiosk_camera_switch_and_anonymous_metrics(client, festival, manager, visitor, connection):
+    """KIOSK-A11Y-01·ESG-G-08: 중지 스위치는 사유와 함께 감사에 남고, 지표는 세션과 잇지 않는다."""
+    for event in ("CONSENT_SHOWN", "CONSENT_GRANTED", "SUGGESTED", "ACCEPTED", "MANUAL_LARGE_TEXT"):
+        assert client.post("/api/v1/visitor/kiosk-assist-events", headers=visitor,
+                           json={"eventType": event, "modelVersion": "age_gender-1"}).status_code == 204
+    # 개인과 이을 수 있는 값은 애초에 받지 않는다(extra="forbid").
+    assert error_code(client.post("/api/v1/visitor/kiosk-assist-events", headers=visitor,
+                                  json={"eventType": "SUGGESTED", "estimatedAge": 71}), 400) == "VALIDATION_ERROR"
+
+    enabled = data(client.patch(f"/api/v1/admin/festivals/{festival['id']}/kiosk-camera", headers=manager,
+                                json={"enabled": True}))
+    assert enabled["enabled"] is True and enabled["notice"]["processingLocation"]
+    # 중지에는 사유가 필요하다 — 편향·오탐 점검 기록이 남아야 한다.
+    assert error_code(client.patch(f"/api/v1/admin/festivals/{festival['id']}/kiosk-camera", headers=manager,
+                                   json={"enabled": False}), 400) == "STOP_REASON_REQUIRED"
+    stopped = data(client.patch(f"/api/v1/admin/festivals/{festival['id']}/kiosk-camera", headers=manager,
+                                json={"enabled": False, "stopReason": "고령층 오탐 점검"}))
+    assert stopped["enabled"] is False and stopped["stopReason"] == "고령층 오탐 점검"
+
+    view = data(client.get(f"/api/v1/admin/festivals/{festival['id']}/kiosk-camera", headers=manager))
+    assert view["counts"]["ACCEPTED"] >= 1 and view["rates"]["suggestionAcceptRate"] is not None
+    assert view["rates"]["manualLargeTextCount"] >= 1
+    assert any(row["modelVersion"] == "age_gender-1" for row in view["models"])
+    assert connection.execute("SELECT 1 FROM audit_logs WHERE action='KIOSK_CAMERA_TOGGLE'").fetchone()
+    # 카메라를 꺼도 수동 접근성 이용은 계속 기록된다.
+    assert client.post("/api/v1/visitor/kiosk-assist-events", headers=visitor,
+                       json={"eventType": "MANUAL_LARGE_TEXT"}).status_code == 204
+    # 이벤트 테이블에 방문객 세션 참조가 없어야 한다(ESG-G-08).
+    columns = connection.execute("""SELECT column_name FROM information_schema.columns
+        WHERE table_name='kiosk_assist_events'""").fetchall()
+    assert not any("session" in row["column_name"] for row in columns)

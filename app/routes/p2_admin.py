@@ -445,8 +445,10 @@ def search_internal_documents(festival_id: str, body: InternalSearchIn, request:
     patterns = [f"%{term}%" for term in search_terms(body.question)]
     # internal_documents_body_idx(gin_trgm_ops)가 ILIKE ANY를 받는다.
     rows = all_rows(connection, """SELECT id,title,document_type,body,source_url,updated_at FROM internal_documents
-        WHERE festival_id=%s AND status='ACTIVE' AND allowed_roles ? %s AND body ILIKE ANY(%s)
-        ORDER BY updated_at DESC LIMIT 5""", (festival_id, user["role"], patterns)) if patterns else []
+        WHERE festival_id=%(festival_id)s AND status='ACTIVE' AND allowed_roles ? %(role)s AND body ILIKE ANY(%(patterns)s)
+        ORDER BY (SELECT count(*) FROM unnest(%(patterns)s::text[]) pattern WHERE body ILIKE pattern) DESC,
+                 updated_at DESC LIMIT 5""",
+        {"festival_id": festival_id, "role": user["role"], "patterns": patterns}) if patterns else []
     excerpts = [mask_sensitive(row["body"][:500]) for row in rows]
     return success(request, {"answer": "\n\n".join(excerpts) if excerpts else "권한 범위의 운영 문서에서 근거를 찾지 못했습니다.",
                              "sources": [{"documentId": row["id"], "title": row["title"], "sourceUrl": row["source_url"]} for row in rows]})

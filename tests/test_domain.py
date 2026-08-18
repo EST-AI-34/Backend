@@ -53,6 +53,11 @@ def test_phase2_domain_rules():
     masked = mask_sensitive("help@example.com 또는 010-1234-5678")
     assert "example.com" not in masked and "1234-5678" not in masked
     assert search_terms("  야간 공연, 야간-주차! ") == ["야간", "공연", "주차"]
+    # 조사를 뗀 어간이 원본과 함께 따라와야 "화장실이"가 본문의 "화장실은"과 만난다.
+    assert search_terms("화장실이 어디예요") == ["화장실이", "화장실", "어디예요"]
+    assert search_terms("안내소에서는") == ["안내소에서는", "안내소"]
+    # 어간이 1자만 남으면 떼지 않는다("수가" -> "수"는 아무 문서나 걸린다).
+    assert search_terms("수가 부족해요") == ["수가", "부족해요"]
 
 
 def test_course_selection_skips_overlaps_and_deadline():

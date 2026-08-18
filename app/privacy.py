@@ -49,6 +49,7 @@ RETENTION_POLICY: list[dict[str, str]] = [
     {"key": "LOCATION_RECORD", "label": "개인위치정보 확인자료", "featureId": "VIS-03·BIZ-03", "retention": "6개월", "mode": "AUTO"},
     {"key": "MERCHANT_ACCOUNT", "label": "상인 계정", "featureId": "BIZ-05", "retention": "비활성화 후 1년", "mode": "AUTO"},
     {"key": "BOOKING_CONTACT", "label": "예약 최소 연락정보", "featureId": "VIS-06", "retention": "해당 회차 종료 후 7일", "mode": "NOT_COLLECTED"},
+    {"key": "KIOSK_CAMERA_FRAME", "label": "키오스크 얼굴 검출 프레임", "featureId": "KIOSK-A11Y-01·ESG-G-08", "retention": "기기 내 분석 직후 폐기(서버 미수집)", "mode": "NOT_COLLECTED"},
     {"key": "AUDIT_LOG", "label": "감사 로그", "featureId": "OPS-09", "retention": "2년", "mode": "MANUAL"},
 ]
 

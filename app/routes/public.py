@@ -25,7 +25,8 @@ def published_festival(connection: Connection, code: str) -> dict:
     return found(one(
         connection,
         """SELECT id,code,name,description,timezone,starts_at,ends_at,status,default_language,
-                  supported_languages,visitor_menus,transport,updated_at FROM festivals
+                  supported_languages,visitor_menus,transport,
+                  kiosk_camera_enabled,updated_at FROM festivals
            WHERE code=%s AND status IN ('PUBLISHED','ONGOING','ENDED')""",
         (code,),
     ), "게시된 축제를 찾을 수 없습니다.")

@@ -7,8 +7,8 @@ from ..domain import classify_issue, is_safe_question, search_terms
 from ..errors import bad_request, conflict, found
 from ..http import success
 from ..privacy import CONSENT_ITEMS, RETENTION_POLICY, WITHDRAWABLE, delete_where
-from ..schemas import (ComplaintIn, ConsentPatch, ConversationIn, MessageIn, PrivacyRequestIn,
-                       ReportMessageIn, SurveyResponseIn, VisitorAreaIn)
+from ..schemas import (ComplaintIn, ConsentPatch, ConversationIn, KioskAssistEventIn, MessageIn,
+                       PrivacyRequestIn, ReportMessageIn, SurveyResponseIn, VisitorAreaIn)
 
 
 router = APIRouter()
@@ -83,6 +83,22 @@ def visitor_announcements(request: Request, visitor: Visitor, connection: Db):
         "channel": {"type": "WEB_POLL", "pollSeconds": 30,
                     "limitation": "이 화면을 열어 둔 동안에만 새 공지가 도착합니다. 화면을 닫거나 다른 앱을 쓰는 동안에는 알림이 도달하지 않으므로, 긴급 상황은 현장 방송과 안내 인력 안내를 함께 확인해 주세요."},
     })
+
+
+@router.post("/visitor/kiosk-assist-events", status_code=204)
+def kiosk_assist_event(body: KioskAssistEventIn, visitor: Visitor, connection: Db) -> Response:
+    """KIOSK-A11Y-01 익명 효과 지표.
+
+    방문 세션 토큰으로 축제만 확인하고 세션 자체는 저장하지 않는다 — 어떤 세션이 고령으로
+    추정됐는지가 남으면 "수집하지 않는다"는 ESG-G-08 규칙이 사실상 깨진다. 남는 것은
+    축제·이벤트 종류·모델 버전·시각뿐이라, 지표는 건수 비율로만 계산된다.
+
+    카메라 제안이 꺼진 축제에서도 MANUAL_LARGE_TEXT는 기록한다 — 중지 스위치를 내린 뒤
+    수동 전환만으로 접근성 이용이 유지되는지 확인해야 하기 때문이다(ESG-G-08 완료 기준).
+    """
+    connection.execute("INSERT INTO kiosk_assist_events(festival_id,event_type,model_version) VALUES(%s,%s,%s)",
+                       (visitor["festival_id"], body.event_type, body.model_version))
+    return Response(status_code=204)
 
 
 @router.get("/visitor/privacy")
@@ -192,13 +208,23 @@ def send_message(conversation_id: str, body: MessageIn, request: Request, visito
         return success(request, {"messageId": row["id"], "answer": row["answer"], "safetyStatus": "BLOCKED", "sources": [], "fallback": fallback})
 
     patterns = [f"%{term}%" for term in search_terms(body.message)]
-    sources = all_rows(connection, """SELECT cv.id AS content_version_id,cv.body,cv.language,ci.content_type,ci.resource_type,
-        ci.slug,ci.updated_at,f.code AS festival_code FROM content_items ci
-        JOIN content_versions cv ON cv.id=ci.published_version_id JOIN festivals f ON f.id=ci.festival_id
-        WHERE ci.festival_id=%s AND ci.lifecycle_status='PUBLISHED' AND cv.status='APPROVED'
-          AND (coalesce(cv.body->>'title','') || ' ' || coalesce(cv.body->>'summary','') || ' ' ||
-               coalesce(cv.body->>'description','') || ' ' || coalesce(cv.body->>'text','')) ILIKE ANY(%s)
-        ORDER BY ci.updated_at DESC LIMIT 3""", (visitor["festival_id"], patterns)) if patterns else []
+    # 최신순으로 뽑던 걸 맞은 검색어 개수순으로 바꿨다. "아이 잃어버렸어요"가 분실물 안내 대신
+    # "아이"만 걸린 프로그램 문서를 물어왔다. 동점이면 제목이 걸린 문서, 그다음 최신순.
+    # 시드는 한 트랜잭션이라 updated_at이 전부 같다. slug까지 넣어야 순서가 매번 같다.
+    sources = all_rows(connection, """SELECT content_version_id,body,language,content_type,resource_type,slug,updated_at,festival_code
+        FROM (SELECT cv.id AS content_version_id,cv.body,cv.language,ci.content_type,ci.resource_type,
+                ci.slug,ci.updated_at,f.code AS festival_code,
+                coalesce(cv.body->>'title','') AS title,
+                coalesce(cv.body->>'title','') || ' ' || coalesce(cv.body->>'summary','') || ' ' ||
+                coalesce(cv.body->>'description','') || ' ' || coalesce(cv.body->>'text','') AS haystack
+              FROM content_items ci
+              JOIN content_versions cv ON cv.id=ci.published_version_id JOIN festivals f ON f.id=ci.festival_id
+              WHERE ci.festival_id=%(festival_id)s AND ci.lifecycle_status='PUBLISHED' AND cv.status='APPROVED') candidates
+        WHERE haystack ILIKE ANY(%(patterns)s)
+        ORDER BY (SELECT count(*) FROM unnest(%(patterns)s::text[]) pattern WHERE haystack ILIKE pattern) DESC,
+                 (SELECT count(*) FROM unnest(%(patterns)s::text[]) pattern WHERE title ILIKE pattern) DESC,
+                 updated_at DESC, slug LIMIT 3""",
+        {"festival_id": visitor["festival_id"], "patterns": patterns}) if patterns else []
     allowed = bool(sources)
     excerpts = [source["body"].get("summary") or source["body"].get("description") or source["body"].get("title") for source in sources]
     answer = "\n\n".join(filter(None, excerpts)) if allowed else "승인된 축제 정보에서 충분한 근거를 찾지 못했습니다."

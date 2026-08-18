@@ -15,7 +15,7 @@ from ..privacy import CONSENT_ITEMS, RETENTION_POLICY, purge_personal_data, purg
 from .admin_core import created, patch_row
 from ..schemas import (AnnouncementDraftIn, AnnouncementIn, AnnouncementPatch, GenericExportIn, MembershipIn,
                        MembershipPatch, PrivacyRequestPatch, PublishAnnouncementIn, SurveyIn, SurveyPatch,
-                       TicketIn, TicketPatch, TicketTransitionIn)
+                       KioskCameraPatch, TicketIn, TicketPatch, TicketTransitionIn)
 from ..security import hash_password
 
 
@@ -509,6 +509,76 @@ def notification_deliveries(festival_id: str, request: Request, _: Scope, user: 
         "channel": {"type": "WEB_POLL", "announcementPollSeconds": 30, "bookingPollSeconds": 10,
                     "limitation": "웹 폴링은 화면이 열려 있는 세션에만 도달합니다. 백그라운드·종료 세션은 도달 보장 범위에서 제외되므로 긴급 상황은 현장 방송 등 오프라인 수단을 병행해야 합니다."},
     })
+
+
+# ESG-G-08 이용자 대상 공개 안내. 화면 문구가 아니라 처리 원칙 자체이므로 API가 단일 기준으로 낸다.
+KIOSK_CAMERA_NOTICE = {
+    "purpose": "키오스크 화면의 글씨 크기를 제안하기 위해서만 얼굴을 일시적으로 감지해 연령대를 추정합니다. 신원 확인이 아닙니다.",
+    "choice": "카메라 사용은 선택입니다. 거절하거나 카메라가 없어도 모든 기능을 그대로 이용할 수 있고, 큰 글씨·음성 안내는 언제든 버튼으로 켤 수 있습니다.",
+    "processingLocation": "추정은 키오스크 기기 안에서만 수행됩니다.",
+    "retention": "영상·얼굴 이미지·특징값·추정 연령은 저장하지 않고 분석 직후 폐기하며 서버로 전송하지 않습니다.",
+    "prohibitedUse": "추정 결과를 가격·입장·자격·추천 우선순위·서비스 이용 제한에 사용하지 않습니다.",
+}
+
+
+def kiosk_camera_state(connection, festival_id: str) -> dict:
+    row = found(one(connection, "SELECT kiosk_camera_enabled,kiosk_camera_stop_reason FROM festivals WHERE id=%s", (festival_id,)))
+    return {"enabled": row["kiosk_camera_enabled"], "stopReason": row["kiosk_camera_stop_reason"], "notice": KIOSK_CAMERA_NOTICE}
+
+
+@router.get("/admin/festivals/{festival_id}/kiosk-camera")
+def kiosk_camera(festival_id: str, request: Request, _: Scope, user: Operator, connection: Db):
+    """ESG-G-08 카메라·AI 투명성 화면: 공개 안내, 중지 스위치 상태, 익명 효과 지표.
+
+    지표는 kiosk_assist_events 건수만으로 계산한다 — 방문객 세션과 잇지 않으므로 개별
+    이용자가 어떤 추정을 받았는지는 조회할 수 없고, 그것이 의도한 한계다.
+    """
+    counts = {row["event_type"]: row["count"] for row in all_rows(connection,
+        """SELECT event_type,count(*)::int AS count FROM kiosk_assist_events
+           WHERE festival_id=%s GROUP BY event_type""", (festival_id,))}
+    models = all_rows(connection, """SELECT coalesce(model_version,'(미기록)') AS model_version,count(*)::int AS count,
+        max(created_at) AS last_seen_at FROM kiosk_assist_events WHERE festival_id=%s
+        GROUP BY 1 ORDER BY count DESC""", (festival_id,))
+    granted = counts.get("CONSENT_GRANTED", 0)
+    suggested = counts.get("SUGGESTED", 0)
+    accepted = counts.get("ACCEPTED", 0)
+    return success(request, {
+        **kiosk_camera_state(connection, festival_id),
+        "counts": counts,
+        "models": models,
+        # 분모가 0이면 비율을 만들지 않는다. 0%로 내리면 "한 번도 안 썼다"가 "다 실패했다"로 읽힌다.
+        "rates": {
+            "consentAcceptRate": _rate(granted, counts.get("CONSENT_SHOWN", 0)),
+            "estimateFailureRate": _rate(counts.get("ESTIMATE_FAILED", 0), granted),
+            "suggestionAcceptRate": _rate(accepted, suggested),
+            "manualLargeTextCount": counts.get("MANUAL_LARGE_TEXT", 0),
+            "taskCompletedCount": counts.get("TASK_COMPLETED", 0),
+        },
+    })
+
+
+def _rate(part: int, total: int) -> float | None:
+    return round(part / total, 3) if total else None
+
+
+@router.patch("/admin/festivals/{festival_id}/kiosk-camera")
+def update_kiosk_camera(festival_id: str, body: KioskCameraPatch, request: Request, _: Scope, user: Manager, connection: Db):
+    """카메라 제안 켜기·중지. 편향·오탐이 확인되면 여기서 내리고 수동 접근성 모드만 남긴다.
+
+    중지 사유를 감사 로그에 남긴다 — 정기 점검 결과가 기록으로 남지 않으면 ESG-G-08의
+    '감시·중지 장치'가 스위치 하나로 끝나 버린다.
+    """
+    if not body.enabled and not (body.stop_reason or "").strip():
+        raise bad_request("STOP_REASON_REQUIRED", "카메라 제안을 중지할 때는 사유를 입력해 주세요.")
+    before = kiosk_camera_state(connection, festival_id)
+    connection.execute("UPDATE festivals SET kiosk_camera_enabled=%s,kiosk_camera_stop_reason=%s WHERE id=%s",
+                       (body.enabled, None if body.enabled else body.stop_reason.strip(), festival_id))
+    after = kiosk_camera_state(connection, festival_id)
+    audit(connection, festival_id=festival_id, actor_id=user["id"], action="KIOSK_CAMERA_TOGGLE",
+          resource_type="FESTIVALS", resource_id=festival_id, request_id=request.state.request_id,
+          before_data={"enabled": before["enabled"], "stopReason": before["stopReason"]},
+          after_data={"enabled": after["enabled"], "stopReason": after["stopReason"]})
+    return success(request, after)
 
 
 @router.get("/jobs/{job_id}")
