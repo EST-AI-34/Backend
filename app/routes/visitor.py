@@ -1,11 +1,14 @@
 from fastapi import APIRouter, Request, Response
 from psycopg.errors import UniqueViolation
 
+from .. import ai
+from ..context_repository import load_festival_context_rows
 from ..db import all_rows, jsonb, one
 from ..deps import Db, Visitor
 from ..domain import classify_issue, is_safe_question, search_terms
 from ..errors import bad_request, conflict, found
 from ..http import success
+from ..preprocessing import build_festival_context
 from ..privacy import CONSENT_ITEMS, RETENTION_POLICY, WITHDRAWABLE, delete_where
 from ..schemas import (ComplaintIn, ConsentPatch, ConversationIn, KioskAssistEventIn, MessageIn,
                        PrivacyRequestIn, ReportMessageIn, SurveyResponseIn, VisitorAreaIn)
@@ -229,10 +232,22 @@ def send_message(conversation_id: str, body: MessageIn, request: Request, visito
     excerpts = [source["body"].get("summary") or source["body"].get("description") or source["body"].get("title") for source in sources]
     answer = "\n\n".join(filter(None, excerpts)) if allowed else "승인된 축제 정보에서 충분한 근거를 찾지 못했습니다."
     fallback = None if allowed else {"type": "HELP_DESK", "message": "현장 안내데스크 또는 공식 연락처를 이용해 주세요."}
+    freshness_at = sources[0]["updated_at"] if sources else None
+
+    # Alan이 근거 있는 답을 주면 승인 콘텐츠 검색 결과 대신 그것을 쓴다. 비활성·실패 시에는
+    # 위에서 이미 만든 승인 콘텐츠 기반 답변/HELP_DESK fallback이 그대로 유지된다.
+    festival_context = build_festival_context(load_festival_context_rows(connection, visitor["festival_id"]))
+    alan_answer = ai.answer_with_festival_context(body.message, festival_context)
+    if alan_answer:
+        answer = alan_answer
+        allowed = True
+        fallback = None
+        freshness_at = festival_context["source_updated_at"]
+
     row = one(connection, """INSERT INTO ai_messages(conversation_id,question,answer,safety_status,freshness_at,fallback,context)
         VALUES(%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
         (conversation_id, body.message, answer, "ALLOWED" if allowed else "INSUFFICIENT_GROUNDING",
-         sources[0]["updated_at"] if sources else None, jsonb(fallback) if fallback else None, jsonb(body.context)))
+         freshness_at, jsonb(fallback) if fallback else None, jsonb(body.context)))
     response_sources = []
     for rank, source in enumerate(sources, 1):
         connection.execute("INSERT INTO ai_message_sources(message_id,content_version_id,rank) VALUES(%s,%s,%s)", (row["id"], source["content_version_id"], rank))

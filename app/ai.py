@@ -4,6 +4,7 @@
 호출부는 이미 가지고 있는 규칙 기반 문장을 그대로 쓴다. 외부 AI가 실제로
 쓰였는지는 응답의 externalAiUsed로 운영자에게 드러낸다.
 """
+import json
 import logging
 import re
 import time
@@ -25,6 +26,10 @@ RISK_INSTRUCTION = (
 ESG_INSTRUCTION = (
     "아래 검증된 ESG 정보만 사용해 운영자 대시보드용 한국어 브리핑을 정확히 한 문장으로 쓰세요. "
     "가장 중요한 상태와 필요한 조치 하나만 언급하고, 새로운 수치를 만들거나 계산하지 마세요."
+)
+FESTIVAL_CONTEXT_INSTRUCTION = (
+    "아래 festival_context에 들어 있는 검증된 운영 데이터만 사용해 방문객 질문에 한국어로 답하세요. "
+    "개인정보, 원본 DB 행, 내부 식별자, 확인되지 않은 수치를 만들지 말고, 근거가 부족하면 안내데스크 이용을 권하세요."
 )
 
 
@@ -64,6 +69,31 @@ def briefing(instruction: str, context: list[str]) -> str | None:
         return None
     _breaker["failures"] = 0
     return answer
+
+
+def answer_with_festival_context(question: str, festival_context: dict) -> str | None:
+    """Visitor AI answer using normalized DB context. Failure keeps existing fallback path.
+
+    회로 차단기(_breaker)는 일부러 재사용하지 않는다 — 방문객 질문은 요청마다 다르고
+    briefing()과 실패 원인을 공유할 이유가 없다. ENABLE_EXTERNAL_AI 조건과 예외 처리
+    범위만 briefing()과 동일하게 맞춘다.
+    """
+    if not settings.external_ai_enabled:
+        return None
+    try:
+        content = json.dumps(festival_context, ensure_ascii=False, default=str, sort_keys=True)
+        return ask_festival_context(question, content)
+    except (AIUnavailable, httpx.HTTPError, ValueError) as error:
+        logger.warning("외부 AI 축제 컨텍스트 답변 실패, 기존 DB 기반 답변을 사용합니다: %s", error)
+        return None
+
+
+def ask_festival_context(question: str, context_json: str) -> str:
+    return one_sentence(ask(
+        "당신은 지역축제 방문객 안내 도우미입니다. "
+        f"{FESTIVAL_CONTEXT_INSTRUCTION}\n\n"
+        f"방문객 질문:\n{question}\n\nfestival_context:\n{context_json}"
+    ))
 
 
 def ask(content: str) -> str:
