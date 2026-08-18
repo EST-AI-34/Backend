@@ -6,7 +6,8 @@ from psycopg.errors import UniqueViolation
 
 from ..db import all_rows, audit, jsonb, one, set_clause
 from ..deps import Db, IfMatch, Manager, ManagerOrReviewer, Operator, Scope, User
-from ..domain import classify_issue, is_safe_question, mask_sensitive, search_terms, validate_booking_transition
+from ..domain import (classify_issue, is_safe_question, mask_sensitive, search_terms,
+                      validate_booking_transition)
 from ..errors import bad_request, conflict, found
 from ..http import cursor_params, keyset, paged, success
 from .admin_core import created, in_festival, patch_row, scoped

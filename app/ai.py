@@ -54,6 +54,10 @@ class AIUnavailable(RuntimeError):
     pass
 
 
+class AIBusy(AIUnavailable):
+    """다른 요청이 공유 client_id를 쓰는 중. Alan 장애가 아니라 대기열 문제다."""
+
+
 # 회로 차단기. briefing()은 DB 커넥션을 쥔 요청 스레드 안에서 동기로 돈다(풀 max_size=10).
 # Alan이 죽으면 대시보드 요청마다 타임아웃 + 재시도만큼 커넥션이 묶여 풀이 마른다.
 # 연속 실패가 쌓이면 한동안 아예 부르지 않고 규칙 기반 문장으로 넘어간다.
@@ -65,10 +69,16 @@ _breaker = {"failures": 0, "open_until": 0.0}
 # ponytail: 프로세스 잠금은 현재 1-worker 배포용이다. 여러 replica 전에 공급자의 세션별 키가 필요하다.
 _alan_lock = threading.Lock()
 
+# 같은 신호면 같은 문장이다. 대시보드는 여러 운영자가 계속 새로고침하는데 그때마다 Alan을
+# 부르면 _alan_lock 뒤로 줄이 서서 체감 지연이 곱해진다. 짧은 TTL 메모로 한 번만 부른다.
+# ponytail: 프로세스 메모리. 여러 replica로 늘릴 때만 공유 캐시(Redis)를 얹는다.
+_briefing_cache: dict[tuple[str, tuple[str, ...]], tuple[float, str]] = {}
+
 
 def reset_breaker() -> None:
     """차단 상태를 지운다. 프로세스 전역 상태라 테스트가 서로 간섭하지 않게 필요하다."""
     _breaker.update(failures=0, open_until=0.0)
+    _briefing_cache.clear()
 
 
 def briefing(instruction: str, context: list[str]) -> str | None:
@@ -77,8 +87,15 @@ def briefing(instruction: str, context: list[str]) -> str | None:
         return None
     if time.monotonic() < _breaker["open_until"]:
         return None
+    key = (instruction, tuple(context))
+    cached = _briefing_cache.get(key)
+    if cached and time.monotonic() < cached[0]:
+        return cached[1]
     try:
         answer = one_sentence(ask(prompt(instruction, context)))
+    except AIBusy:
+        # Alan 장애가 아니라 앞 요청을 기다리는 상황이다. 붙잡아 두지 말고 규칙 문장으로 답한다.
+        return None
     # ValueError는 response.json()이 JSON이 아닌 본문(게이트웨이 HTML 등)을 만났을 때다.
     except (AIUnavailable, httpx.HTTPError, ValueError) as error:
         _breaker["failures"] += 1
@@ -89,6 +106,11 @@ def briefing(instruction: str, context: list[str]) -> str | None:
         logger.warning("외부 AI 브리핑 실패, 규칙 기반 문장을 사용합니다: %s", error)
         return None
     _breaker["failures"] = 0
+    # 캐시가 무한히 자라지 않게 만료된 항목은 쓰기 때 치운다(키 종류가 수십 개 수준이다).
+    now = time.monotonic()
+    for stale in [k for k, (expires, _) in _briefing_cache.items() if expires <= now]:
+        del _briefing_cache[stale]
+    _briefing_cache[key] = (now + settings.briefing_cache_seconds, answer)
     return answer
 
 
@@ -142,19 +164,18 @@ def ask_festival_context(question: str, context_json: str) -> str:
 
 
 def ask(content: str) -> str:
-    """Alan 상태를 앞뒤로 지우고 질문 한 건을 보낸다. 실패 시 AIUnavailable."""
+    """Alan 상태를 지우고 질문 한 건을 보낸다. 실패 시 AIUnavailable, 대기열이면 AIBusy."""
     if settings.alan_client_id.strip() in PLACEHOLDER_KEYS:
         raise AIUnavailable("ALAN_CLIENT_ID가 설정되지 않았습니다.")
-    with _alan_lock:
+    # 답을 받은 뒤에도 상태를 지우면 왕복이 세 번이 된다. 문맥 격리는 질문 직전 reset 하나로
+    # 이미 보장되므로, 사용자를 기다리게 하는 뒤쪽 reset은 보내지 않는다.
+    if not _alan_lock.acquire(timeout=settings.alan_lock_wait_seconds):
+        raise AIBusy("다른 요청이 Alan을 사용 중입니다.")
+    try:
         reset_state()
-        try:
-            data = request({"content": content, "client_id": settings.alan_client_id})
-        finally:
-            try:
-                reset_state()
-            except AIUnavailable as error:
-                # 다음 요청은 사전 reset이 성공해야 질문을 보내므로 현재 응답까지 버릴 이유는 없다.
-                logger.warning("Alan 응답 후 상태 초기화 실패: %s", error)
+        data = request({"content": content, "client_id": settings.alan_client_id})
+    finally:
+        _alan_lock.release()
     answer = data.get("answer")
     if not isinstance(answer, str) or not answer.strip():
         raise AIUnavailable("Alan이 빈 답변을 반환했습니다.")
@@ -162,7 +183,7 @@ def ask(content: str) -> str:
 
 
 def reset_state() -> None:
-    """공유 client_id의 이전 대화 상태를 제거한다. 상태 없음(404)은 정상이다."""
+    """질문 직전에 공유 client_id의 이전 대화 상태를 제거한다. 상태 없음(404)은 정상이다."""
     url = settings.alan_question_url.rsplit("/question", 1)[0] + "/reset-state"
     try:
         with httpx.Client(timeout=timeout()) as client:

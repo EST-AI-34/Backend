@@ -31,6 +31,11 @@ class Settings:
     # 대시보드 응답이 Alan 지연에 묶이지 않도록 짧게 잡는다. 브리핑 한 문장은 이 안에 온다.
     alan_read_timeout: float = float(os.getenv("ALAN_READ_TIMEOUT_SECONDS", "8"))
     alan_max_retries: int = int(os.getenv("ALAN_MAX_RETRIES", "1"))
+    # 공유 client_id 한 개라 Alan 호출은 한 번에 하나다. 이만큼 기다려도 차례가 안 오면
+    # 대시보드를 붙잡지 않고 규칙 기반 문장으로 응답한다.
+    alan_lock_wait_seconds: float = float(os.getenv("ALAN_LOCK_WAIT_SECONDS", "2"))
+    # 같은 신호에 같은 문장을 다시 받으려고 Alan을 기다리지 않는다(ai.briefing 메모 수명).
+    briefing_cache_seconds: float = float(os.getenv("BRIEFING_CACHE_SECONDS", "120"))
     # 추천 노출 이력은 위치정보법 제16조의 수집·이용·제공사실 확인자료에 해당한다(OPS-11 정책표: 6개월).
     recommendation_event_retention_days: int = int(os.getenv("RECOMMENDATION_EVENT_RETENTION_DAYS", "180"))
 

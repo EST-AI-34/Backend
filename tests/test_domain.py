@@ -269,7 +269,7 @@ def test_server_errors_are_retried(monkeypatch):
     assert count_calls(monkeypatch, 503) == 3
 
 
-def test_alan_resets_shared_state_around_each_question(monkeypatch):
+def test_alan_resets_shared_state_before_each_question(monkeypatch):
     import httpx
 
     methods = []
@@ -283,7 +283,29 @@ def test_alan_resets_shared_state_around_each_question(monkeypatch):
     with_settings(monkeypatch, external_ai_enabled=True, alan_client_id="test-uuid")
     stub_transport(monkeypatch, handler)
     assert ai.ask("질문") == "승인된 정보의 답변입니다."
-    assert methods == ["DELETE", "GET", "DELETE"]
+    # 응답 뒤 reset은 보내지 않는다 — 문맥 격리는 질문 직전 reset이 보장하고, 뒤쪽 왕복은
+    # 사용자를 기다리게 할 뿐이다.
+    assert methods == ["DELETE", "GET"]
+
+
+def test_briefing_falls_back_instead_of_waiting_for_a_busy_alan(monkeypatch):
+    import httpx
+
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        return httpx.Response(200, json={"answer": "답변입니다."})
+
+    with_settings(monkeypatch, external_ai_enabled=True, alan_client_id="test-uuid",
+                  alan_lock_wait_seconds=0.01)
+    stub_transport(monkeypatch, handler)
+    with ai._alan_lock:  # 다른 요청이 Alan을 쓰는 중
+        assert ai.briefing(ai.RISK_INSTRUCTION, ["혼잡 90%"]) is None
+    assert calls["n"] == 0
+    # 대기열 때문에 건너뛴 것은 장애가 아니라서 회로 차단기를 열지 않는다.
+    assert ai._breaker["failures"] == 0
+    assert ai.briefing(ai.RISK_INSTRUCTION, ["혼잡 90%"]) == "답변입니다."
 
 
 def test_grounded_answer_only_uses_supplied_sources(monkeypatch):
@@ -314,3 +336,28 @@ def test_self_cancel_closes_before_start():
     assert error.value.code == "CANCEL_WINDOW_CLOSED"
     with pytest.raises(AppError):
         validate_booking_cancel_window(now - timedelta(minutes=1), now)
+
+
+def test_same_signals_reuse_the_cached_briefing(monkeypatch):
+    import httpx
+
+    calls = {"n": 0}
+
+    def handler(request):
+        if request.method == "DELETE":
+            return httpx.Response(200, json={"message": "reset"})
+        calls["n"] += 1
+        return httpx.Response(200, json={"answer": f"답변 {calls['n']}."})
+
+    with_settings(monkeypatch, external_ai_enabled=True, alan_client_id="test-uuid")
+    stub_transport(monkeypatch, handler)
+    assert ai.briefing(ai.RISK_INSTRUCTION, ["혼잡 90%"]) == "답변 1."
+    assert ai.briefing(ai.RISK_INSTRUCTION, ["혼잡 90%"]) == "답변 1."
+    assert calls["n"] == 1
+    # 신호가 바뀌면 캐시를 타지 않는다.
+    assert ai.briefing(ai.RISK_INSTRUCTION, ["혼잡 95%"]) == "답변 2."
+    # 수명이 지나면 다시 부른다.
+    with_settings(monkeypatch, external_ai_enabled=True, alan_client_id="test-uuid",
+                  briefing_cache_seconds=0)
+    assert ai.briefing(ai.RISK_INSTRUCTION, ["혼잡 90%"]) == "답변 3."
+    assert ai.briefing(ai.RISK_INSTRUCTION, ["혼잡 90%"]) == "답변 4."
