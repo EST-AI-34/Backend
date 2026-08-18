@@ -13,6 +13,7 @@ import time
 import httpx
 
 from .config import settings
+from .preprocessing import cap_context_size, select_context_for_question
 
 
 logger = logging.getLogger(__name__)
@@ -116,9 +117,20 @@ def answer_with_festival_context(question: str, festival_context: dict) -> str |
     if not settings.external_ai_enabled:
         return None
     try:
-        content = json.dumps(festival_context, ensure_ascii=False, default=str, sort_keys=True)
+        # Alan 질문 API는 GET 쿼리스트링으로 content를 보낸다(ask()/request() 참고) — 이
+        # 프로젝트가 쓰는 Alan 프록시(kdt-api-function)는 POST JSON body를 지원하지 않는다
+        # (실측: 같은 엔드포인트에 POST하면 404). festival_context 전체(~4.7KB)를 그대로
+        # 실으면 URL이 너무 길어져 Alan이 414(URI Too Long)로 거부한다(실제 재현 확인).
+        # 그래서 전송 방식을 바꾸는 대신 질문에 맞는 카테고리만 골라 크기를 줄인다.
+        narrowed = select_context_for_question(question, festival_context)
+        narrowed = cap_context_size(narrowed)
+        content = json.dumps(narrowed, ensure_ascii=False, default=str, sort_keys=True)
         return ask_festival_context(question, content)
-    except (AIUnavailable, httpx.HTTPError, ValueError) as error:
+    # TypeError/AttributeError도 함께 잡는다 — festival_context가 예상한 dict 모양이 아닌
+    # 경우(현재 유일한 호출부인 build_festival_context() 결과라면 일어나지 않지만, 이
+    # 함수는 공개 헬퍼라 다른 호출부가 생기면 방어가 필요하다) 라우트까지 예외가 새어
+    # 나가 500이 되면 안 되고, 다른 실패와 똑같이 조용히 기존 fallback 경로로 넘어가야 한다.
+    except (AIUnavailable, httpx.HTTPError, ValueError, TypeError, AttributeError) as error:
         logger.warning("외부 AI 축제 컨텍스트 답변 실패, 기존 fallback 경로를 사용합니다: %s", error)
         return None
 

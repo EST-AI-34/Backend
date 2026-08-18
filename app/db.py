@@ -12,12 +12,15 @@ from .config import settings
 from .errors import AppError, bad_request, conflict
 
 
+# prepare_threshold=None: 트랜잭션 모드 pgbouncer(Supabase pooler 등) 뒤에서는 서버측
+# prepared statement 캐시가 물리 커넥션 간에 섞여 DuplicatePreparedStatement로 죽는다
+# (백그라운드 잡 폴러에서 실제 재현 확인). 세션 모드/직결에서도 부작용이 없어 항상 끈다.
 pool = ConnectionPool(
     conninfo=settings.database_url,
     min_size=1,
     max_size=10,
     open=False,
-    kwargs={"row_factory": dict_row},
+    kwargs={"row_factory": dict_row, "prepare_threshold": None},
 )
 
 

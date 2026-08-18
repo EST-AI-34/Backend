@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -332,3 +333,69 @@ def safe_number(value):
 def enum_value(value, allowed: set[str], default: str) -> str:
     text = safe_str(value)
     return text if text in allowed else default
+
+
+# Alan 질문 API는 GET 쿼리스트링으로 content를 보낸다(app/ai.py의 request()). festival_context
+# 전체(카테고리 6개, ~4.7KB)를 그대로 실으면 URL이 길어져 Alan이 414(URI Too Long)로 거부한다
+# (실제 재현 확인). 근본 대응은 질문 의도에 맞는 카테고리만 골라 보내는 것이다 — LLM을 한 번
+# 더 불러 의도를 분류하지 않고 키워드 규칙으로 충분히 가른다.
+CONTEXT_CATEGORY_KEYWORDS = {
+    "congestion": ("혼잡", "붐비", "북적", "사람 많", "괜찮"),
+    "ops_tickets": ("안전", "위험", "사고", "문제", "이슈"),
+    "programs": ("퍼레이드", "공연", "프로그램", "일정", "몇 시", "시간", "변경"),
+    # "알려줘"는 거의 모든 질문에 붙는 범용 어미라 넣지 않는다 — 넣으면 다른 카테고리
+    # 질문에도 announcements가 항상 딸려 붙어 크기 축소 효과가 옅어진다.
+    "announcements": ("공지", "안내사항"),
+    "esg_measurements": ("esg", "다회용기", "재사용", "재활용", "대중교통", "목표"),
+    "facilities": ("화장실", "시설", "안내소", "의무실", "휴게"),
+}
+# 매칭되는 키워드가 하나도 없을 때 쓰는 최소 핵심 카테고리 — 안전·혼잡·공지는 대부분의
+# 방문객 질문에 공통으로 유용하고, 나머지(ESG·시설·프로그램)보다 우선순위가 높다.
+SAFE_CORE_CATEGORIES = ("congestion", "ops_tickets", "announcements")
+CONTEXT_LIST_KEYS = ("congestion", "ops_tickets", "announcements", "esg_measurements", "programs", "facilities")
+
+# GET URL 길이 상한에 맞춘 안전 마진. instruction·질문 문자열까지 포함해 URL 인코딩되므로
+# festival_context 자체는 이보다 더 작게 유지해야 한다.
+MAX_ALAN_CONTEXT_CHARS = 2000
+
+
+def select_context_for_question(question: str, context: dict) -> dict:
+    """질문과 관련된 카테고리만 채우고 나머지는 빈 리스트로 비운 festival_context를 만든다.
+
+    키(key) 자체는 항상 유지한다 — Alan에게 주는 스키마가 질문마다 흔들리지 않게 하기
+    위해서다. 매칭되는 카테고리가 없으면 SAFE_CORE_CATEGORIES로 대체한다.
+    """
+    normalized = (question or "").lower()
+    selected = {
+        category for category, keywords in CONTEXT_CATEGORY_KEYWORDS.items()
+        if any(keyword in normalized for keyword in keywords)
+    }
+    if not selected:
+        selected = set(SAFE_CORE_CATEGORIES)
+
+    narrowed = dict(context)
+    for key in CONTEXT_LIST_KEYS:
+        narrowed[key] = context.get(key, []) if key in selected else []
+    return narrowed
+
+
+def cap_context_size(context: dict, max_chars: int = MAX_ALAN_CONTEXT_CHARS) -> dict:
+    """선택된 카테고리를 담아도 너무 크면 각 리스트를 앞에서부터 남기고 뒤를 줄인다.
+
+    각 카테고리 리스트는 DB 조회 단계(context_repository.py)에서 이미 최신·우선순위
+    순으로 정렬돼 나오므로, 앞쪽만 남기는 것 자체가 "가장 중요한 항목 우선"이다.
+    문자열을 중간에서 자르지 않는다 — 항목 단위로만 줄여 JSON이 항상 유효하게 유지된다.
+    리스트를 전부 비워도 여전히 넘치면(메타 필드 자체가 큰 경우) 더 줄일 게 없으므로
+    그 상태로 반환한다 — 어느 경우든 마지막으로 만든 상태를 항상 크기 검사한 뒤 돌려준다.
+    """
+    capped = dict(context)
+    limit = max((len(capped.get(key) or []) for key in CONTEXT_LIST_KEYS), default=0)
+    while True:
+        content = json.dumps(capped, ensure_ascii=False, default=str, sort_keys=True)
+        if len(content) <= max_chars or limit <= 0:
+            return capped
+        limit -= 1
+        for key in CONTEXT_LIST_KEYS:
+            values = capped.get(key) or []
+            if len(values) > limit:
+                capped[key] = values[:limit]

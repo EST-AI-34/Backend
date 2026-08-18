@@ -205,3 +205,97 @@ def test_facility_question_context_has_restroom(client, visitor, connection, fes
     entry = next(item for item in context["facilities"] if item["name"] == name)
     assert entry["facility_type"] == "RESTROOM"
     assert entry["area_name"] == area_name
+
+
+def stub_alan_transport(monkeypatch, handler):
+    """ai.py가 만드는 httpx.Client에 가짜 전송을 끼운다(tests/test_domain.py와 동일 패턴)."""
+    import httpx
+
+    from app import ai
+
+    real_client = httpx.Client
+    monkeypatch.setattr(ai.httpx, "Client", lambda **_: real_client(transport=httpx.MockTransport(handler)))
+
+
+def test_answer_with_festival_context_never_puts_full_context_in_the_request_url(monkeypatch):
+    """TEST 1 — Alan은 GET 쿼리스트링으로 호출된다(POST 미지원, 실측 404). festival_context
+    전체(~4.7KB)를 그대로 실으면 URL이 길어져 Alan이 414로 거부한다(실제 재현 확인).
+    select_context_for_question이 무관한 카테고리를 비워 URL을 짧게 유지하는지 검증한다."""
+    import httpx
+
+    from app import ai
+
+    import dataclasses
+    monkeypatch.setattr(ai, "settings", dataclasses.replace(
+        ai.settings, external_ai_enabled=True, alan_client_id="test-uuid"))
+
+    seen = {}
+
+    def handler(request):
+        if request.method == "DELETE":
+            return httpx.Response(200, json={"message": "reset"})
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json={"answer": "혼잡 정보 답변입니다."})
+
+    stub_alan_transport(monkeypatch, handler)
+
+    big_context = {
+        "version": 1,
+        "festival": {"code": "EST34"},
+        "congestion": [{"area_name": f"구역-{i}", "note": "x" * 80} for i in range(30)],
+        "ops_tickets": [{"title": f"이슈-{i}", "description": "y" * 80} for i in range(10)],
+        "announcements": [], "programs": [], "esg_measurements": [], "facilities": [],
+    }
+    answer = ai.answer_with_festival_context("지금 어디가 제일 혼잡해?", big_context)
+
+    assert answer == "혼잡 정보 답변입니다."
+    # 원본 context(선택·상한 없이)를 그대로 실었을 때 만들어졌을 URL과 비교한다 — 실제
+    # 배포에서 이 차이(선택 전 ~4.7KB festival_context)가 정확히 414를 유발했다.
+    import json
+    from urllib.parse import quote
+    question = "지금 어디가 제일 혼잡해?"
+    unselected_content = json.dumps(big_context, ensure_ascii=False, default=str, sort_keys=True)
+    unselected_prompt = f"{ai.FESTIVAL_CONTEXT_INSTRUCTION}\n\n방문객 질문:\n{question}\n\nfestival_context:\n{unselected_content}"
+    unselected_url_len = len(quote(unselected_prompt))
+    assert len(seen["url"]) < unselected_url_len * 0.6
+    # ops_tickets 데이터(제목 "이슈-0" 등)는 이 질문(혼잡)과 무관한 카테고리라 URL에
+    # 아예 나타나지 않아야 한다("이슈"라는 단어 자체는 instruction 문구에도 나오므로
+    # ops_tickets INSERT가 만든 구체적인 제목 형태로 검사한다).
+    assert "이슈-0" not in seen["url"] and quote("이슈-0") not in seen["url"]
+
+
+def test_answer_with_festival_context_returns_none_when_alan_rejects_with_414(monkeypatch):
+    """TEST 6 — Alan이 414(URI Too Long)를 반환해도 기존 fallback 경로로 조용히 넘어가야
+    한다. 예외가 라우트까지 새어나가 500이 되면 안 된다(app/routes/visitor.py가 잡는 범위와
+    동일하게 여기서는 answer_with_festival_context 반환값만 확인한다)."""
+    import httpx
+
+    from app import ai
+
+    import dataclasses
+    monkeypatch.setattr(ai, "settings", dataclasses.replace(
+        ai.settings, external_ai_enabled=True, alan_client_id="test-uuid"))
+
+    def handler(request):
+        if request.method == "DELETE":
+            return httpx.Response(200, json={"message": "reset"})
+        return httpx.Response(414, text="Request-URI Too Long")
+
+    stub_alan_transport(monkeypatch, handler)
+
+    answer = ai.answer_with_festival_context("지금 어디가 제일 혼잡해?", {"version": 1, "congestion": []})
+    assert answer is None
+
+
+def test_answer_with_festival_context_returns_none_for_malformed_context(monkeypatch):
+    """festival_context가 예상한 dict 모양이 아니어도(현재 유일한 호출부는 항상 정상 dict를
+    주지만, 공개 헬퍼라 방어가 필요하다) 500 대신 조용히 None으로 fallback해야 한다."""
+    import dataclasses
+
+    from app import ai
+
+    monkeypatch.setattr(ai, "settings", dataclasses.replace(
+        ai.settings, external_ai_enabled=True, alan_client_id="test-uuid"))
+
+    assert ai.answer_with_festival_context("질문", None) is None
+    assert ai.answer_with_festival_context("질문", "not-a-dict") is None
