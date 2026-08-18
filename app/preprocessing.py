@@ -4,6 +4,7 @@ from decimal import Decimal
 
 FESTIVAL_CONTEXT_VERSION = "festival-context-v1"
 RECENT_HOURS = 24
+CROWD_LEVEL_RANK = {"QUIET": 0, "MODERATE": 1, "BUSY": 2, "FULL": 3}
 
 
 def recommendation_exposure_items(events: list[dict]) -> list[dict]:
@@ -52,12 +53,16 @@ def build_festival_context(rows: dict, now: datetime | None = None) -> dict:
             "timezone": safe_str(festival.get("timezone")),
             "status": safe_str(festival.get("status")),
         },
-        "congestion": normalize_congestion(rows.get("congestion_samples") or rows.get("crowd_snapshots") or [], now, quality),
+        "congestion": normalize_congestion(
+            rows.get("congestion_samples") or rows.get("crowd_snapshots") or [],
+            rows.get("congestion_recent") or [], now, quality,
+        ),
         "visitor_count": normalize_visitor_counts(rows.get("visitor_count_samples") or [], quality),
         "ops_tickets": normalize_ops_tickets(rows.get("ops_tickets") or [], now, quality),
         "announcements": normalize_announcements(rows.get("announcements") or [], now, quality),
         "esg_measurements": normalize_esg_measurements(rows.get("esg_measurements") or [], now, quality),
         "programs": normalize_programs(rows.get("programs") or [], now, quality),
+        "facilities": normalize_facilities(rows.get("facilities") or [], quality),
         "data_quality": quality,
     }
     timestamps = source_timestamps(context)
@@ -65,7 +70,8 @@ def build_festival_context(rows: dict, now: datetime | None = None) -> dict:
     return context
 
 
-def normalize_congestion(samples: list[dict], now: datetime, quality: list[dict]) -> list[dict]:
+def normalize_congestion(samples: list[dict], recent_samples: list[dict], now: datetime, quality: list[dict]) -> list[dict]:
+    trend_by_area = congestion_trend_by_area(recent_samples)
     items = []
     for sample in samples[:20]:
         captured_at = as_datetime(sample.get("captured_at"))
@@ -73,8 +79,9 @@ def normalize_congestion(samples: list[dict], now: datetime, quality: list[dict]
         if not captured_at or (expires_at and expires_at <= now):
             quality.append({"source": "congestion", "issue": "stale_or_malformed_sample"})
             continue
+        area_id = safe_str(sample.get("area_id"))
         items.append({
-            "area_id": safe_str(sample.get("area_id")),
+            "area_id": area_id,
             "area_name": safe_str(sample.get("area_name")),
             "crowd_level": enum_value(sample.get("crowd_level"), {"QUIET", "MODERATE", "BUSY", "FULL"}, "UNKNOWN"),
             "people_count": safe_int(sample.get("people_count")),
@@ -82,10 +89,59 @@ def normalize_congestion(samples: list[dict], now: datetime, quality: list[dict]
             "source_type": safe_str(sample.get("source_type")),
             "captured_at": iso(captured_at),
             "expires_at": iso(expires_at),
+            # 최신 스냅샷 한 건만으로는 "지금 원래 이 정도"인지 "방금 급증"인지 구분할 수
+            # 없다. 같은 구역의 최근 스냅샷들을 비교해 방문객 질문("괜찮아?")에 답할 수 있는
+            # 최소한의 추세를 덧붙인다.
+            "trend": trend_by_area.get(area_id, "insufficient_data"),
         })
     if not items:
         quality.append({"source": "congestion", "issue": "empty_result"})
     return items
+
+
+def congestion_trend_by_area(recent_samples: list[dict]) -> dict[str, str]:
+    by_area: dict[str, list[dict]] = {}
+    for sample in recent_samples:
+        area_id = safe_str(sample.get("area_id"))
+        captured_at = as_datetime(sample.get("captured_at"))
+        if not area_id or not captured_at:
+            continue
+        by_area.setdefault(area_id, []).append({
+            "captured_at": captured_at,
+            "people_count": safe_int(sample.get("people_count")),
+            "crowd_level": enum_value(sample.get("crowd_level"), {"QUIET", "MODERATE", "BUSY", "FULL"}, "UNKNOWN"),
+        })
+    trends: dict[str, str] = {}
+    for area_id, points in by_area.items():
+        points.sort(key=lambda point: point["captured_at"])
+        trends[area_id] = trend_from_points(points)
+    return trends
+
+
+def trend_from_points(points: list[dict]) -> str:
+    if len(points) < 2:
+        return "insufficient_data"
+    first, last = points[0], points[-1]
+    if first["people_count"] is not None and last["people_count"] is not None and first["people_count"] > 0:
+        change = (last["people_count"] - first["people_count"]) / first["people_count"]
+        if change >= 0.5:
+            return "rapidly_increasing"
+        if change >= 0.15:
+            return "increasing"
+        if change <= -0.15:
+            return "decreasing"
+        return "stable"
+    first_rank = CROWD_LEVEL_RANK.get(first["crowd_level"])
+    last_rank = CROWD_LEVEL_RANK.get(last["crowd_level"])
+    if first_rank is None or last_rank is None:
+        return "insufficient_data"
+    if last_rank - first_rank >= 2:
+        return "rapidly_increasing"
+    if last_rank > first_rank:
+        return "increasing"
+    if last_rank < first_rank:
+        return "decreasing"
+    return "stable"
 
 
 def normalize_visitor_counts(samples: list[dict], quality: list[dict]) -> dict:
@@ -170,19 +226,43 @@ def normalize_esg_measurements(rows: list[dict], now: datetime, quality: list[di
 
 
 def normalize_programs(rows: list[dict], now: datetime, quality: list[dict]) -> list[dict]:
+    """회차(program_sessions) 단위 일정. "몇 시야?"에는 실제 시작 시각이, "일정 바뀌었어?"에는
+    rescheduled 플래그가 있어야 답할 수 있다 — 프로그램 단위 요약만으로는 둘 다 안 된다."""
     items = []
-    for row in rows[:10]:
-        updated_at = as_datetime(row.get("updated_at"))
-        if updated_at and stale(updated_at, now):
-            quality.append({"source": "programs", "issue": "older_than_24h", "title": safe_str(row.get("title"))})
+    for row in rows[:15]:
+        starts_at = as_datetime(row.get("starts_at"))
+        if not starts_at:
+            quality.append({"source": "programs", "issue": "malformed_timestamp", "title": safe_str(row.get("title"))})
+            continue
         items.append({
             "slug": safe_str(row.get("slug")),
             "title": safe_str(row.get("title"))[:120],
             "category": safe_str(row.get("category")),
-            "status": safe_str(row.get("status")),
-            "next_starts_at": iso(as_datetime(row.get("next_starts_at"))),
+            "area_name": safe_str(row.get("area_name")),
+            "starts_at": iso(starts_at),
+            "ends_at": iso(as_datetime(row.get("ends_at"))),
+            # 운영자 위험 브리프(schedule_change 신호)와 같은 기준: 등록 뒤 1분 넘게 지나
+            # 수정됐으면 변경된 일정으로 본다.
+            "rescheduled": bool(row.get("rescheduled")),
+        })
+    if not items:
+        quality.append({"source": "programs", "issue": "empty_result"})
+    return items
+
+
+def normalize_facilities(rows: list[dict], quality: list[dict]) -> list[dict]:
+    items = []
+    for row in rows[:30]:
+        name = safe_str(row.get("name"))
+        if not name:
+            continue
+        items.append({
+            "name": name,
+            "facility_type": safe_str(row.get("facility_type")),
             "area_name": safe_str(row.get("area_name")),
         })
+    if not items:
+        quality.append({"source": "facilities", "issue": "empty_result"})
     return items
 
 

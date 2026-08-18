@@ -208,7 +208,8 @@ def send_message(conversation_id: str, body: MessageIn, request: Request, visito
             VALUES(%s,%s,%s,'BLOCKED',%s,%s) RETURNING *""",
             (conversation_id, body.message, "보안 또는 개인정보와 관련된 요청에는 답변할 수 없습니다.",
              jsonb(fallback), jsonb(body.context)))
-        return success(request, {"messageId": row["id"], "answer": row["answer"], "safetyStatus": "BLOCKED", "sources": [], "fallback": fallback})
+        return success(request, {"messageId": row["id"], "answer": row["answer"], "safetyStatus": "BLOCKED",
+                                 "sources": [], "fallback": fallback, "externalAiUsed": False})
 
     patterns = [f"%{term}%" for term in search_terms(body.message)]
     # 최신순으로 뽑던 걸 맞은 검색어 개수순으로 바꿨다. "아이 잃어버렸어요"가 분실물 안내 대신
@@ -230,19 +231,28 @@ def send_message(conversation_id: str, body: MessageIn, request: Request, visito
         {"festival_id": visitor["festival_id"], "patterns": patterns}) if patterns else []
     allowed = bool(sources)
     excerpts = [source["body"].get("summary") or source["body"].get("description") or source["body"].get("title") for source in sources]
-    answer = "\n\n".join(filter(None, excerpts)) if allowed else "승인된 축제 정보에서 충분한 근거를 찾지 못했습니다."
-    fallback = None if allowed else {"type": "HELP_DESK", "message": "현장 안내데스크 또는 공식 연락처를 이용해 주세요."}
-    freshness_at = sources[0]["updated_at"] if sources else None
 
-    # Alan이 근거 있는 답을 주면 승인 콘텐츠 검색 결과 대신 그것을 쓴다. 비활성·실패 시에는
-    # 위에서 이미 만든 승인 콘텐츠 기반 답변/HELP_DESK fallback이 그대로 유지된다.
+    # 혼잡·운영 이슈·공지·프로그램·ESG처럼 승인 콘텐츠(문서)가 아니라 실시간 운영 데이터가
+    # 있어야 답할 수 있는 질문("지금 어디가 혼잡해?" 등)은 아래 콘텐츠 검색만으로는 답이
+    # 안 나온다. festival_context 기반 답변을 먼저 시도하고, 거기서 답을 못 만들면(비활성·
+    # 실패·근거 부족) 기존 grounded_answer(승인 콘텐츠) 경로로 넘어간다 — 한 요청에서 Alan을
+    # 두 번 부르지 않는다. ENABLE_EXTERNAL_AI 확인은 briefing()과 같은 자리(ai.py 함수 내부)에
+    # 둔다 — 호출부마다 따로 검사하면 조건이 흩어진다.
     festival_context = build_festival_context(load_festival_context_rows(connection, visitor["festival_id"]))
-    alan_answer = ai.answer_with_festival_context(body.message, festival_context)
-    if alan_answer:
-        answer = alan_answer
+    generated = ai.answer_with_festival_context(body.message, festival_context)
+    freshness_at = festival_context["source_updated_at"]
+    if not generated and allowed:
+        generated = ai.grounded_answer(body.message, sources)
+        freshness_at = sources[0]["updated_at"]
+
+    if generated:
+        answer = generated
         allowed = True
         fallback = None
-        freshness_at = festival_context["source_updated_at"]
+    else:
+        answer = "\n\n".join(filter(None, excerpts)) if allowed else "승인된 축제 정보에서 충분한 근거를 찾지 못했습니다."
+        fallback = None if allowed else {"type": "HELP_DESK", "message": "현장 안내데스크 또는 공식 연락처를 이용해 주세요."}
+        freshness_at = sources[0]["updated_at"] if sources else None
 
     row = one(connection, """INSERT INTO ai_messages(conversation_id,question,answer,safety_status,freshness_at,fallback,context)
         VALUES(%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
@@ -259,7 +269,8 @@ def send_message(conversation_id: str, body: MessageIn, request: Request, visito
             "rank": rank,
         })
     return success(request, {"messageId": row["id"], "answer": row["answer"], "safetyStatus": row["safety_status"],
-                             "freshnessAt": row["freshness_at"], "sources": response_sources, "fallback": fallback})
+                             "freshnessAt": row["freshness_at"], "sources": response_sources, "fallback": fallback,
+                             "externalAiUsed": generated is not None})
 
 
 @router.get("/visitor/ai/conversations/{conversation_id}/messages")
