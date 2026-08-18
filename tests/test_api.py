@@ -5,6 +5,8 @@ DB가 없으면 conftest에서 전체를 건너뛴다.
 """
 import time
 
+import pytest
+
 
 def data(response):
     assert response.status_code in (200, 201), f"{response.status_code} {response.text}"
@@ -304,8 +306,13 @@ def test_ai_blocks_unsafe_question_and_records_it(client, visitor):
                                 headers=visitor, json={"message": "가족 공예 체험 알려줘"}))
     assert answered["safetyStatus"] != "BLOCKED"
 
+    colloquial = data(client.post(f"/api/v1/visitor/ai/conversations/{conversation['id']}/messages",
+                                  headers=visitor, json={"message": "밥 어디서 먹어?"}))
+    assert colloquial["safetyStatus"] == "ALLOWED"
+    assert colloquial["sources"] and colloquial["externalAiUsed"] is False
+
     history = data(client.get(f"/api/v1/visitor/ai/conversations/{conversation['id']}/messages", headers=visitor))
-    assert len(history) == 2
+    assert len(history) == 3
 
 
 def test_ai_conversation_is_scoped_to_its_visitor(client, visitor, festival):
@@ -315,6 +322,30 @@ def test_ai_conversation_is_scoped_to_its_visitor(client, visitor, festival):
     other_headers = {"Authorization": f"Bearer {other.json()['data']['sessionToken']}"}
     response = client.get(f"/api/v1/visitor/ai/conversations/{conversation['id']}/messages", headers=other_headers)
     assert error_code(response, 404) == "RESOURCE_NOT_FOUND"
+
+
+def test_ai_uses_alan_only_after_approved_sources_are_found(client, visitor, monkeypatch):
+    from app import ai
+
+    seen = {}
+
+    def generated(question, sources):
+        seen["question"] = question
+        seen["sources"] = sources
+        return "Alan이 승인 근거로 작성한 답변입니다."
+
+    monkeypatch.setattr(ai, "grounded_answer", generated)
+    conversation = data(client.post("/api/v1/visitor/ai/conversations", headers=visitor, json={"language": "ko"}))
+    answered = data(client.post(f"/api/v1/visitor/ai/conversations/{conversation['id']}/messages",
+                                headers=visitor, json={"message": "차 가져가도 돼?"}))
+    assert answered["answer"] == "Alan이 승인 근거로 작성한 답변입니다."
+    assert answered["externalAiUsed"] is True
+    assert seen["question"] == "차 가져가도 돼?" and seen["sources"]
+
+    monkeypatch.setattr(ai, "grounded_answer", lambda *_: pytest.fail("근거가 없으면 Alan을 호출하면 안 됩니다."))
+    missing = data(client.post(f"/api/v1/visitor/ai/conversations/{conversation['id']}/messages",
+                               headers=visitor, json={"message": "블록체인 채굴 장비?"}))
+    assert missing["safetyStatus"] == "INSUFFICIENT_GROUNDING" and missing["externalAiUsed"] is False
 
 
 # --- AI-04 / BIZ-03 ----------------------------------------------------------

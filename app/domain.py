@@ -123,6 +123,28 @@ JOSA = ("에서는", "에게는", "으로는", "이라는", "에서", "에게", 
         "부터", "보다", "라도", "이라", "은", "는", "이", "가", "을", "를", "에", "와", "과",
         "도", "만", "의", "로")
 
+# 방문객이 실제로 쓰는 구어체를 승인 콘텐츠의 표현으로 잇는다. 범용 형태소 분석기보다
+# 축제 안내에서 자주 실패한 표현만 명시하는 편이 결과와 운영 범위를 예측하기 쉽다.
+QUERY_ALIASES = {
+    "밥": ("먹거리", "음식"),
+    "먹어": ("먹거리", "음식"),
+    "먹을": ("먹거리", "음식"),
+    "차 가져": ("주차", "자가용"),
+    "자동차": ("주차", "자가용"),
+    "몇 시": ("운영 시간",),
+    "몇시": ("운영 시간",),
+    "언제 열": ("운영 시간",),
+    "돈 내": ("입장료", "무료"),
+    "무료야": ("입장료", "무료"),
+    "행사": ("프로그램", "체험"),
+    "애완": ("반려동물",),
+    "멍멍이": ("반려동물", "강아지"),
+    "비 오": ("우천", "비"),
+    "비오": ("우천", "비"),
+    "더워": ("폭염", "그늘막", "식수대"),
+    "다쳤": ("응급", "의료"),
+}
+
 
 def without_josa(term: str) -> str:
     """조사를 뗀 어간. 뗄 게 없거나 남는 글자가 1자면 원본 그대로."""
@@ -135,7 +157,10 @@ def without_josa(term: str) -> str:
 def search_terms(text: str) -> list[str]:
     terms = [term for term in re.split(r"[^\w가-힣]+", text.lower()) if len(term) >= 2][:8]
     # 어간을 원본과 함께 넘긴다(OR 검색이라 원본이 맞던 문서는 계속 맞는다).
-    return list(dict.fromkeys([variant for term in terms for variant in (term, without_josa(term))]))
+    variants = [variant for term in terms for variant in (term, without_josa(term))]
+    lowered = text.lower()
+    variants.extend(alias for phrase, aliases in QUERY_ALIASES.items() if phrase in lowered for alias in aliases)
+    return list(dict.fromkeys(variants))
 
 
 def supported_language(requested: str | None, supported: list[str], default: str) -> str:

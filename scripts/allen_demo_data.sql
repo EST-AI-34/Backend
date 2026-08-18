@@ -156,10 +156,10 @@ VALUES
     '44444444-4444-4444-8444-444444444401',
     '22222222-2222-4222-8222-222222222222',
     '33333333-3333-4333-8333-333333333301',
-    'A Zone Safety Desk',
-    'INFO',
-    '{"wheelchair_accessible": true, "first_aid": true}'::jsonb,
-    '{"open": "10:00", "close": "23:00"}'::jsonb,
+    'A구역 화장실',
+    'RESTROOM',
+    '{"wheelchair_accessible": true}'::jsonb,
+    '{"open": "09:00", "close": "23:00"}'::jsonb,
     'ACTIVE',
     1,
     now(),
@@ -169,10 +169,36 @@ VALUES
     '44444444-4444-4444-8444-444444444402',
     '22222222-2222-4222-8222-222222222222',
     '33333333-3333-4333-8333-333333333302',
-    'B Zone Refill Station',
-    'WATER',
-    '{"refill": true, "bottle_wash": true}'::jsonb,
-    '{"open": "10:00", "close": "22:00"}'::jsonb,
+    'B구역 화장실',
+    'RESTROOM',
+    '{"wheelchair_accessible": true}'::jsonb,
+    '{"open": "09:00", "close": "23:00"}'::jsonb,
+    'ACTIVE',
+    1,
+    now(),
+    now()
+  ),
+  (
+    '44444444-4444-4444-8444-444444444403',
+    '22222222-2222-4222-8222-222222222222',
+    '33333333-3333-4333-8333-333333333303',
+    '종합 안내소',
+    'INFO',
+    '{"wheelchair_accessible": true, "interpreter": true}'::jsonb,
+    '{"open": "09:00", "close": "23:00"}'::jsonb,
+    'ACTIVE',
+    1,
+    now(),
+    now()
+  ),
+  (
+    '44444444-4444-4444-8444-444444444404',
+    '22222222-2222-4222-8222-222222222222',
+    '33333333-3333-4333-8333-333333333301',
+    '의무실',
+    'MEDICAL',
+    '{"wheelchair_accessible": true, "first_aid": true}'::jsonb,
+    '{"open": "09:00", "close": "23:00"}'::jsonb,
     'ACTIVE',
     1,
     now(),
@@ -226,10 +252,10 @@ VALUES
   (
     '66666666-6666-4666-8666-666666666601',
     '22222222-2222-4222-8222-222222222222',
-    'allen-demo-opening-headliner',
-    'Opening Headliner',
-    'Demo headliner event that drives the A Zone surge.',
-    'MUSIC',
+    'allen-demo-main-parade',
+    '메인 퍼레이드',
+    'A구역 급증을 유발하는 데모 헤드라이너 행사. 시작 시간이 변경됐다(program_sessions.updated_at 참고).',
+    'PARADE',
     '{"captioning": true, "large_text_supported": true}'::jsonb,
     'PUBLISHED',
     1,
@@ -240,10 +266,23 @@ VALUES
     '66666666-6666-4666-8666-666666666602',
     '22222222-2222-4222-8222-222222222222',
     'allen-demo-local-food-showcase',
-    'Local Food Showcase',
-    'Stable B Zone program used as a comparison lane.',
+    'B구역 로컬 푸드쇼',
+    'B구역 안정 상태 비교용 데모 프로그램(일정 변경 없음).',
     'FOOD',
     '{"wheelchair_route": true}'::jsonb,
+    'PUBLISHED',
+    1,
+    now(),
+    now()
+  ),
+  (
+    '66666666-6666-4666-8666-666666666603',
+    '22222222-2222-4222-8222-222222222222',
+    'allen-demo-kpop-concert',
+    'K-POP 공연',
+    '메인 스테이지에서 열리는 데모 K-POP 공연.',
+    'MUSIC',
+    '{"captioning": true}'::jsonb,
     'PUBLISHED',
     1,
     now(),
@@ -265,6 +304,8 @@ INSERT INTO program_sessions (
   updated_at
 )
 VALUES
+  -- 메인 퍼레이드: 원래 등록 시각(created_at)보다 한참 뒤(updated_at)에 시작 시각이 바뀌었다
+  -- (18:00 -> 18:30에 대응하는 30분 지연). "변경된 일정 있어?"에 이 세션이 잡혀야 한다.
   (
     '66666666-7777-4777-8777-666666666701',
     '22222222-2222-4222-8222-222222222222',
@@ -290,6 +331,20 @@ VALUES
     1,
     now() - interval '2 hours',
     now() - interval '2 hours'
+  ),
+  -- K-POP 공연: 변경 없이 등록 그대로(created_at == updated_at) — 일정 변경 질문에서 제외돼야 한다.
+  (
+    '66666666-7777-4777-8777-666666666703',
+    '22222222-2222-4222-8222-222222222222',
+    '66666666-6666-4666-8666-666666666603',
+    '33333333-3333-4333-8333-333333333301',
+    now() + interval '3 hours 30 minutes',
+    now() + interval '5 hours',
+    2000,
+    'OPEN',
+    1,
+    now() - interval '2 hours',
+    now() - interval '2 hours'
   )
 ON CONFLICT DO NOTHING;
 
@@ -306,14 +361,15 @@ INSERT INTO crowd_snapshots (
   created_at
 )
 VALUES
+  -- A구역: 30분 동안 250 -> 520 -> 780 -> 950명으로 급격히 증가 (rapidly_increasing 추세).
   (
     '77777777-7777-4777-8777-777777777701',
     '22222222-2222-4222-8222-222222222222',
     '33333333-3333-4333-8333-333333333301',
     'SENSOR',
-    now() - interval '29 minutes',
-    'QUIET',
-    210,
+    now() - interval '30 minutes',
+    'MODERATE',
+    250,
     now() + interval '2 hours',
     '11111111-2222-4222-8222-111111111102',
     now()
@@ -323,9 +379,9 @@ VALUES
     '22222222-2222-4222-8222-222222222222',
     '33333333-3333-4333-8333-333333333301',
     'SENSOR',
-    now() - interval '19 minutes',
+    now() - interval '20 minutes',
     'BUSY',
-    640,
+    520,
     now() + interval '2 hours',
     '11111111-2222-4222-8222-111111111102',
     now()
@@ -335,21 +391,34 @@ VALUES
     '22222222-2222-4222-8222-222222222222',
     '33333333-3333-4333-8333-333333333301',
     'SENSOR',
-    now() - interval '9 minutes',
-    'FULL',
-    930,
+    now() - interval '10 minutes',
+    'BUSY',
+    780,
     now() + interval '2 hours',
     '11111111-2222-4222-8222-111111111102',
     now()
   ),
   (
+    '77777777-7777-4777-8777-777777777708',
+    '22222222-2222-4222-8222-222222222222',
+    '33333333-3333-4333-8333-333333333301',
+    'SENSOR',
+    now(),
+    'FULL',
+    950,
+    now() + interval '2 hours',
+    '11111111-2222-4222-8222-111111111102',
+    now()
+  ),
+  -- B구역: 같은 30분 동안 180 -> 190 -> 185 -> 200명으로 안정적(stable 추세) — A와 비교되는 대조군.
+  (
     '77777777-7777-4777-8777-777777777704',
     '22222222-2222-4222-8222-222222222222',
     '33333333-3333-4333-8333-333333333302',
     'SENSOR',
-    now() - interval '29 minutes',
+    now() - interval '30 minutes',
     'MODERATE',
-    260,
+    180,
     now() + interval '2 hours',
     '11111111-2222-4222-8222-111111111102',
     now()
@@ -359,9 +428,9 @@ VALUES
     '22222222-2222-4222-8222-222222222222',
     '33333333-3333-4333-8333-333333333302',
     'SENSOR',
-    now() - interval '19 minutes',
+    now() - interval '20 minutes',
     'MODERATE',
-    280,
+    190,
     now() + interval '2 hours',
     '11111111-2222-4222-8222-111111111102',
     now()
@@ -371,9 +440,21 @@ VALUES
     '22222222-2222-4222-8222-222222222222',
     '33333333-3333-4333-8333-333333333302',
     'SENSOR',
-    now() - interval '9 minutes',
+    now() - interval '10 minutes',
     'MODERATE',
-    290,
+    185,
+    now() + interval '2 hours',
+    '11111111-2222-4222-8222-111111111102',
+    now()
+  ),
+  (
+    '77777777-7777-4777-8777-777777777709',
+    '22222222-2222-4222-8222-222222222222',
+    '33333333-3333-4333-8333-333333333302',
+    'SENSOR',
+    now(),
+    'MODERATE',
+    200,
     now() + interval '2 hours',
     '11111111-2222-4222-8222-111111111102',
     now()
@@ -431,6 +512,19 @@ VALUES
     '11111111-2222-4222-8222-111111111102',
     now() - interval '16 minutes',
     now() - interval '3 minutes'
+  ),
+  (
+    '88888888-8888-4888-8888-888888888805',
+    '22222222-2222-4222-8222-222222222222',
+    '33333333-3333-4333-8333-333333333301',
+    'INCIDENT',
+    'HIGH',
+    'OPEN',
+    'A Zone first-aid request',
+    'Synthetic ticket: visitor reported feeling unwell near the main stage crowd line.',
+    '11111111-2222-4222-8222-111111111102',
+    now() - interval '8 minutes',
+    now() - interval '2 minutes'
   ),
   (
     '88888888-8888-4888-8888-888888888803',
@@ -615,7 +709,7 @@ VALUES
     '99999999-cccc-4ccc-8ccc-999999999c01',
     '22222222-2222-4222-8222-222222222222',
     '99999999-aaaa-4aaa-8aaa-999999999a01',
-    'A Zone entry control',
+    'A구역 혼잡으로 우회 동선을 이용해 주세요.',
     'WARNING',
     '["VISITOR"]'::jsonb,
     '["33333333-3333-4333-8333-333333333301"]'::jsonb,
@@ -630,16 +724,31 @@ VALUES
     '99999999-cccc-4ccc-8ccc-999999999c02',
     '22222222-2222-4222-8222-222222222222',
     '99999999-aaaa-4aaa-8aaa-999999999a02',
-    'B Zone food court notice',
-    'INFO',
+    '메인 퍼레이드 시작 시간이 18:00에서 18:30으로 변경되었습니다.',
+    'WARNING',
     '["VISITOR"]'::jsonb,
-    '["33333333-3333-4333-8333-333333333302"]'::jsonb,
+    '[]'::jsonb,
     now() - interval '40 minutes',
     now() + interval '3 hours',
     'ACTIVE',
     1,
     '11111111-2222-4222-8222-111111111101',
     now() - interval '40 minutes'
+  ),
+  (
+    '99999999-cccc-4ccc-8ccc-999999999c03',
+    '22222222-2222-4222-8222-222222222222',
+    NULL,
+    '우천으로 일부 프로그램 장소가 변경되었습니다.',
+    'INFO',
+    '["VISITOR"]'::jsonb,
+    '[]'::jsonb,
+    now() - interval '70 minutes',
+    now() + interval '4 hours',
+    'ACTIVE',
+    1,
+    '11111111-2222-4222-8222-111111111101',
+    now() - interval '70 minutes'
   )
 ON CONFLICT DO NOTHING;
 
@@ -957,7 +1066,7 @@ VALUES
   (
     'dddddddd-1111-4111-8111-dddddddddd01',
     '22222222-2222-4222-8222-222222222222',
-    'Reusable container adoption',
+    '다회용기 사용률',
     'E',
     'ACTIVE',
     '11111111-2222-4222-8222-111111111101',
@@ -966,7 +1075,7 @@ VALUES
   (
     'dddddddd-1111-4111-8111-dddddddddd02',
     '22222222-2222-4222-8222-222222222222',
-    'Public transit visitor share',
+    '대중교통 이용률',
     'E',
     'ACTIVE',
     '11111111-2222-4222-8222-111111111101',
@@ -975,7 +1084,7 @@ VALUES
   (
     'dddddddd-1111-4111-8111-dddddddddd03',
     '22222222-2222-4222-8222-222222222222',
-    'Waste sorting accuracy',
+    '재활용률',
     'E',
     'ACTIVE',
     '11111111-2222-4222-8222-111111111101',
@@ -1014,7 +1123,7 @@ VALUES
     1,
     'public_transit_and_shuttle_arrivals / estimated_total_arrivals * 100',
     '%',
-    65,
+    60,
     '{"required_sources": ["gate_survey_aggregate"], "contains_pii": false}'::jsonb,
     false,
     '11111111-2222-4222-8222-111111111101',
@@ -1050,20 +1159,37 @@ INSERT INTO esg_measurements (
   updated_at
 )
 VALUES
+  -- 다회용기 사용률 추세: 55 -> 58 -> 61 (목표 80, 개선 중). 앞의 두 건은 세 번째 건이
+  -- supersedes_id로 대체해 "정정 이력"을 만든다 — 최신 승인값만 Context에 남는다.
   (
     'dddddddd-3333-4333-8333-dddddddddd21',
     '22222222-2222-4222-8222-222222222222',
     'dddddddd-2222-4222-8222-dddddddddd11',
     55,
     'POS_AGGREGATE',
-    'demo://allen/reusable-container-pos-early',
-    'allen-demo-reuse-early',
+    'demo://allen/reusable-container-pos-t1',
+    'allen-demo-reuse-t1',
     now() - interval '6 hours',
     'SUPERSEDED',
     NULL,
     '11111111-2222-4222-8222-111111111102',
     now() - interval '6 hours',
-    now() - interval '5 hours'
+    now() - interval '4 hours'
+  ),
+  (
+    'dddddddd-3333-4333-8333-dddddddddd25',
+    '22222222-2222-4222-8222-222222222222',
+    'dddddddd-2222-4222-8222-dddddddddd11',
+    58,
+    'POS_AGGREGATE',
+    'demo://allen/reusable-container-pos-t2',
+    'allen-demo-reuse-t2',
+    now() - interval '4 hours',
+    'SUPERSEDED',
+    'dddddddd-3333-4333-8333-dddddddddd21',
+    '11111111-2222-4222-8222-111111111102',
+    now() - interval '4 hours',
+    now() - interval '2 hours'
   ),
   (
     'dddddddd-3333-4333-8333-dddddddddd22',
@@ -1075,16 +1201,17 @@ VALUES
     'allen-demo-reuse-latest',
     now() - interval '2 hours',
     'APPROVED',
-    'dddddddd-3333-4333-8333-dddddddddd21',
+    'dddddddd-3333-4333-8333-dddddddddd25',
     '11111111-2222-4222-8222-111111111102',
     now() - interval '2 hours',
     now() - interval '90 minutes'
   ),
+  -- 대중교통 이용률: 목표 60, 현재 67(목표 초과 달성).
   (
     'dddddddd-3333-4333-8333-dddddddddd23',
     '22222222-2222-4222-8222-222222222222',
     'dddddddd-2222-4222-8222-dddddddddd12',
-    72,
+    67,
     'SURVEY_AGGREGATE',
     'demo://allen/transit-share-gate-summary',
     'allen-demo-transit-latest',
@@ -1095,20 +1222,37 @@ VALUES
     now() - interval '3 hours',
     now() - interval '2 hours'
   ),
+  -- 재활용률: 목표 75, 현재 72(목표 근접, 미달). 승인 완료라 Context에 들어간다.
   (
     'dddddddd-3333-4333-8333-dddddddddd24',
     '22222222-2222-4222-8222-222222222222',
     'dddddddd-2222-4222-8222-dddddddddd13',
-    68,
+    72,
     'MANUAL_INSPECTION',
-    'demo://allen/waste-sorting-pending',
-    'allen-demo-sorting-pending',
+    'demo://allen/recycling-rate-approved',
+    'allen-demo-recycling-approved',
     now() - interval '4 hours',
-    'IN_REVIEW',
+    'APPROVED',
     NULL,
     '11111111-2222-4222-8222-111111111102',
     now() - interval '4 hours',
-    now() - interval '4 hours'
+    now() - interval '3 hours'
+  ),
+  -- 검토 대기 중인 재활용률 최신 집계 — 증빙 없이 제출된 상태(Evidence 없음 사례).
+  (
+    'dddddddd-3333-4333-8333-dddddddddd26',
+    '22222222-2222-4222-8222-222222222222',
+    'dddddddd-2222-4222-8222-dddddddddd13',
+    74,
+    'MANUAL_INSPECTION',
+    'demo://allen/recycling-rate-pending',
+    'allen-demo-recycling-pending',
+    now() - interval '30 minutes',
+    'IN_REVIEW',
+    NULL,
+    '11111111-2222-4222-8222-111111111102',
+    now() - interval '30 minutes',
+    now() - interval '30 minutes'
   )
 ON CONFLICT DO NOTHING;
 
@@ -1254,3 +1398,14 @@ SELECT
 FROM business_recommendation_events event
 WHERE event.festival_id = '22222222-2222-4222-8222-222222222222'
 ORDER BY event.created_at;
+
+SELECT
+  'facilities' AS check_name,
+  facility.name,
+  facility.facility_type,
+  area.name AS area_name,
+  facility.status
+FROM facilities facility
+LEFT JOIN festival_areas area ON area.id = facility.area_id
+WHERE facility.festival_id = '22222222-2222-4222-8222-222222222222'
+ORDER BY facility.facility_type, facility.name;

@@ -7,6 +7,7 @@
 import json
 import logging
 import re
+import threading
 import time
 
 import httpx
@@ -27,9 +28,24 @@ ESG_INSTRUCTION = (
     "아래 검증된 ESG 정보만 사용해 운영자 대시보드용 한국어 브리핑을 정확히 한 문장으로 쓰세요. "
     "가장 중요한 상태와 필요한 조치 하나만 언급하고, 새로운 수치를 만들거나 계산하지 마세요."
 )
+VISITOR_INSTRUCTION = (
+    "방문객의 질문에 아래 승인된 축제 정보만 사용해 친절하고 간결한 한국어로 답하세요. "
+    "정보에 없는 사실은 추측하지 말고, 웹이나 이전 대화의 정보는 사용하지 마세요."
+)
+# festival_context는 승인 콘텐츠(문서)가 아니라 혼잡·운영 이슈·공지·프로그램·ESG 같은
+# 실시간 운영 데이터 스냅샷이다. 문서 인용이 아니라 수치·상태를 있는 그대로 전달해야 한다.
 FESTIVAL_CONTEXT_INSTRUCTION = (
-    "아래 festival_context에 들어 있는 검증된 운영 데이터만 사용해 방문객 질문에 한국어로 답하세요. "
-    "개인정보, 원본 DB 행, 내부 식별자, 확인되지 않은 수치를 만들지 말고, 근거가 부족하면 안내데스크 이용을 권하세요."
+    "당신은 지역축제 방문객 안내 도우미입니다. 아래 festival_context에 들어 있는 검증된 운영 "
+    "데이터만 사용해 방문객 질문에 자연스러운 한국어로 답하세요.\n"
+    "규칙:\n"
+    "- festival_context에 있는 사실만 답하고, 수치나 시각을 새로 만들거나 추측하지 마세요.\n"
+    "- 여러 시점의 혼잡 데이터가 있으면 가장 최신 값과 추세(trend)를 함께 언급하세요.\n"
+    "- 안전/운영 질문에는 해결되지 않은(unresolved) 이슈를 우선 사용하세요.\n"
+    "- 일정 질문에는 변경 이력이 있으면 변경된 시각을 사용하세요.\n"
+    "- ESG 질문에는 현재값(current)과 목표(target)를 함께 비교해 답하세요.\n"
+    "- 시설 질문에는 실제 facilities 목록에 있는 곳만 안내하세요.\n"
+    "- 질문에 답할 근거가 festival_context에 없으면 모른다고 말하고 현장 안내데스크 이용을 "
+    "권하세요. 개인정보, 원본 DB 행, 내부 식별자는 언급하지 마세요."
 )
 
 
@@ -43,6 +59,10 @@ class AIUnavailable(RuntimeError):
 BREAKER_THRESHOLD = 3
 BREAKER_COOLDOWN_SECONDS = 60
 _breaker = {"failures": 0, "open_until": 0.0}
+# Alan 상태는 client_id 단위인데 현재 배포는 할당받은 키 하나를 공유한다. reset과 질문을
+# 한 임계 구역으로 묶어 요청 사이 문맥을 지운다.
+# ponytail: 프로세스 잠금은 현재 1-worker 배포용이다. 여러 replica 전에 공급자의 세션별 키가 필요하다.
+_alan_lock = threading.Lock()
 
 
 def reset_breaker() -> None:
@@ -71,12 +91,27 @@ def briefing(instruction: str, context: list[str]) -> str | None:
     return answer
 
 
-def answer_with_festival_context(question: str, festival_context: dict) -> str | None:
-    """Visitor AI answer using normalized DB context. Failure keeps existing fallback path.
+def grounded_answer(question: str, sources: list[dict]) -> str | None:
+    """승인 콘텐츠가 있을 때만 Alan으로 방문객용 답변을 다듬는다."""
+    if not sources:
+        return None
+    context = []
+    for source in sources:
+        body = source["body"]
+        context.append(" | ".join(filter(None, (
+            body.get("title"), body.get("summary"), body.get("description"), body.get("text"),
+        ))))
+    return briefing(f"{VISITOR_INSTRUCTION}\n\n방문객 질문: {question}", context)
 
-    회로 차단기(_breaker)는 일부러 재사용하지 않는다 — 방문객 질문은 요청마다 다르고
-    briefing()과 실패 원인을 공유할 이유가 없다. ENABLE_EXTERNAL_AI 조건과 예외 처리
-    범위만 briefing()과 동일하게 맞춘다.
+
+def answer_with_festival_context(question: str, festival_context: dict) -> str | None:
+    """혼잡·운영 이슈·공지·프로그램·ESG 같은 실시간 운영 데이터로 방문객 질문에 답한다.
+
+    grounded_answer()(승인 콘텐츠 검색 결과)와 목적이 다르다 — 이쪽은 "지금 어디가
+    혼잡해?"처럼 문서가 아니라 실시간 운영 데이터가 있어야 답할 수 있는 질문을 위한
+    것이다. briefing()의 회로 차단기는 일부러 공유하지 않는다 — 방문객 질문은 요청마다
+    다르고 관리자 브리핑과 실패 원인을 같은 카운터로 묶을 이유가 없다. ENABLE_EXTERNAL_AI
+    조건과 예외 처리 범위, 그리고 ask()가 제공하는 잠금·상태 초기화는 그대로 물려받는다.
     """
     if not settings.external_ai_enabled:
         return None
@@ -84,27 +119,47 @@ def answer_with_festival_context(question: str, festival_context: dict) -> str |
         content = json.dumps(festival_context, ensure_ascii=False, default=str, sort_keys=True)
         return ask_festival_context(question, content)
     except (AIUnavailable, httpx.HTTPError, ValueError) as error:
-        logger.warning("외부 AI 축제 컨텍스트 답변 실패, 기존 DB 기반 답변을 사용합니다: %s", error)
+        logger.warning("외부 AI 축제 컨텍스트 답변 실패, 기존 fallback 경로를 사용합니다: %s", error)
         return None
 
 
 def ask_festival_context(question: str, context_json: str) -> str:
     return one_sentence(ask(
-        "당신은 지역축제 방문객 안내 도우미입니다. "
-        f"{FESTIVAL_CONTEXT_INSTRUCTION}\n\n"
-        f"방문객 질문:\n{question}\n\nfestival_context:\n{context_json}"
+        f"{FESTIVAL_CONTEXT_INSTRUCTION}\n\n방문객 질문:\n{question}\n\nfestival_context:\n{context_json}"
     ))
 
 
 def ask(content: str) -> str:
-    """Alan에 질문 한 건을 보내고 답변을 받는다. 실패 시 AIUnavailable."""
+    """Alan 상태를 앞뒤로 지우고 질문 한 건을 보낸다. 실패 시 AIUnavailable."""
     if settings.alan_client_id.strip() in PLACEHOLDER_KEYS:
         raise AIUnavailable("ALAN_CLIENT_ID가 설정되지 않았습니다.")
-    data = request({"content": content, "client_id": settings.alan_client_id})
+    with _alan_lock:
+        reset_state()
+        try:
+            data = request({"content": content, "client_id": settings.alan_client_id})
+        finally:
+            try:
+                reset_state()
+            except AIUnavailable as error:
+                # 다음 요청은 사전 reset이 성공해야 질문을 보내므로 현재 응답까지 버릴 이유는 없다.
+                logger.warning("Alan 응답 후 상태 초기화 실패: %s", error)
     answer = data.get("answer")
     if not isinstance(answer, str) or not answer.strip():
         raise AIUnavailable("Alan이 빈 답변을 반환했습니다.")
     return answer.strip()
+
+
+def reset_state() -> None:
+    """공유 client_id의 이전 대화 상태를 제거한다. 상태 없음(404)은 정상이다."""
+    url = settings.alan_question_url.rsplit("/question", 1)[0] + "/reset-state"
+    try:
+        with httpx.Client(timeout=timeout()) as client:
+            response = client.request("DELETE", url, json={"client_id": settings.alan_client_id})
+        if response.status_code == 404:
+            return
+        response.raise_for_status()
+    except httpx.HTTPError as error:
+        raise AIUnavailable(f"Alan 대화 상태 초기화에 실패했습니다: {error}") from error
 
 
 def prompt(instruction: str, context: list[str]) -> str:
