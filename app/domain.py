@@ -12,7 +12,11 @@ from .preprocessing import recommendation_exposure_items
 # f-string으로 그대로 SQL에 넣는 상수라 컬럼 참조(column)에 사용자 입력이 들어가면 안 된다.
 def safety_facility_order(column: str = "facility_type") -> str:
     keywords = ("MEDICAL", "SAFETY", "FIRST_AID", "FIRSTAID", "AED", "EMERGENCY", "SECURITY")
-    array = ",".join(f"'%{keyword}%'" for keyword in keywords)
+    # 두 호출부 모두 이 문자열을 파라미터 바인딩이 있는 쿼리에 f-string으로 끼워 넣는다.
+    # psycopg는 실행 전에 SQL 전체에서 %-플레이스홀더를 찾는데, ILIKE 패턴의 리터럴 %가
+    # %M/%S/%F 같은 잘못된 플레이스홀더로 오인돼 "only '%s','%b','%t' are allowed..."로
+    # 죽는다(실제 재현됨: /public/.../facilities 500). %%로 이스케이프해 리터럴 %로 남긴다.
+    array = ",".join(f"'%%{keyword}%%'" for keyword in keywords)
     return f"CASE WHEN {column} ILIKE ANY(ARRAY[{array}]) THEN 0 ELSE 1 END"
 
 
