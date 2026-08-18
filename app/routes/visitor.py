@@ -2,11 +2,13 @@ from fastapi import APIRouter, Request, Response
 from psycopg.errors import UniqueViolation
 
 from .. import ai
+from ..context_repository import load_festival_context_rows
 from ..db import all_rows, jsonb, one
 from ..deps import Db, Visitor
 from ..domain import classify_issue, is_safe_question, search_terms
 from ..errors import bad_request, conflict, found
 from ..http import success
+from ..preprocessing import build_festival_context
 from ..privacy import CONSENT_ITEMS, RETENTION_POLICY, WITHDRAWABLE, delete_where
 from ..schemas import (ComplaintIn, ConsentPatch, ConversationIn, KioskAssistEventIn, MessageIn,
                        PrivacyRequestIn, ReportMessageIn, SurveyResponseIn, VisitorAreaIn)
@@ -229,13 +231,33 @@ def send_message(conversation_id: str, body: MessageIn, request: Request, visito
         {"festival_id": visitor["festival_id"], "patterns": patterns}) if patterns else []
     allowed = bool(sources)
     excerpts = [source["body"].get("summary") or source["body"].get("description") or source["body"].get("title") for source in sources]
-    generated = ai.grounded_answer(body.message, sources) if allowed else None
-    answer = generated or ("\n\n".join(filter(None, excerpts)) if allowed else "승인된 축제 정보에서 충분한 근거를 찾지 못했습니다.")
-    fallback = None if allowed else {"type": "HELP_DESK", "message": "현장 안내데스크 또는 공식 연락처를 이용해 주세요."}
+
+    # 혼잡·운영 이슈·공지·프로그램·ESG처럼 승인 콘텐츠(문서)가 아니라 실시간 운영 데이터가
+    # 있어야 답할 수 있는 질문("지금 어디가 혼잡해?" 등)은 아래 콘텐츠 검색만으로는 답이
+    # 안 나온다. festival_context 기반 답변을 먼저 시도하고, 거기서 답을 못 만들면(비활성·
+    # 실패·근거 부족) 기존 grounded_answer(승인 콘텐츠) 경로로 넘어간다 — 한 요청에서 Alan을
+    # 두 번 부르지 않는다. ENABLE_EXTERNAL_AI 확인은 briefing()과 같은 자리(ai.py 함수 내부)에
+    # 둔다 — 호출부마다 따로 검사하면 조건이 흩어진다.
+    festival_context = build_festival_context(load_festival_context_rows(connection, visitor["festival_id"]))
+    generated = ai.answer_with_festival_context(body.message, festival_context)
+    freshness_at = festival_context["source_updated_at"]
+    if not generated and allowed:
+        generated = ai.grounded_answer(body.message, sources)
+        freshness_at = sources[0]["updated_at"]
+
+    if generated:
+        answer = generated
+        allowed = True
+        fallback = None
+    else:
+        answer = "\n\n".join(filter(None, excerpts)) if allowed else "승인된 축제 정보에서 충분한 근거를 찾지 못했습니다."
+        fallback = None if allowed else {"type": "HELP_DESK", "message": "현장 안내데스크 또는 공식 연락처를 이용해 주세요."}
+        freshness_at = sources[0]["updated_at"] if sources else None
+
     row = one(connection, """INSERT INTO ai_messages(conversation_id,question,answer,safety_status,freshness_at,fallback,context)
         VALUES(%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
         (conversation_id, body.message, answer, "ALLOWED" if allowed else "INSUFFICIENT_GROUNDING",
-         sources[0]["updated_at"] if sources else None, jsonb(fallback) if fallback else None, jsonb(body.context)))
+         freshness_at, jsonb(fallback) if fallback else None, jsonb(body.context)))
     response_sources = []
     for rank, source in enumerate(sources, 1):
         connection.execute("INSERT INTO ai_message_sources(message_id,content_version_id,rank) VALUES(%s,%s,%s)", (row["id"], source["content_version_id"], rank))

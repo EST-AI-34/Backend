@@ -4,6 +4,7 @@ from collections import Counter
 from datetime import UTC, datetime, timedelta
 
 from .errors import bad_request, unprocessable
+from .preprocessing import recommendation_exposure_items
 
 
 # facility_type은 자유 텍스트 컬럼이라 고정된 값 집합이 없다. 안전 관련 키워드가 이름에
@@ -324,17 +325,16 @@ def recommendation_bias(events: list[dict], max_business_share: float = 0.6, max
     sponsored: Counter[str] = Counter()
     categories: Counter[str] = Counter()
     labels: dict[str, dict] = {}
-    for event in events:
-        response = event.get("response_snapshot") or {}
-        for item in (response.get("items") or []) + (response.get("sponsored_items") or []):
-            business_id = str(item.get("business_id") or "")
-            if not business_id:
-                continue
-            businesses[business_id] += 1
-            categories[str(item.get("category") or "UNKNOWN")] += 1
-            labels[business_id] = {"name": item.get("name") or business_id, "category": item.get("category") or "UNKNOWN"}
-            if item.get("is_sponsored"):
-                sponsored[business_id] += 1
+    # 추천 편향 전처리 회귀 방지: response_snapshot이 dict가 아니거나(방어적 스키마 변화),
+    # item이 dict가 아니거나 business_id가 공백뿐인 경우까지 recommendation_exposure_items가
+    # 한곳에서 걸러준다. 여기서 다시 인라인으로 파싱하면 그 방어가 새는 경로가 생긴다.
+    for item in recommendation_exposure_items(events):
+        business_id = item["business_id"]
+        businesses[business_id] += 1
+        categories[str(item["category"])] += 1
+        labels[business_id] = {"name": item["name"], "category": item["category"]}
+        if item["is_sponsored"]:
+            sponsored[business_id] += 1
     total = sum(businesses.values())
     share = (lambda count: round(count / total, 4)) if total else (lambda count: 0.0)
     business_rows = [
