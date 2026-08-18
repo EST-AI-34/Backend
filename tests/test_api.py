@@ -959,3 +959,85 @@ def test_sales_are_only_aggregated_with_business_consent(client, festival, manag
     report = data(client.get(f"/api/v1/admin/festivals/{festival['id']}/business-performance", headers=manager))
     row = next(item for item in report["items"] if item["id"] == business["id"])
     assert row["salesAmount"] is not None
+
+
+def test_business_performance_counts_events_once_per_event(client, festival, manager, reviewer, connection, unique):
+    """이벤트와 쿠폰 발급을 한 쿼리에서 조인하면 노출 1건이 발급 수만큼 불어난다(BIZ-04 전환율·매출이 통째로 틀렸다)."""
+    business = data(client.post(f"/api/v1/admin/festivals/{festival['id']}/businesses", headers=manager, json={
+        "registrationNo": unique("REG"), "name": unique("집계업체"), "category": "FOOD"}))
+    business = data(client.post(f"/api/v1/admin/festivals/{festival['id']}/businesses/{business['id']}/review",
+                                headers=reviewer, json={"decision": "APPROVED"}))
+    data(client.patch(f"/api/v1/admin/festivals/{festival['id']}/businesses/{business['id']}",
+                      headers={**manager, "If-Match": str(business["version"])}, json={"salesConsent": True}))
+    connection.execute("""INSERT INTO business_events(festival_business_id,event_type,sales_amount,source)
+        VALUES(%s,'IMPRESSION',NULL,'TEST'),(%s,'VISIT',NULL,'TEST'),(%s,'SALE',10000,'TEST')""",
+        (business["id"], business["id"], business["id"]))
+    coupon = data(client.post(f"/api/v1/admin/festivals/{festival['id']}/businesses/{business['id']}/coupons",
+                              headers=manager, json={
+        "name": unique("집계쿠폰"), "benefitType": "PERCENT", "benefitValue": 10, "issueLimit": 5, "perVisitorLimit": 1,
+        "startsAt": "2020-01-01T00:00:00Z", "endsAt": "2030-01-01T00:00:00Z"}))
+    for _ in range(3):
+        session = data(client.post(f"/api/v1/public/festivals/{festival['code']}/visitor-sessions",
+                                   json={"language": "ko", "consents": {"privacy": True}}))
+        data(client.post(f"/api/v1/visitor/coupons/{coupon['id']}/issues",
+                         headers={"Authorization": f"Bearer {session['sessionToken']}", "Idempotency-Key": unique("cp")}))
+
+    report = data(client.get(f"/api/v1/admin/festivals/{festival['id']}/business-performance", headers=manager))
+    row = next(item for item in report["items"] if item["id"] == business["id"])
+    assert (row["impressions"], row["visits"], row["couponsIssued"]) == (1, 1, 3)
+    # 쿠폰 발급(3건) × 매출 이벤트(1건)로 3배가 되던 자리다. 쿠폰 발급 이벤트는 이미 1건 더 쌓인다.
+    assert float(row["salesAmount"]) == 10000
+
+
+def waiting_session(client, festival, connection, minutes: int, capacity: int) -> str:
+    program = connection.execute("SELECT id FROM programs WHERE festival_id=%s LIMIT 1", (festival["id"],)).fetchone()
+    area = connection.execute("SELECT id FROM festival_areas WHERE festival_id=%s LIMIT 1", (festival["id"],)).fetchone()
+    row = connection.execute("""INSERT INTO program_sessions(festival_id,program_id,area_id,starts_at,ends_at,capacity)
+        VALUES(%s,%s,%s,now()+make_interval(mins => %s),now()+make_interval(mins => %s),%s) RETURNING id""",
+        (festival["id"], program["id"], area["id"], minutes, minutes + 60, capacity)).fetchone()
+    return str(row["id"])
+
+
+def book(client, festival, unique, session_id: str, party_size: int) -> tuple[dict, dict]:
+    opened = data(client.post(f"/api/v1/public/festivals/{festival['code']}/visitor-sessions",
+                              json={"language": "ko", "consents": {"privacy": True}}))
+    headers = {"Authorization": f"Bearer {opened['sessionToken']}"}
+    booking = data(client.post(f"/api/v1/visitor/program-sessions/{session_id}/bookings",
+                               headers={**headers, "Idempotency-Key": unique("book")}, json={"partySize": party_size}))
+    return booking, headers
+
+
+def test_self_cancel_closes_30_minutes_before_start(client, festival, connection, unique):
+    """방문객·운영자 화면이 고지해 온 취소 마감을 서버가 실제로 막는다(이후는 현장 노쇼 처리)."""
+    session_id = waiting_session(client, festival, connection, minutes=10, capacity=5)
+    booking, headers = book(client, festival, unique, session_id, 1)
+    response = client.delete(f"/api/v1/visitor/bookings/{booking['id']}", headers=headers)
+    assert error_code(response, 400) == "CANCEL_WINDOW_CLOSED"
+
+
+def test_cancel_promotes_every_waiting_that_fits(client, festival, connection, unique):
+    """취소로 난 자리는 순번대로 채운다 — 예전에는 선두 한 건만 보고 끝나 자리가 남았다."""
+    session_id = waiting_session(client, festival, connection, minutes=90, capacity=3)
+    confirmed, headers = book(client, festival, unique, session_id, 3)
+    assert confirmed["status"] == "CONFIRMED"
+    too_big, _ = book(client, festival, unique, session_id, 4)
+    fits, _ = book(client, festival, unique, session_id, 2)
+    last, _ = book(client, festival, unique, session_id, 1)
+    assert [row["status"] for row in (too_big, fits, last)] == ["WAITING"] * 3
+
+    assert client.delete(f"/api/v1/visitor/bookings/{confirmed['id']}", headers=headers).status_code == 204
+    status = {str(row["id"]): row["status"] for row in connection.execute(
+        "SELECT id,status FROM bookings WHERE program_session_id=%s", (session_id,)).fetchall()}
+    assert status[fits["id"]] == "CONFIRMED" and status[last["id"]] == "CONFIRMED"
+    # 인원이 안 맞는 대기는 순번을 잃지 않고 그대로 남는다.
+    assert status[too_big["id"]] == "WAITING"
+
+
+def test_completed_bookings_still_occupy_capacity(client, festival, manager, connection, unique):
+    """입장 완료를 정원에서 빼면 회차 진행 중에 정원 초과 예약이 확정된다."""
+    session_id = waiting_session(client, festival, connection, minutes=90, capacity=1)
+    booking, _ = book(client, festival, unique, session_id, 1)
+    data(client.post(f"/api/v1/admin/festivals/{festival['id']}/bookings/{booking['id']}/status",
+                     headers=manager, json={"status": "COMPLETED"}))
+    later, _ = book(client, festival, unique, session_id, 1)
+    assert later["status"] == "WAITING"

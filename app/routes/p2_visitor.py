@@ -5,7 +5,8 @@ from psycopg.errors import UniqueViolation
 
 from ..db import all_rows, idempotent, jsonb, one
 from ..deps import Db, IdempotencyKey, Visitor
-from ..domain import select_course, supported_language, validate_booking_transition
+from ..domain import (select_course, supported_language, validate_booking_cancel_window,
+                      validate_booking_transition)
 from ..errors import bad_request, conflict, found
 from ..http import idempotent_success, success
 from ..schemas import BookingIn, CoursePlanIn, RewardEventIn, VisitorPreferencesPatch
@@ -17,8 +18,10 @@ router = APIRouter()
 
 
 def reserved_seats(connection, session_id) -> int:
+    """정원을 차지하고 있는 인원. 입장 완료(COMPLETED)도 자리를 쓴 것이다 —
+    빼면 운영자가 입장 처리를 할수록 자리가 비어 보여서 회차 진행 중에 정원 초과 예약이 확정됐다."""
     return one(connection, """SELECT coalesce(sum(party_size),0)::int AS count FROM bookings
-        WHERE program_session_id=%s AND status IN ('CONFIRMED','CALLED')""", (session_id,))["count"]
+        WHERE program_session_id=%s AND status IN ('CONFIRMED','CALLED','COMPLETED')""", (session_id,))["count"]
 
 
 @router.patch("/visitor-sessions/current")
@@ -52,6 +55,7 @@ def public_businesses(festival_code: str, request: Request, response: Response, 
 def public_coupons(festival_code: str, request: Request, response: Response, connection: Db):
     festival = published_festival(connection, festival_code)
     rows = all_rows(connection, """SELECT c.id,c.name,c.description,c.benefit_type,c.benefit_value,c.valid_from,c.valid_until,
+        c.per_visitor_limit,
         c.issue_limit-(SELECT count(*) FROM coupon_issues ci WHERE ci.coupon_id=c.id) AS remaining,b.name AS business_name
         FROM coupons c JOIN festival_businesses fb ON fb.id=c.festival_business_id JOIN businesses b ON b.id=fb.business_id
         WHERE fb.festival_id=%s AND fb.participation_status='APPROVED' AND c.status='ACTIVE'
@@ -102,15 +106,35 @@ def create_booking(session_id: str, body: BookingIn, request: Request, response:
 
 @router.delete("/visitor/bookings/{booking_id}", status_code=204)
 def cancel_booking(booking_id: str, visitor: Visitor, connection: Db) -> Response:
-    booking = found(one(connection, "SELECT * FROM bookings WHERE id=%s AND visitor_session_id=%s FOR UPDATE", (booking_id, visitor["id"])))
+    booking = found(one(connection, """SELECT b.*,ps.starts_at FROM bookings b
+        JOIN program_sessions ps ON ps.id=b.program_session_id
+        WHERE b.id=%s AND b.visitor_session_id=%s FOR UPDATE OF b""", (booking_id, visitor["id"])))
     validate_booking_transition(booking["status"], "CANCELLED")
+    validate_booking_cancel_window(booking["starts_at"])
     connection.execute("UPDATE bookings SET status='CANCELLED',cancelled_at=now(),version=version+1,updated_at=now() WHERE id=%s", (booking_id,))
-    if booking["status"] == "CONFIRMED":
-        session = one(connection, "SELECT capacity FROM program_sessions WHERE id=%s FOR UPDATE", (booking["program_session_id"],))
-        waiting = one(connection, "SELECT * FROM bookings WHERE program_session_id=%s AND status='WAITING' ORDER BY queue_number FOR UPDATE SKIP LOCKED LIMIT 1", (booking["program_session_id"],))
-        if waiting and (session["capacity"] is None or reserved_seats(connection, booking["program_session_id"]) + waiting["party_size"] <= session["capacity"]):
-            connection.execute("UPDATE bookings SET status='CONFIRMED',queue_number=NULL,version=version+1,updated_at=now() WHERE id=%s", (waiting["id"],))
+    # 자리를 쓰고 있던 예약이 빠졌을 때만 대기를 올린다(CALLED도 자리를 차지한다).
+    if booking["status"] in ("CONFIRMED", "CALLED"):
+        promote_waiting(connection, booking["program_session_id"])
     return Response(status_code=204)
+
+
+def promote_waiting(connection, session_id) -> None:
+    """빈 자리만큼 대기를 순번대로 확정한다.
+
+    예전에는 선두 한 건만 봤다 — 5명이 취소해도 한 건만 올라갔고, 선두가 인원 때문에 못
+    들어가면 뒤에 맞는 대기가 있어도 자리가 비어 있는 채로 남았다.
+    인원이 안 맞는 대기는 건너뛰되 순번은 그대로 두어 다음 취소 때 다시 후보가 된다.
+    """
+    session = one(connection, "SELECT capacity FROM program_sessions WHERE id=%s FOR UPDATE", (session_id,))
+    waiting = all_rows(connection, """SELECT id,party_size FROM bookings WHERE program_session_id=%s AND status='WAITING'
+        ORDER BY queue_number FOR UPDATE SKIP LOCKED""", (session_id,))
+    taken = reserved_seats(connection, session_id)
+    for booking in waiting:
+        if session["capacity"] is not None and taken + booking["party_size"] > session["capacity"]:
+            continue
+        connection.execute("UPDATE bookings SET status='CONFIRMED',queue_number=NULL,version=version+1,updated_at=now() WHERE id=%s",
+                           (booking["id"],))
+        taken += booking["party_size"]
 
 
 @router.post("/visitor/course-plans", status_code=201)
@@ -146,8 +170,10 @@ def create_course_plan(body: CoursePlanIn, request: Request, visitor: Visitor, c
 
 @router.get("/visitor/coupons")
 def my_coupons(request: Request, visitor: Visitor, connection: Db):
+    # coupon_id를 함께 준다 — 없으면 화면이 "이미 발급받았는지"를 업체명·쿠폰명 문자열로
+    # 짐작해야 해서, 방문객당 한도가 2장 이상인 쿠폰의 두 번째 발급이 잠겼다.
     rows = all_rows(connection, """SELECT ci.id,CASE WHEN ci.expires_at<=now() AND ci.status='ISSUED' THEN 'EXPIRED' ELSE ci.status END AS status,
-        ci.issued_at,ci.expires_at,c.name,c.description,c.benefit_type,c.benefit_value,b.name AS business_name
+        ci.issued_at,ci.expires_at,ci.coupon_id,c.name,c.description,c.benefit_type,c.benefit_value,b.name AS business_name
         FROM coupon_issues ci JOIN coupons c ON c.id=ci.coupon_id JOIN festival_businesses fb ON fb.id=c.festival_business_id
         JOIN businesses b ON b.id=fb.business_id WHERE ci.visitor_session_id=%s ORDER BY ci.issued_at DESC""", (visitor["id"],))
     return success(request, rows)
