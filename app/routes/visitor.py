@@ -99,8 +99,9 @@ def kiosk_assist_event(body: KioskAssistEventIn, visitor: Visitor, connection: D
     카메라 제안이 꺼진 축제에서도 MANUAL_LARGE_TEXT는 기록한다 — 중지 스위치를 내린 뒤
     수동 전환만으로 접근성 이용이 유지되는지 확인해야 하기 때문이다(ESG-G-08 완료 기준).
     """
-    connection.execute("INSERT INTO kiosk_assist_events(festival_id,event_type,model_version) VALUES(%s,%s,%s)",
-                       (visitor["festival_id"], body.event_type, body.model_version))
+    connection.execute("""INSERT INTO kiosk_assist_events(festival_id,event_type,model_version,result)
+        VALUES(%s,%s,%s,%s)""",
+                       (visitor["festival_id"], body.event_type, body.model_version, body.result))
     return Response(status_code=204)
 
 

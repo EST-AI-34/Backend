@@ -54,8 +54,17 @@ class KioskAssistEventIn(APIModel):
     model_version은 ESG-G-08 편향 점검이 어느 모델의 결과인지 구분하기 위한 것이다.
     """
     event_type: Literal["CONSENT_SHOWN", "CONSENT_GRANTED", "CONSENT_DECLINED", "ESTIMATE_FAILED",
-                        "SUGGESTED", "ACCEPTED", "DISMISSED", "MANUAL_LARGE_TEXT", "TASK_COMPLETED"]
+                        "ESTIMATE_RESULT", "SUGGESTED", "ACCEPTED", "DISMISSED", "MANUAL_LARGE_TEXT", "TASK_COMPLETED"]
     model_version: str | None = Field(default=None, max_length=100)
+    result: Literal["SENIOR", "OTHER", "UNAVAILABLE"] | None = None
+
+    @model_validator(mode="after")
+    def validate_result(self):
+        if self.event_type == "ESTIMATE_RESULT" and self.result is None:
+            raise ValueError("ESTIMATE_RESULT에는 result가 필요합니다.")
+        if self.event_type != "ESTIMATE_RESULT" and self.result is not None:
+            raise ValueError("result는 ESTIMATE_RESULT에서만 사용할 수 있습니다.")
+        return self
 
 
 class KioskCameraPatch(APIModel):

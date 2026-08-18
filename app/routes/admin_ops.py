@@ -531,7 +531,8 @@ def kiosk_camera(festival_id: str, request: Request, _: Scope, user: Operator, c
     """ESG-G-08 카메라·AI 투명성 화면: 공개 안내, 중지 스위치 상태, 익명 효과 지표.
 
     지표는 kiosk_assist_events 건수만으로 계산한다 — 방문객 세션과 잇지 않으므로 개별
-    이용자가 어떤 추정을 받았는지는 조회할 수 없고, 그것이 의도한 한계다.
+    이용자가 어떤 추정을 받았는지는 조회할 수 없다. 연령대 판정 결과도 익명 범주와
+    시각·모델 버전만 남기며 영상·얼굴 특징값·추정 나이는 저장하지 않는다.
     """
     counts = {row["event_type"]: row["count"] for row in all_rows(connection,
         """SELECT event_type,count(*)::int AS count FROM kiosk_assist_events
@@ -539,6 +540,15 @@ def kiosk_camera(festival_id: str, request: Request, _: Scope, user: Operator, c
     models = all_rows(connection, """SELECT coalesce(model_version,'(미기록)') AS model_version,count(*)::int AS count,
         max(created_at) AS last_seen_at FROM kiosk_assist_events WHERE festival_id=%s
         GROUP BY 1 ORDER BY count DESC""", (festival_id,))
+    estimate_result_counts = {row["result"]: row["count"] for row in all_rows(connection,
+        """SELECT result,count(*)::int AS count FROM kiosk_assist_events
+           WHERE festival_id=%s AND event_type='ESTIMATE_RESULT'
+           GROUP BY result ORDER BY result""", (festival_id,))}
+    estimate_result_log = all_rows(connection, """SELECT result,
+        coalesce(model_version,'(미기록)') AS model_version,created_at
+        FROM kiosk_assist_events
+        WHERE festival_id=%s AND event_type='ESTIMATE_RESULT'
+        ORDER BY created_at DESC LIMIT 100""", (festival_id,))
     granted = counts.get("CONSENT_GRANTED", 0)
     suggested = counts.get("SUGGESTED", 0)
     accepted = counts.get("ACCEPTED", 0)
@@ -546,6 +556,7 @@ def kiosk_camera(festival_id: str, request: Request, _: Scope, user: Operator, c
         **kiosk_camera_state(connection, festival_id),
         "counts": counts,
         "models": models,
+        "estimateResults": {"counts": estimate_result_counts, "recent": estimate_result_log},
         # 분모가 0이면 비율을 만들지 않는다. 0%로 내리면 "한 번도 안 썼다"가 "다 실패했다"로 읽힌다.
         "rates": {
             "consentAcceptRate": _rate(granted, counts.get("CONSENT_SHOWN", 0)),

@@ -1079,6 +1079,13 @@ def test_kiosk_camera_switch_and_anonymous_metrics(client, festival, manager, vi
     for event in ("CONSENT_SHOWN", "CONSENT_GRANTED", "SUGGESTED", "ACCEPTED", "MANUAL_LARGE_TEXT"):
         assert client.post("/api/v1/visitor/kiosk-assist-events", headers=visitor,
                            json={"eventType": event, "modelVersion": "age_gender-1"}).status_code == 204
+    for result in ("SENIOR", "OTHER"):
+        assert client.post("/api/v1/visitor/kiosk-assist-events", headers=visitor,
+                           json={"eventType": "ESTIMATE_RESULT", "modelVersion": "age_gender-1", "result": result}).status_code == 204
+    assert error_code(client.post("/api/v1/visitor/kiosk-assist-events", headers=visitor,
+                                  json={"eventType": "ESTIMATE_RESULT"}), 400) == "VALIDATION_ERROR"
+    assert error_code(client.post("/api/v1/visitor/kiosk-assist-events", headers=visitor,
+                                  json={"eventType": "SUGGESTED", "result": "SENIOR"}), 400) == "VALIDATION_ERROR"
     # 개인과 이을 수 있는 값은 애초에 받지 않는다(extra="forbid").
     assert error_code(client.post("/api/v1/visitor/kiosk-assist-events", headers=visitor,
                                   json={"eventType": "SUGGESTED", "estimatedAge": 71}), 400) == "VALIDATION_ERROR"
@@ -1097,6 +1104,9 @@ def test_kiosk_camera_switch_and_anonymous_metrics(client, festival, manager, vi
     assert view["counts"]["ACCEPTED"] >= 1 and view["rates"]["suggestionAcceptRate"] is not None
     assert view["rates"]["manualLargeTextCount"] >= 1
     assert any(row["modelVersion"] == "age_gender-1" for row in view["models"])
+    assert view["estimateResults"]["counts"]["SENIOR"] >= 1
+    assert view["estimateResults"]["counts"]["OTHER"] >= 1
+    assert any(row["result"] == "SENIOR" for row in view["estimateResults"]["recent"])
     assert connection.execute("SELECT 1 FROM audit_logs WHERE action='KIOSK_CAMERA_TOGGLE'").fetchone()
     # 카메라를 꺼도 수동 접근성 이용은 계속 기록된다.
     assert client.post("/api/v1/visitor/kiosk-assist-events", headers=visitor,
