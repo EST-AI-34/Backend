@@ -116,8 +116,25 @@ def is_safe_question(message: str) -> bool:
     return not any(pattern.search(message) for pattern, _ in SENSITIVE_PATTERNS)
 
 
+# 한국어 조사. 검색이 토큰 통째로 ILIKE라 "화장실이"가 본문의 "화장실은"과 안 맞았다.
+# 긴 것부터 떼어낸다("에서는"을 "는"보다 먼저 봐야 한다).
+JOSA = ("에서는", "에게는", "으로는", "이라는", "에서", "에게", "한테", "으로", "이나", "까지",
+        "부터", "보다", "라도", "이라", "은", "는", "이", "가", "을", "를", "에", "와", "과",
+        "도", "만", "의", "로")
+
+
+def without_josa(term: str) -> str:
+    """조사를 뗀 어간. 뗄 게 없거나 남는 글자가 1자면 원본 그대로."""
+    for josa in JOSA:
+        if term.endswith(josa) and len(term) - len(josa) >= 2:
+            return term[: -len(josa)]
+    return term
+
+
 def search_terms(text: str) -> list[str]:
-    return list(dict.fromkeys(term for term in re.split(r"[^\w가-힣]+", text.lower()) if len(term) >= 2))[:8]
+    terms = [term for term in re.split(r"[^\w가-힣]+", text.lower()) if len(term) >= 2][:8]
+    # 어간을 원본과 함께 넘긴다(OR 검색이라 원본이 맞던 문서는 계속 맞는다).
+    return list(dict.fromkeys([variant for term in terms for variant in (term, without_josa(term))]))
 
 
 def supported_language(requested: str | None, supported: list[str], default: str) -> str:

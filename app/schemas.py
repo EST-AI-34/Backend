@@ -47,6 +47,23 @@ class VisitorAreaIn(APIModel):
     source: Literal["QR", "MANUAL"] = "MANUAL"
 
 
+class KioskAssistEventIn(APIModel):
+    """KIOSK-A11Y-01 익명 효과 지표. 개인과 이을 수 있는 값은 받지 않는다.
+
+    추정 연령·신뢰도·프레임은 키오스크 밖으로 나오지 않으므로 여기에 필드가 없다.
+    model_version은 ESG-G-08 편향 점검이 어느 모델의 결과인지 구분하기 위한 것이다.
+    """
+    event_type: Literal["CONSENT_SHOWN", "CONSENT_GRANTED", "CONSENT_DECLINED", "ESTIMATE_FAILED",
+                        "SUGGESTED", "ACCEPTED", "DISMISSED", "MANUAL_LARGE_TEXT", "TASK_COMPLETED"]
+    model_version: str | None = Field(default=None, max_length=100)
+
+
+class KioskCameraPatch(APIModel):
+    """ESG-G-08 카메라 제안 중지 스위치. 끌 때는 사유를 남긴다(편향·오탐 점검 기록)."""
+    enabled: bool
+    stop_reason: str | None = Field(default=None, max_length=500)
+
+
 class ConsentPatch(APIModel):
     consents: dict[str, bool] = Field(min_length=1)
 
