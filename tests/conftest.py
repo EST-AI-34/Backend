@@ -45,7 +45,7 @@ def client():
 
 
 @pytest.fixture(autouse=True)
-def reset_rate_limit(client):
+def reset_rate_limit():
     """레이트 리밋 버킷은 프로세스 전역이라 테스트끼리 새어 나간다.
 
     버킷 키가 (IP, 경로 앞 5조각, 분)이라 같은 축제의 운영자 쓰기 요청이 전부 한 버킷
