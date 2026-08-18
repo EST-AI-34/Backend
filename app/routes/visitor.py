@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Request, Response
 from psycopg.errors import UniqueViolation
 
+from .. import ai
 from ..db import all_rows, jsonb, one
 from ..deps import Db, Visitor
 from ..domain import classify_issue, is_safe_question, search_terms
@@ -205,7 +206,8 @@ def send_message(conversation_id: str, body: MessageIn, request: Request, visito
             VALUES(%s,%s,%s,'BLOCKED',%s,%s) RETURNING *""",
             (conversation_id, body.message, "보안 또는 개인정보와 관련된 요청에는 답변할 수 없습니다.",
              jsonb(fallback), jsonb(body.context)))
-        return success(request, {"messageId": row["id"], "answer": row["answer"], "safetyStatus": "BLOCKED", "sources": [], "fallback": fallback})
+        return success(request, {"messageId": row["id"], "answer": row["answer"], "safetyStatus": "BLOCKED",
+                                 "sources": [], "fallback": fallback, "externalAiUsed": False})
 
     patterns = [f"%{term}%" for term in search_terms(body.message)]
     # 최신순으로 뽑던 걸 맞은 검색어 개수순으로 바꿨다. "아이 잃어버렸어요"가 분실물 안내 대신
@@ -227,7 +229,8 @@ def send_message(conversation_id: str, body: MessageIn, request: Request, visito
         {"festival_id": visitor["festival_id"], "patterns": patterns}) if patterns else []
     allowed = bool(sources)
     excerpts = [source["body"].get("summary") or source["body"].get("description") or source["body"].get("title") for source in sources]
-    answer = "\n\n".join(filter(None, excerpts)) if allowed else "승인된 축제 정보에서 충분한 근거를 찾지 못했습니다."
+    generated = ai.grounded_answer(body.message, sources) if allowed else None
+    answer = generated or ("\n\n".join(filter(None, excerpts)) if allowed else "승인된 축제 정보에서 충분한 근거를 찾지 못했습니다.")
     fallback = None if allowed else {"type": "HELP_DESK", "message": "현장 안내데스크 또는 공식 연락처를 이용해 주세요."}
     row = one(connection, """INSERT INTO ai_messages(conversation_id,question,answer,safety_status,freshness_at,fallback,context)
         VALUES(%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
@@ -244,7 +247,8 @@ def send_message(conversation_id: str, body: MessageIn, request: Request, visito
             "rank": rank,
         })
     return success(request, {"messageId": row["id"], "answer": row["answer"], "safetyStatus": row["safety_status"],
-                             "freshnessAt": row["freshness_at"], "sources": response_sources, "fallback": fallback})
+                             "freshnessAt": row["freshness_at"], "sources": response_sources, "fallback": fallback,
+                             "externalAiUsed": generated is not None})
 
 
 @router.get("/visitor/ai/conversations/{conversation_id}/messages")

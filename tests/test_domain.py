@@ -58,6 +58,9 @@ def test_phase2_domain_rules():
     assert search_terms("안내소에서는") == ["안내소에서는", "안내소"]
     # 어간이 1자만 남으면 떼지 않는다("수가" -> "수"는 아무 문서나 걸린다).
     assert search_terms("수가 부족해요") == ["수가", "부족해요"]
+    assert search_terms("밥 어디서 먹어?") == ["어디서", "먹어", "먹거리", "음식"]
+    assert search_terms("차 가져가도 돼?") == ["가져가도", "가져가", "주차", "자가용"]
+    assert search_terms("애완견도 갈 수 있어?")[-1] == "반려동물"
 
 
 def test_course_selection_skips_overlaps_and_deadline():
@@ -186,7 +189,8 @@ def test_briefing_sends_client_id_and_reads_answer(monkeypatch):
     seen = {}
 
     def handler(request):
-        seen["url"] = str(request.url)
+        if request.method == "GET":
+            seen["url"] = str(request.url)
         return httpx.Response(200, json={"answer": "혼잡도가 높습니다. 뒤 문장은 잘린다.", "references": []})
 
     with_settings(monkeypatch, external_ai_enabled=True, alan_client_id="test-uuid")
@@ -201,6 +205,8 @@ def test_request_retries_then_succeeds(monkeypatch):
     calls = {"n": 0}
 
     def handler(request):
+        if request.method == "DELETE":
+            return httpx.Response(200, json={"message": "reset"})
         calls["n"] += 1
         if calls["n"] == 1:
             raise httpx.ConnectError("일시적 실패")
@@ -243,6 +249,8 @@ def count_calls(monkeypatch, status):
     calls = {"n": 0}
 
     def handler(request):
+        if request.method == "DELETE":
+            return httpx.Response(200, json={"message": "reset"})
         calls["n"] += 1
         return httpx.Response(status, json={"error": "boom"})
 
@@ -259,6 +267,42 @@ def test_client_errors_are_not_retried(monkeypatch):
 
 def test_server_errors_are_retried(monkeypatch):
     assert count_calls(monkeypatch, 503) == 3
+
+
+def test_alan_resets_shared_state_around_each_question(monkeypatch):
+    import httpx
+
+    methods = []
+
+    def handler(request):
+        methods.append(request.method)
+        if request.method == "DELETE":
+            return httpx.Response(404, json={"message": "no state"})
+        return httpx.Response(200, json={"answer": "승인된 정보의 답변입니다."})
+
+    with_settings(monkeypatch, external_ai_enabled=True, alan_client_id="test-uuid")
+    stub_transport(monkeypatch, handler)
+    assert ai.ask("질문") == "승인된 정보의 답변입니다."
+    assert methods == ["DELETE", "GET", "DELETE"]
+
+
+def test_grounded_answer_only_uses_supplied_sources(monkeypatch):
+    import httpx
+
+    seen = {}
+
+    def handler(request):
+        if request.method == "DELETE":
+            return httpx.Response(200, json={"message": "reset"})
+        seen["content"] = request.url.params["content"]
+        return httpx.Response(200, json={"answer": "마켓존에서 식사할 수 있습니다."})
+
+    with_settings(monkeypatch, external_ai_enabled=True, alan_client_id="test-uuid")
+    stub_transport(monkeypatch, handler)
+    source = {"body": {"title": "먹거리 안내", "summary": "마켓존에 먹거리 부스가 있습니다."}}
+    assert ai.grounded_answer("밥 어디서 먹어?", [source]) == "마켓존에서 식사할 수 있습니다."
+    assert "승인된 축제 정보만" in seen["content"] and "마켓존에 먹거리 부스" in seen["content"]
+    assert ai.grounded_answer("밥 어디서 먹어?", []) is None
 
 
 def test_self_cancel_closes_before_start():
