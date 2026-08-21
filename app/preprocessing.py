@@ -1,11 +1,13 @@
 import json
+from collections import defaultdict
 from datetime import UTC, datetime
-from decimal import Decimal
 
 
 FESTIVAL_CONTEXT_VERSION = "festival-context-v1"
 RECENT_HOURS = 24
 CROWD_LEVEL_RANK = {"QUIET": 0, "MODERATE": 1, "BUSY": 2, "FULL": 3}
+# 허용 값 목록은 순위표에서 그대로 얻는다 — 두 곳에 적어 두면 한쪽만 늘어난다.
+CROWD_LEVELS = frozenset(CROWD_LEVEL_RANK)
 
 
 def recommendation_exposure_items(events: list[dict]) -> list[dict]:
@@ -84,7 +86,7 @@ def normalize_congestion(samples: list[dict], recent_samples: list[dict], now: d
         items.append({
             "area_id": area_id,
             "area_name": safe_str(sample.get("area_name")),
-            "crowd_level": enum_value(sample.get("crowd_level"), {"QUIET", "MODERATE", "BUSY", "FULL"}, "UNKNOWN"),
+            "crowd_level": enum_value(sample.get("crowd_level"), CROWD_LEVELS, "UNKNOWN"),
             "people_count": safe_int(sample.get("people_count")),
             "estimated_wait_min": safe_int(sample.get("estimated_wait_min")),
             "source_type": safe_str(sample.get("source_type")),
@@ -101,22 +103,19 @@ def normalize_congestion(samples: list[dict], recent_samples: list[dict], now: d
 
 
 def congestion_trend_by_area(recent_samples: list[dict]) -> dict[str, str]:
-    by_area: dict[str, list[dict]] = {}
+    by_area: defaultdict[str, list[dict]] = defaultdict(list)
     for sample in recent_samples:
         area_id = safe_str(sample.get("area_id"))
         captured_at = as_datetime(sample.get("captured_at"))
         if not area_id or not captured_at:
             continue
-        by_area.setdefault(area_id, []).append({
+        by_area[area_id].append({
             "captured_at": captured_at,
             "people_count": safe_int(sample.get("people_count")),
-            "crowd_level": enum_value(sample.get("crowd_level"), {"QUIET", "MODERATE", "BUSY", "FULL"}, "UNKNOWN"),
+            "crowd_level": enum_value(sample.get("crowd_level"), CROWD_LEVELS, "UNKNOWN"),
         })
-    trends: dict[str, str] = {}
-    for area_id, points in by_area.items():
-        points.sort(key=lambda point: point["captured_at"])
-        trends[area_id] = trend_from_points(points)
-    return trends
+    return {area_id: trend_from_points(sorted(points, key=lambda point: point["captured_at"]))
+            for area_id, points in by_area.items()}
 
 
 def trend_from_points(points: list[dict]) -> str:
@@ -278,22 +277,19 @@ def source_timestamps(value) -> list[str]:
 
 
 def as_datetime(value) -> datetime | None:
-    if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=UTC)
     if isinstance(value, str):
         try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-            return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError:
             return None
-    return None
+    if not isinstance(value, datetime):
+        return None
+    return value if value.tzinfo else value.replace(tzinfo=UTC)
 
 
 def iso(value: datetime | None) -> str | None:
-    if not value:
-        return None
-    normalized = value if value.tzinfo else value.replace(tzinfo=UTC)
-    return normalized.astimezone(UTC).isoformat()
+    normalized = as_datetime(value)
+    return normalized.astimezone(UTC).isoformat() if normalized else None
 
 
 def stale(value: datetime, now: datetime) -> bool:
@@ -318,19 +314,13 @@ def safe_int(value, default=None) -> int | None:
 
 
 def safe_number(value):
-    if value is None:
-        return None
-    if isinstance(value, Decimal):
-        return float(value)
-    if isinstance(value, int | float):
-        return value
     try:
-        return float(value)
+        return value if isinstance(value, int | float) else float(value)
     except (TypeError, ValueError):
         return None
 
 
-def enum_value(value, allowed: set[str], default: str) -> str:
+def enum_value(value, allowed: frozenset[str] | set[str], default: str) -> str:
     text = safe_str(value)
     return text if text in allowed else default
 

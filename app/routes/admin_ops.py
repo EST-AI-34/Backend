@@ -96,8 +96,6 @@ def update_announcement(festival_id: str, announcement_id: str, body: Announceme
 
 @router.post("/admin/festivals/{festival_id}/announcements/{announcement_id}/publish")
 def publish_announcement(festival_id: str, announcement_id: str, body: PublishAnnouncementIn, request: Request, _: Scope, user: Manager, connection: Db):
-    if body.ends_at and body.starts_at >= body.ends_at:
-        raise bad_request("VALIDATION_ERROR", "endsAt은 startsAt 이후여야 합니다.")
     if not one(connection, """SELECT cv.id FROM content_versions cv JOIN content_items ci ON ci.id=cv.content_item_id
         WHERE cv.id=%s AND ci.festival_id=%s AND cv.status='APPROVED'""", (body.content_version_id, festival_id)):
         raise bad_request("CONTENT_NOT_APPROVED", "승인된 공지 콘텐츠만 게시할 수 있습니다.")

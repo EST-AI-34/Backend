@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 from fastapi import APIRouter, Request, Response
 from psycopg.errors import UniqueViolation
 
-from ..db import all_rows, idempotent, jsonb, one
+from ..db import all_rows, deliveries, idempotent, jsonb, one
 from ..deps import Db, IdempotencyKey, Visitor
 from ..domain import (select_course, supported_language, validate_booking_cancel_window,
                       validate_booking_transition)
@@ -72,10 +72,8 @@ def my_bookings(request: Request, visitor: Visitor, connection: Db):
         JOIN festival_areas a ON a.id=ps.area_id WHERE b.visitor_session_id=%s ORDER BY ps.starts_at""", (visitor["id"],))
     # OPS-10: 호출은 이 폴링 응답에 실릴 때 비로소 방문객에게 닿는다. 도달 결과를 운영자가
     # 확인할 수 있도록 응답에 실제로 실린 호출을 세션별로 남긴다.
-    for row in rows:
-        if row["status"] == "CALLED":
-            connection.execute("""INSERT INTO notification_deliveries(festival_id,resource_type,resource_id,visitor_session_id)
-                VALUES(%s,'BOOKING_CALL',%s,%s) ON CONFLICT DO NOTHING""", (visitor["festival_id"], row["id"], visitor["id"]))
+    deliveries(connection, visitor["festival_id"], "BOOKING_CALL",
+               [row["id"] for row in rows if row["status"] == "CALLED"], visitor["id"])
     return success(request, rows)
 
 

@@ -103,19 +103,18 @@ def process_one_job() -> bool:
         if not job:
             return False
         connection.execute("UPDATE jobs SET status='RUNNING',updated_at=now() WHERE id=%s", (job["id"],))
-        handler_entry = JOB_HANDLERS.get(job["job_type"])
+        handler, revert_resource = JOB_HANDLERS.get(job["job_type"], (None, False))
         try:
             # 핸들러를 세이브포인트 안에서 돌린다. DB 오류(잘못된 SQL 등)는 트랜잭션을
             # abort 상태로 만들어서, 세이브포인트가 없으면 아래 fail_job의 UPDATE까지 실패한다.
             # 그러면 attempts가 오르지 않은 채 전부 롤백돼 워커가 같은 잡을 영원히 다시 집는다.
             with connection.transaction():
-                if not handler_entry:
+                if not handler:
                     raise ValueError(f"unsupported job type: {job['job_type']}")
-                handler, _ = handler_entry
                 result = handler(connection, job)
             connection.execute("UPDATE jobs SET status='COMPLETED',result=%s,updated_at=now() WHERE id=%s", (jsonb(result), job["id"]))
         except Exception as error:  # job failure belongs in durable state
-            fail_job(connection, job, handler_entry is not None, bool(handler_entry and handler_entry[1]), error)
+            fail_job(connection, job, handler is not None, revert_resource, error)
         return True
 
 

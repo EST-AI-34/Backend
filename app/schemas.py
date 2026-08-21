@@ -13,6 +13,11 @@ class APIModel(BaseModel):
     model_config = ConfigDict(alias_generator=camel, populate_by_name=True, extra="forbid")
 
 
+class VersionedPatch(APIModel):
+    """낙관적 잠금이 걸린 PATCH 본문. version이 없으면 patch_row가 If-Match 헤더에서 읽는다."""
+    version: int | None = None
+
+
 class LoginIn(APIModel):
     email: EmailStr
     password: str = Field(min_length=8)
@@ -128,12 +133,13 @@ class SurveyResponseIn(APIModel):
 
 
 class DateRangeModel(APIModel):
+    """시작·종료가 함께 오는 입력. 종료를 선택값으로 넓히는 하위 스키마도 이 검사를 그대로 쓴다."""
     starts_at: datetime
     ends_at: datetime
 
     @model_validator(mode="after")
     def valid_range(self):
-        if self.starts_at >= self.ends_at:
+        if self.ends_at and self.starts_at >= self.ends_at:
             raise ValueError("endsAt은 startsAt 이후여야 합니다.")
         return self
 
@@ -155,7 +161,7 @@ class TransportOptionIn(APIModel):
     status: Literal["원활", "보통", "혼잡", "지연"] = "원활"
 
 
-class FestivalPatch(APIModel):
+class FestivalPatch(VersionedPatch):
     name: str | None = None
     description: str | None = None
     timezone: str | None = None
@@ -166,7 +172,6 @@ class FestivalPatch(APIModel):
     supported_languages: list[str] | None = None
     visitor_menus: dict[str, bool] | None = None
     transport: list[TransportOptionIn] | None = None
-    version: int | None = None
 
 
 AreaStatus = Literal["ACTIVE", "INACTIVE", "ARCHIVED"]
@@ -184,14 +189,13 @@ class AreaIn(APIModel):
     status: AreaStatus = "ACTIVE"
 
 
-class AreaPatch(APIModel):
+class AreaPatch(VersionedPatch):
     name: str | None = None
     area_type: str | None = None
     description: str | None = Field(default=None, max_length=1000)
     latitude: float | None = Field(default=None, ge=-90, le=90)
     longitude: float | None = Field(default=None, ge=-180, le=180)
     status: AreaStatus | None = None
-    version: int | None = None
 
 
 class FacilityIn(APIModel):
@@ -203,14 +207,13 @@ class FacilityIn(APIModel):
     status: FacilityStatus = "ACTIVE"
 
 
-class FacilityPatch(APIModel):
+class FacilityPatch(VersionedPatch):
     area_id: str | None = None
     name: str | None = None
     facility_type: str | None = None
     accessibility: dict[str, Any] | None = None
     operating_hours: dict[str, Any] | None = None
     status: FacilityStatus | None = None
-    version: int | None = None
 
 
 class ProgramIn(APIModel):
@@ -222,14 +225,13 @@ class ProgramIn(APIModel):
     status: ProgramStatus = "DRAFT"
 
 
-class ProgramPatch(APIModel):
+class ProgramPatch(VersionedPatch):
     slug: str | None = Field(default=None, pattern=r"^[a-z0-9-]+$")
     title: str | None = None
     summary: str | None = None
     category: str | None = None
     accessibility: dict[str, Any] | None = None
     status: ProgramStatus | None = None
-    version: int | None = None
 
 
 class ProgramSessionIn(DateRangeModel):
@@ -238,13 +240,12 @@ class ProgramSessionIn(DateRangeModel):
     status: SessionStatus = "OPEN"
 
 
-class ProgramSessionPatch(APIModel):
+class ProgramSessionPatch(VersionedPatch):
     area_id: str | None = None
     starts_at: datetime | None = None
     ends_at: datetime | None = None
     capacity: int | None = Field(default=None, ge=0)
     status: SessionStatus | None = None
-    version: int | None = None
 
 
 class CloneFestivalIn(DateRangeModel):
@@ -292,16 +293,24 @@ class AnnouncementPatch(APIModel):
     version: int
 
 
-class PublishAnnouncementIn(APIModel):
-    content_version_id: str
+class AnnouncementPublishBase(DateRangeModel):
+    """게시 시점에 정해지는 공지 노출 조건. 두 게시 경로가 같은 값을 같은 규칙으로 받는다.
+
+    노출 창 검사(DateRangeModel)가 스키마에 있으면 라우트에서 손으로 다시 확인할 필요가
+    없다 — 예전에는 publish 라우트만 같은 조건을 직접 들고 있었다. 자동 해제 시각을 비워
+    두는 공지가 있어 ends_at만 선택값으로 넓힌다.
+    """
     severity: Literal["INFO", "WARNING", "EMERGENCY"]
     audience: list[str] = Field(min_length=1)
     target_area_ids: list[str] = Field(default_factory=list)
-    starts_at: datetime
     ends_at: datetime | None = None
 
 
-class AnnouncementDraftIn(APIModel):
+class PublishAnnouncementIn(AnnouncementPublishBase):
+    content_version_id: str
+
+
+class AnnouncementDraftIn(AnnouncementPublishBase):
     """공지 생성부터 게시까지 한 번에 받는 입력.
 
     예전에는 클라이언트가 공지 생성 → 콘텐츠 항목 → 버전 → 검수 제출 → 승인 → 게시를
@@ -310,17 +319,6 @@ class AnnouncementDraftIn(APIModel):
     """
     title: str = Field(min_length=1, max_length=200)
     body: str = Field(min_length=1, max_length=4000)
-    severity: Literal["INFO", "WARNING", "EMERGENCY"]
-    audience: list[str] = Field(min_length=1)
-    target_area_ids: list[str] = Field(default_factory=list)
-    starts_at: datetime
-    ends_at: datetime | None = None
-
-    @model_validator(mode="after")
-    def valid_window(self):
-        if self.ends_at and self.starts_at >= self.ends_at:
-            raise ValueError("endsAt은 startsAt 이후여야 합니다.")
-        return self
 
 
 class SurveyQuestionIn(APIModel):
@@ -352,13 +350,12 @@ class SurveyIn(APIModel):
         return self
 
 
-class SurveyPatch(APIModel):
+class SurveyPatch(VersionedPatch):
     title: str | None = Field(default=None, min_length=1, max_length=200)
     description: str | None = Field(default=None, max_length=1000)
     starts_at: datetime | None = None
     ends_at: datetime | None = None
     status: Literal["DRAFT", "ACTIVE", "CLOSED"] | None = None
-    version: int | None = None
 
 
 class TicketIn(APIModel):
@@ -529,7 +526,7 @@ class BusinessIn(APIModel):
     booth_no: str | None = Field(default=None, max_length=50)
 
 
-class FestivalBusinessPatch(APIModel):
+class FestivalBusinessPatch(VersionedPatch):
     """운영자가 고치는 참여업체 속성.
 
     is_sponsored(광고 노출)와 esg_participating(ESG 참여)은 추천 점수·광고 분리의 입력값인데
@@ -541,7 +538,6 @@ class FestivalBusinessPatch(APIModel):
     esg_participating: bool | None = None
     # BIZ-04 매출 데이터 수집 동의. 철회하면 파기 배치가 해당 업체의 매출 이벤트를 즉시 지운다.
     sales_consent: bool | None = None
-    version: int | None = None
 
 
 class BusinessPatch(APIModel):

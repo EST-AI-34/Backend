@@ -1,7 +1,7 @@
 """EST34-2026 축제 데이터를 visitjeju 2026제주수변공원ESG축제 기준으로 재구성한다.
 
 출처: https://visitjeju.net/kr/festival/view?contentsid=CNTS_300000000014541
-원 행사 기간은 2026-07-18~19(토·일)이지만 이미 지난 날짜라 다가오는 주말(2026-08-22~23)로 옮겼다.
+원 행사 기간은 2026-07-18~19(토·일)이지만 이미 지난 날짜라 2026-08-19~20로 옮겼다.
 바꾸려면 STARTS_AT/ENDS_AT만 고치면 된다.
 
 기본은 드라이런(롤백)이다. 실제 반영은 --apply.
@@ -30,8 +30,8 @@ DESCRIPTION = (
     "장소: 제주시 외도동 월대천·수변공원 일대(제주시 내도동 도근내길 45). "
     "주관: 제주관광공사. 문의: 064-712-7151."
 )
-STARTS_AT = datetime(2026, 8, 22, 10, 0, tzinfo=KST)
-ENDS_AT = datetime(2026, 8, 23, 18, 0, tzinfo=KST)
+STARTS_AT = datetime(2026, 8, 19, 10, 0, tzinfo=KST)
+ENDS_AT = datetime(2026, 8, 20, 18, 0, tzinfo=KST)
 
 TRANSPORT = [
     {"mode": "버스", "label": "외도초등학교 정류장 하차", "detail": "제주 시내버스 이용 후 도보 8분", "status": "원활"},

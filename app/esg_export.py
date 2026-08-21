@@ -89,22 +89,17 @@ def _minimal_pdf(lines: list[str]) -> bytes:
     stream_bytes = stream.encode("latin-1", errors="replace")
 
     objects = [
-        "<< /Type /Catalog /Pages 2 0 R >>",
-        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
-        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
-        None,  # placeholder for the stream object, built below
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        b"<< /Length %d >>\nstream\n" % len(stream_bytes) + stream_bytes + b"\nendstream",
     ]
     body = b"%PDF-1.4\n"
     offsets = [0]
     for index, obj in enumerate(objects, start=1):
         offsets.append(len(body))
-        if obj is None:
-            body += f"{index} 0 obj << /Length {len(stream_bytes)} >>\nstream\n".encode("latin-1")
-            body += stream_bytes
-            body += b"\nendstream\nendobj\n"
-        else:
-            body += f"{index} 0 obj {obj} endobj\n".encode("latin-1")
+        body += b"%d 0 obj " % index + obj + b" endobj\n"
     xref_offset = len(body)
     xref = f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n"
     xref += "".join(f"{offset:010d} 00000 n \n" for offset in offsets[1:])
@@ -186,7 +181,8 @@ def build_report_artifact(report: dict, export_format: str) -> dict[str, Any]:
         artifact = _artifact(_minimal_docx(lines), f"esg-report-{report['id']}.docx",
                              "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
         return {**artifact, "textLossWarning": None}
-    dropped = sum(1 for line in lines for char in line if char.encode("latin-1", errors="replace") == b"?" and char != "?")
+    # latin-1로 못 옮기는 글자 수 = 원문 길이 - 버리고 인코딩한 바이트 수(latin-1은 1글자 1바이트).
+    dropped = sum(len(line) - len(line.encode("latin-1", errors="ignore")) for line in lines)
     artifact = _artifact(_minimal_pdf(lines), f"esg-report-{report['id']}.pdf", "application/pdf")
     return {**artifact, "textLossWarning": (
         f"PDF는 라틴 문자 전용 표준 폰트만 사용해 한글 {dropped}자가 '?'로 표시됩니다. "

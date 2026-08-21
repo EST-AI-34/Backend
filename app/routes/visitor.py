@@ -3,7 +3,7 @@ from psycopg.errors import UniqueViolation
 
 from .. import ai
 from ..context_repository import load_festival_context_rows
-from ..db import all_rows, jsonb, one
+from ..db import all_rows, deliveries, jsonb, one
 from ..deps import Db, Visitor
 from ..domain import classify_issue, is_safe_question, search_terms
 from ..errors import bad_request, conflict, found
@@ -77,9 +77,7 @@ def visitor_announcements(request: Request, visitor: Visitor, connection: Db):
                OR (%(area_id)s::uuid IS NOT NULL AND a.target_area_ids ? %(area_id)s::text))
         ORDER BY CASE a.severity WHEN 'EMERGENCY' THEN 1 WHEN 'WARNING' THEN 2 ELSE 3 END,a.starts_at DESC""",
         {"festival_id": visitor["festival_id"], "area_id": str(area["area_id"]) if area["area_id"] else None})
-    for row in rows:
-        connection.execute("""INSERT INTO notification_deliveries(festival_id,resource_type,resource_id,visitor_session_id)
-            VALUES(%s,'ANNOUNCEMENT',%s,%s) ON CONFLICT DO NOTHING""", (visitor["festival_id"], row["id"], visitor["id"]))
+    deliveries(connection, visitor["festival_id"], "ANNOUNCEMENT", [row["id"] for row in rows], visitor["id"])
     return success(request, {
         "items": rows, "area": area,
         # 웹 폴링은 화면을 열어 둔 세션에만 닿는다. 이 한계를 방문객 화면이 그대로 고지한다(OPS-10).
